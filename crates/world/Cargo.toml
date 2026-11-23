@@ -1,0 +1,7 @@
+[package]
+name = "world"
+version.workspace = true
+edition.workspace = true
+description = "Pure-math 2.5D road projection: geometry, camera, scanline strips"
+
+[dependencies]
