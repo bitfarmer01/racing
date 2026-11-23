@@ -1,0 +1,216 @@
+//! WASM browser shell: the layer between the page and the composed runtime.
+//!
+//! One wasm artifact ships per GPU backend (cargo features `webgpu` /
+//! `webgl2`, matching [`render::QualityTier::backend`]); the JS loader in
+//! `web/loader.js` feature-detects the browser and boots exactly one of them.
+//! Inside a build nothing branches on backend capability at runtime beyond
+//! [`render::QualityTier::select`] — the loader's adapter probe already made
+//! that decision.
+//!
+//! The shell reuses `runtime`'s [`advance_game_frame`] composition for the
+//! frame loop instead of re-wiring camera, road mesh, and sprite batching
+//! here: per frame the JS loader calls [`BrowserGame::advance_frame`] with
+//! input flags, the race advances one 60 Hz tick, the pre-owned batch and
+//! road mesh refill, and [`render::GpuRenderer::draw`] presents.
+//!
+//! Boundaries:
+//! - The canvas is sized by the loader before construction; the shell reads
+//!   `canvas.width()/height()` once at boot. `GpuRenderer` owns the surface
+//!   configuration privately, so there is no resize path yet — a resize
+//!   would rebuild the renderer. This is a recorded follow-up, not a
+//!   silent gap.
+//! - No browser here on the dev host: this crate is compile-checked for
+//!   wasm32 (`cargo check -p web --target wasm32-unknown-unknown`, both
+//!   feature builds) and exercised in a browser only by the recorded
+//!   follow-up smoke test.
+//!
+//! No tests: the blueprint's test gate does not apply to the wasm shell, and
+//! the no-tests constraint for this task forbids adding any.
+
+#![forbid(unsafe_code)]
+
+use game::input::GameInput;
+use render::{AtlasDims, AtlasUpload, GpuRenderer, OrthoCamera, QualityTier, SpriteBatch};
+use runtime::frame::demo_race;
+use runtime::{advance_game_frame, pack_placeholder_atlas, AtlasMapping, RoadMesh};
+use wasm_bindgen::prelude::*;
+use world::RoadGeometry;
+
+/// Installs the panic hook once: panics surface in the browser console
+/// instead of vanishing behind a frozen loading screen.
+#[wasm_bindgen(start)]
+fn start() {
+    console_error_panic_hook::set_once();
+}
+
+/// Which backend this build was compiled for, as the loader picked it.
+#[wasm_bindgen]
+pub fn backend_name() -> String {
+    if cfg!(feature = "webgl2") {
+        "webgl2".to_owned()
+    } else {
+        "webgpu".to_owned()
+    }
+}
+
+/// Folds the loader's input flags into the events queued for one tick:
+/// the last throttle-family command wins (brake over throttle), then the
+/// last steering direction. Pure — no device or race access.
+fn frame_inputs(
+    accelerate: bool,
+    brake: bool,
+    steer_left: bool,
+    steer_right: bool,
+) -> ([GameInput; 2], usize) {
+    let throttle = if brake {
+        Some(GameInput::Brake)
+    } else if accelerate {
+        Some(GameInput::Accelerate)
+    } else {
+        None
+    };
+    let steer = if steer_left {
+        Some(GameInput::SteerLeft)
+    } else if steer_right {
+        Some(GameInput::SteerRight)
+    } else {
+        None
+    };
+    let mut inputs = [GameInput::Accelerate, GameInput::Accelerate];
+    let mut count = 0;
+    for input in [throttle, steer].into_iter().flatten() {
+        inputs[count] = input;
+        count += 1;
+    }
+    (inputs, count)
+}
+
+/// The booted game: one race, its frame-composition buffers, and the GPU
+/// renderer presenting to the loader's canvas. Held across frames so the
+/// steady-state loop allocates nothing.
+#[wasm_bindgen]
+pub struct BrowserGame {
+    race: game::race::Race,
+    geometry: RoadGeometry,
+    mapping: AtlasMapping,
+    batch: SpriteBatch,
+    road: RoadMesh,
+    camera: OrthoCamera,
+    renderer: GpuRenderer,
+}
+
+pub(crate) enum BootError {
+    Atlas(String),
+    Render(String),
+}
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Atlas(e) => write!(f, "placeholder atlas pack failed: {e}"),
+            Self::Render(e) => write!(f, "renderer bring-up failed: {e}"),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl BrowserGame {
+    /// Boots the demo race on `canvas`: packs the placeholder atlas, selects
+    /// the quality tier from the loader's capability facts, and brings up the
+    /// GPU pipeline (warm behind the loading screen per the blueprint).
+    ///
+    /// `low_end_device` comes from the loader's device heuristics;
+    /// `has_webgpu` is compile-time — this build either carries the WebGPU
+    /// backend or it does not, and the loader already chose the build to
+    /// match its adapter probe.
+    ///
+    /// The canvas is sized before this call; its current `width`/`height`
+    /// become the swap-chain size.
+    ///
+    /// Async factory rather than an async constructor: wasm-bindgen has
+    /// deprecated async constructors (invalid TS bindings).
+    #[wasm_bindgen]
+    pub async fn boot(
+        canvas: web_sys::HtmlCanvasElement,
+        low_end_device: bool,
+    ) -> Result<BrowserGame, JsError> {
+        Self::bring_up(canvas, low_end_device)
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    async fn bring_up(
+        canvas: web_sys::HtmlCanvasElement,
+        low_end_device: bool,
+    ) -> Result<Self, BootError> {
+        let has_webgpu = cfg!(feature = "webgpu");
+        let tier = QualityTier::select(has_webgpu, low_end_device);
+
+        let packed = pack_placeholder_atlas().map_err(|e| BootError::Atlas(e.to_string()))?;
+        let mapping = AtlasMapping::from_packed(&packed);
+        let (width, height) = (packed.atlas.width(), packed.atlas.height());
+        let rgba = packed.atlas.into_raw();
+        let atlas = AtlasUpload::from_rgba(AtlasDims::new(width, height), rgba)
+            .map_err(|e| BootError::Atlas(e.to_string()))?;
+
+        let (race, geometry) = demo_race();
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let renderer = GpuRenderer::new(
+            &instance,
+            wgpu::SurfaceTarget::Canvas(canvas.clone()),
+            (canvas.width(), canvas.height()),
+            &atlas,
+            tier,
+        )
+        .await
+        .map_err(|e| BootError::Render(e.to_string()))?;
+
+        Ok(Self {
+            race,
+            geometry,
+            mapping,
+            batch: SpriteBatch::for_tier(tier),
+            road: RoadMesh::default(),
+            // The camera's clip transform is a fixed ortho over the runtime's
+            // pixel-space viewport; per-frame rider positions already live in
+            // screen space, so one camera serves every frame.
+            camera: OrthoCamera::new(runtime::VIEWPORT_WIDTH, runtime::VIEWPORT_HEIGHT),
+            renderer,
+        })
+    }
+
+    /// Advances the race one 60 Hz tick under the loader's input flags and
+    /// draws the composed frame. Steady state: no allocation after warmup —
+    /// the batch and road mesh refill through `advance_game_frame`.
+    pub fn advance_frame(
+        &mut self,
+        accelerate: bool,
+        brake: bool,
+        steer_left: bool,
+        steer_right: bool,
+    ) -> Result<(), JsError> {
+        let (inputs, count) = frame_inputs(accelerate, brake, steer_left, steer_right);
+        advance_game_frame(
+            &mut self.race,
+            &self.geometry,
+            &self.mapping,
+            &inputs[..count],
+            &mut self.batch,
+            &mut self.road,
+        );
+        self.renderer
+            .draw(&self.batch, &self.camera)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Current race lap index, for the loader's HUD.
+    pub fn lap_index(&self) -> u32 {
+        self.race.lap_index()
+    }
+
+    /// Current player distance along the track, in meters, for the HUD.
+    pub fn player_distance(&self) -> f32 {
+        self.race.player_distance()
+    }
+}
