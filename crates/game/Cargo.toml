@@ -8,9 +8,3 @@ publish = false
 [dependencies]
 sim = { path = "../sim" }
 world = { path = "../world" }
-
-# Standalone-build marker while `game` waits for the render coder's single
-# workspace-members edit. DELETE this table when adding "crates/game" to the
-# root workspace members — a member must not declare its own [workspace].
-[workspace]
-
