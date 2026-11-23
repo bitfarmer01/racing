@@ -20,6 +20,6 @@ pub use batch::SpriteBatch;
 pub use camera::{
     instance_from_billboard, push_projected, OrthoCamera, RoadPlacement, SpriteStyle,
 };
-pub use gpu::{AtlasUpload, GpuRenderer, RenderError, SPRITE_SHADER};
+pub use gpu::{AtlasUpload, GpuRenderer, RenderError, RoadVertex, ROAD_SHADER, SPRITE_SHADER};
 pub use instance::SpriteInstance;
 pub use tier::{Backend, Effects, QualityTier};

@@ -7,7 +7,6 @@
 //! billboard output and pushed via `render::push_projected`. All projection
 //! and batching decisions run here, on the CPU, before any device is touched.
 
-use bytemuck::{Pod, Zeroable};
 use game::bike::Control;
 use game::input::GameInput;
 use game::race::{Race, RaceConfig};
@@ -38,13 +37,10 @@ const ROAD_LIGHT: [f32; 4] = [0.30, 0.30, 0.32, 1.0];
 /// Asphalt dark shade — the alternation reads as forward motion.
 const ROAD_DARK: [f32; 4] = [0.25, 0.25, 0.27, 1.0];
 
-/// One road-mesh vertex: screen-space position plus a flat color.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
-pub struct RoadVertex {
-    pub position: [f32; 2],
-    pub color: [f32; 4],
-}
+/// One road-mesh vertex: screen-space position plus a flat color. The type
+/// lives in the `render` crate (the shared GPU path draws it); re-exported
+/// here so frame composition and the offscreen proof keep one import path.
+pub use render::RoadVertex;
 
 /// The road as drawn: one triangle-strip quad (4 vertices) per road strip,
 /// screen-space, trapezoid-shaped to match the projected road.

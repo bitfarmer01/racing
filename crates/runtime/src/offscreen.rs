@@ -13,7 +13,7 @@
 use std::future::Future;
 use std::path::Path;
 
-use render::{AtlasDims, SpriteInstance, SPRITE_SHADER};
+use render::{AtlasDims, SpriteInstance, ROAD_SHADER, SPRITE_SHADER};
 use wgpu::util::DeviceExt;
 
 use crate::frame::{GameFrame, RoadVertex};
@@ -124,27 +124,8 @@ struct CameraUniform {
     clip_matrix: [[f32; 4]; 4],
 }
 
-const ROAD_SHADER: &str = r#"
-struct CameraUniform {
-    clip_matrix: mat4x4<f32>,
-};
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
-
-struct VSOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VSOut {
-    return VSOut(camera.clip_matrix * vec4<f32>(position, 0.0, 1.0), color);
-}
-
-@fragment
-fn fs_main(out: VSOut) -> @location(0) vec4<f32> {
-    return out.color;
-}
-"#;
+// Road WGSL comes from `render::ROAD_SHADER` — one shader source shared by
+// the offscreen proof and the browser `GpuRenderer` road pass.
 
 /// Renders one composed frame offscreen and writes it as a PNG to `out_path`.
 /// Returns the PNG's pixel dimensions on success.

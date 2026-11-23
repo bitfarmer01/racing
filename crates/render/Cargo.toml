@@ -5,7 +5,20 @@ edition.workspace = true
 description = "wgpu sprite-batch renderer for the racing runtime"
 
 [dependencies]
-wgpu = "25.0.0"
+# `default-features = false` keeps wgpu's `webgpu` feature out of the
+# dependency graph: cargo unifies features per target, so one default-features
+# dependency would re-enable the browser-WebGPU backend even in the web
+# crate's webgl2 bundle, where it races the WebGL2 binding for the canvas
+# (the recorded NoAdapter / empty-canvas bring-up failure — see web's bring_up).
+# The native backends listed here match wgpu's defaults minus `webgpu`, so the
+# offscreen frame-proof still finds a (software) adapter on GPU-less hosts.
+wgpu = { version = "25.0.0", default-features = false, features = [
+    "wgsl",
+    "gles",
+    "vulkan",
+    "metal",
+    "dx12",
+] }
 bytemuck = { version = "1", features = ["derive"] }
 world = { path = "../world" }
 assets = { path = "../assets" }

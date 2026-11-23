@@ -29,12 +29,23 @@
 
 #![forbid(unsafe_code)]
 
-use game::input::GameInput;
+// The browser shell only exists on wasm: wgpu's `SurfaceTarget::Canvas` is
+// gated to wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
+// `not(native)`), so every item that touches a GPU type is compiled only for
+// `wasm32-unknown-unknown` — the target the two workspace wasm checks build.
+// Host builds see the crate as the panic hook plus `backend_name`.
+#[cfg(target_arch = "wasm32")]
 use render::{AtlasDims, AtlasUpload, GpuRenderer, OrthoCamera, QualityTier, SpriteBatch};
+#[cfg(target_arch = "wasm32")]
 use runtime::frame::demo_race;
+#[cfg(target_arch = "wasm32")]
 use runtime::{advance_game_frame, pack_placeholder_atlas, AtlasMapping, RoadMesh};
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use world::RoadGeometry;
+
+#[cfg(target_arch = "wasm32")]
+use game::input::GameInput;
 
 /// Installs the panic hook once: panics surface in the browser console
 /// instead of vanishing behind a frozen loading screen.
@@ -56,6 +67,7 @@ pub fn backend_name() -> String {
 /// Folds the loader's input flags into the events queued for one tick:
 /// the last throttle-family command wins (brake over throttle), then the
 /// last steering direction. Pure — no device or race access.
+#[cfg(target_arch = "wasm32")]
 fn frame_inputs(
     accelerate: bool,
     brake: bool,
@@ -88,6 +100,12 @@ fn frame_inputs(
 /// The booted game: one race, its frame-composition buffers, and the GPU
 /// renderer presenting to the loader's canvas. Held across frames so the
 /// steady-state loop allocates nothing.
+///
+/// wasm-only, and not by choice: wgpu's `SurfaceTarget::Canvas` exists only
+/// on wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
+/// `not(native)`), so this type cannot compile on host targets. The wasm32
+/// checks in the workspace gate compile the real code.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct BrowserGame {
     race: game::race::Race,
@@ -99,11 +117,13 @@ pub struct BrowserGame {
     renderer: GpuRenderer,
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) enum BootError {
     Atlas(String),
     Render(String),
 }
 
+#[cfg(target_arch = "wasm32")]
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -113,6 +133,7 @@ impl std::fmt::Display for BootError {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl BrowserGame {
     /// Boots the demo race on `canvas`: packs the placeholder atlas, selects
@@ -155,7 +176,24 @@ impl BrowserGame {
 
         let (race, geometry) = demo_race();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // One backend per bundle — the loader's probe already picked it.
+        // This matters even though wgpu only compiles the matching backend:
+        // with default features the render/runtime dependency graph unifies
+        // `wgpu/webgpu` back in, and an `Backends::all()` instance then binds
+        // the canvas for BOTH backends. In headless Chrome the WebGPU path's
+        // `canvas.getContext('webgpu')` races the WebGL2 binding and wins,
+        // leaving the GL surface without a context (`NoAdapter` at bring-up,
+        // or a renderer presenting into a void). Requesting exactly one
+        // backend keeps the canvas owned by the build's renderer.
+        let backends = if cfg!(feature = "webgpu") {
+            wgpu::Backends::BROWSER_WEBGPU
+        } else {
+            wgpu::Backends::GL
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::default()
+        });
         let renderer = GpuRenderer::new(
             &instance,
             wgpu::SurfaceTarget::Canvas(canvas.clone()),
@@ -200,7 +238,7 @@ impl BrowserGame {
             &mut self.road,
         );
         self.renderer
-            .draw(&self.batch, &self.camera)
+            .draw(&self.batch, &self.road.vertices, &self.camera)
             .map_err(|e| JsError::new(&e.to_string()))
     }
 

@@ -10,6 +10,16 @@ world = { path = "../world" }
 assets = { path = "../assets" }
 game = { path = "../game" }
 render = { path = "../render" }
-wgpu = "25.0.0"
+# `default-features = false` for the same feature-unification reason recorded
+# in `render/Cargo.toml`: one default-features wgpu dependency re-enables the
+# browser-WebGPU backend in the web crate's webgl2 bundle. Native backends
+# match wgpu's defaults minus `webgpu` so the offscreen proof is unchanged.
+wgpu = { version = "25.0.0", default-features = false, features = [
+    "wgsl",
+    "gles",
+    "vulkan",
+    "metal",
+    "dx12",
+] }
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

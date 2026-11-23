@@ -24,4 +24,8 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4.80"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
-wgpu = "25.0.0"
+# `default-features = false`: wgpu's defaults carry the `webgpu` feature, which
+# cargo would unify into BOTH wasm bundles. The backend feature arrives through
+# this crate's own `webgpu`/`webgl2` feature below; `wgsl` is required to parse
+# the WGSL shader sources.
+wgpu = { version = "25.0.0", default-features = false, features = ["wgsl"] }
