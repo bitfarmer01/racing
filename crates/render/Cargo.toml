@@ -1,0 +1,11 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+description = "wgpu sprite-batch renderer for the racing runtime"
+
+[dependencies]
+wgpu = "25.0.0"
+bytemuck = { version = "1", features = ["derive"] }
+world = { path = "../world" }
+assets = { path = "../assets" }
