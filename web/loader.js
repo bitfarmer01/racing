@@ -72,7 +72,7 @@ async function boot() {
   setStatus('Booting…');
   let game;
   try {
-    game = await glue.RacingWeb.boot(canvas, lowEnd);
+    game = await glue.BrowserGame.boot(canvas, lowEnd);
   } catch (bootError) {
     if (!hasWebGpu) throw bootError;
     // The WebGPU adapter probed fine but bring-up failed (context loss,
@@ -80,10 +80,10 @@ async function boot() {
     console.warn('WebGPU boot failed, falling back to WebGL2:', bootError);
     setStatus('Falling back to WebGL2 build…');
     glue = await importBundle('pkg-webgl2');
-    game = await glue.RacingWeb.boot(canvas, lowEnd);
+    game = await glue.BrowserGame.boot(canvas, lowEnd);
   }
 
-  console.info(`racing: booted the ${glue.RacingWeb.backend_name()} build`);
+  console.info(`racing: booted the ${glue.backend_name()} build`);
   hideOverlay();
   hud.hidden = false;
 
