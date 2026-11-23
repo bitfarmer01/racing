@@ -88,6 +88,51 @@ fn fs_main(out: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Road shader: flat-color triangle-strip quads (one trapezoid per road
+/// strip). Field-for-field the WGSL mirror of [`RoadVertex`]. Shared verbatim
+/// by the offscreen frame proof and the browser `GpuRenderer` road pass.
+pub const ROAD_SHADER: &str = r#"
+struct CameraUniform {
+    clip_matrix: mat4x4<f32>,
+};
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+struct VSOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VSOut {
+    return VSOut(camera.clip_matrix * vec4<f32>(position, 0.0, 1.0), color);
+}
+
+@fragment
+fn fs_main(out: VSOut) -> @location(0) vec4<f32> {
+    return out.color;
+}
+"#;
+
+/// One road-mesh vertex: screen-space position plus a flat color. Owned here
+/// so the shared GPU path can draw the road; `runtime` composes meshes of
+/// these and re-exports the type.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoadVertex {
+    pub position: [f32; 2],
+    pub color: [f32; 4],
+}
+
+/// Grass-green backdrop the road rides on. Field-for-field the clear color
+/// of the offscreen frame proof, so the browser frame and the proof PNG
+/// compose identically.
+const BACKDROP_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.18,
+    g: 0.52,
+    b: 0.24,
+    a: 1.0,
+};
+
 /// Uniform mirror of the WGSL `CameraUniform` struct.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -185,19 +230,25 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array!
     4 => Float32x4,
 ];
 
-/// A warmed-up GPU renderer: surface, one sprite pipeline, atlas texture, and
-/// a fixed-capacity instance buffer. Built once at load (pipelines warm
-/// behind the loading screen per the blueprint), then only [`GpuRenderer::draw`]
-/// runs per frame.
+/// A warmed-up GPU renderer: surface, one sprite pipeline, one road pipeline,
+/// atlas texture, and fixed-capacity instance/road-vertex buffers. Built once
+/// at load (pipelines warm behind the loading screen per the blueprint), then
+/// only [`GpuRenderer::draw`] runs per frame.
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    road_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// The road and sprite pipelines share one camera uniform buffer; both
+    /// WGSL `CameraUniform` structs are field-identical.
+    road_bind_group: wgpu::BindGroup,
     camera_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     capacity: usize,
+    road_vertex_buf: wgpu::Buffer,
+    road_vertex_capacity: usize,
 }
 
 impl GpuRenderer {
@@ -351,6 +402,72 @@ impl GpuRenderer {
             cache: None,
         });
 
+        // Road pipeline: flat-color triangle strips over the same camera
+        // uniform. Opaque — the road always covers its pixels fully.
+        let road_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("render.road_shader"),
+            source: wgpu::ShaderSource::Wgsl(ROAD_SHADER.into()),
+        });
+        let road_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("render.road_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let road_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render.road_bind_group"),
+            layout: &road_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buf.as_entire_binding(),
+            }],
+        });
+        let road_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("render.road_pipeline_layout"),
+            bind_group_layouts: &[&road_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let road_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("render.road_pipeline"),
+            layout: Some(&road_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &road_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<RoadVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &road_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface.get_capabilities(&adapter).formats[0],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..wgpu::PrimitiveState::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let capabilities = surface.get_capabilities(&adapter);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -364,22 +481,46 @@ impl GpuRenderer {
         };
         surface.configure(&device, &config);
 
+        // Road vertices start empty; the first draw sizes the buffer to the
+        // mesh it is handed. Strip count is constant per frame once composed
+        // (draw-distance / step), so steady state never reallocates.
+        let road_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render.road_vertices"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             surface,
             device,
             queue,
             pipeline,
+            road_pipeline,
             bind_group,
+            road_bind_group,
             camera_buf,
             instance_buf,
             capacity,
+            road_vertex_buf,
+            road_vertex_capacity: 0,
         })
     }
 
-    /// Uploads the batch, draws one instanced quad per sprite over the atlas,
-    /// and presents. Per-frame work is exactly: two `write_buffer`s, one
-    /// encoder, one pass, one present — no allocations.
-    pub fn draw(&mut self, batch: &SpriteBatch, camera: &OrthoCamera) -> Result<(), RenderError> {
+    /// Uploads the road mesh, then draws the frame: one flat-color
+    /// triangle-strip pass for the road over the grass backdrop, then one
+    /// instanced quad per sprite on top, and presents. Per-frame work is
+    /// exactly: three `write_buffer`s, one encoder, one pass, one present —
+    /// no allocations in steady state.
+    ///
+    /// `road` may be empty — the sprite-only path — in which case the pass
+    /// presents the backdrop and sprites alone.
+    pub fn draw(
+        &mut self,
+        batch: &SpriteBatch,
+        road: &[RoadVertex],
+        camera: &OrthoCamera,
+    ) -> Result<(), RenderError> {
         let instances = batch.instances();
         debug_assert!(instances.len() <= self.capacity);
         let count = instances.len() as u32;
@@ -396,6 +537,19 @@ impl GpuRenderer {
             self.queue
                 .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
         }
+        if road.len() > self.road_vertex_capacity {
+            self.road_vertex_capacity = road.len();
+            self.road_vertex_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render.road_vertices"),
+                size: std::mem::size_of_val(road) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !road.is_empty() {
+            self.queue
+                .write_buffer(&self.road_vertex_buf, 0, bytemuck::cast_slice(road));
+        }
 
         let view = frame
             .texture
@@ -407,12 +561,12 @@ impl GpuRenderer {
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render.sprite_pass"),
+                label: Some("render.frame_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(BACKDROP_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -420,6 +574,13 @@ impl GpuRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // Road first, sprites on top — painter's order, as in the proof.
+            if !road.is_empty() {
+                pass.set_pipeline(&self.road_pipeline);
+                pass.set_bind_group(0, &self.road_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.road_vertex_buf.slice(..));
+                pass.draw(0..road.len() as u32, 0..1);
+            }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
