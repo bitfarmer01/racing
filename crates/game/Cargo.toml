@@ -1,0 +1,16 @@
+[package]
+name = "game"
+version = "0.1.0"
+edition = "2021"
+description = "Gameplay layer: bike state machine, race loop, pursuit AI, collisions, scoring"
+publish = false
+
+[dependencies]
+sim = { path = "../sim" }
+world = { path = "../world" }
+
+# Standalone-build marker while `game` waits for the render coder's single
+# workspace-members edit. DELETE this table when adding "crates/game" to the
+# root workspace members — a member must not declare its own [workspace].
+[workspace]
+
