@@ -1,0 +1,15 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+description = "Frame composition: advances the race, builds the sprite batch, and proves the GPU path offscreen."
+
+[dependencies]
+sim = { path = "../sim" }
+world = { path = "../world" }
+assets = { path = "../assets" }
+game = { path = "../game" }
+render = { path = "../render" }
+wgpu = "25.0.0"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
