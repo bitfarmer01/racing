@@ -8,6 +8,7 @@
 //! and batching decisions run here, on the CPU, before any device is touched.
 
 use game::bike::Control;
+use game::combat::Attack;
 use game::input::GameInput;
 use game::race::{Race, RaceConfig};
 use render::{AtlasDims, OrthoCamera, RoadPlacement, SpriteBatch, SpriteStyle};
@@ -303,10 +304,15 @@ pub struct AtlasMapping {
     ride: [f32; 4],
     brake: [f32; 4],
     crash: [f32; 4],
+    punch: [f32; 4],
+    kick: [f32; 4],
     /// The rivals' liveries, one per pack slot cycling `(slot - 1) % 3`.
     rival: [f32; 4],
     rival2: [f32; 4],
     rival3: [f32; 4],
+    /// Swing poses per rival livery, same livery order.
+    rival_punch: [[f32; 4]; 3],
+    rival_kick: [[f32; 4]; 3],
     shadow: [f32; 4],
     tree: [f32; 4],
     tree2: [f32; 4],
@@ -335,9 +341,21 @@ impl AtlasMapping {
             ride: uv("bike_ride"),
             brake: uv("bike_brake"),
             crash: uv("bike_crash"),
+            punch: uv("bike_punch"),
+            kick: uv("bike_kick"),
             rival: uv("bike_rival"),
             rival2: uv("bike_rival2"),
             rival3: uv("bike_rival3"),
+            rival_punch: [
+                uv("bike_punch_rival"),
+                uv("bike_punch_rival2"),
+                uv("bike_punch_rival3"),
+            ],
+            rival_kick: [
+                uv("bike_kick_rival"),
+                uv("bike_kick_rival2"),
+                uv("bike_kick_rival3"),
+            ],
             shadow: uv("shadow"),
             tree: uv("tree"),
             tree2: uv("tree2"),
@@ -380,6 +398,18 @@ impl AtlasMapping {
             0 => self.rival,
             1 => self.rival2,
             _ => self.rival3,
+        }
+    }
+
+    /// The mid-swing frame for a rider's attack: the player's own pair, or
+    /// the swing pair cut in the striking rival's livery.
+    pub fn swing_uv(&self, attack: Attack, slot: usize) -> [f32; 4] {
+        let livery = (slot - 1) % 3;
+        match (attack, slot) {
+            (Attack::Punch, 0) => self.punch,
+            (Attack::Kick, 0) => self.kick,
+            (Attack::Punch, _) => self.rival_punch[livery],
+            (Attack::Kick, _) => self.rival_kick[livery],
         }
     }
 
@@ -931,10 +961,14 @@ fn compose(
         } else {
             RIVAL_SCALES[(slot - 1) % RIVAL_SCALES.len()]
         };
-        let uv = if slot == 0 {
-            mapping.frame_uv(control)
-        } else if control == Control::Crashed {
+        // Swing first: a mid-punch rider shows the punch frame even while
+        // braking; the crash pose still wins over a downed rider's swing.
+        let uv = if control == Control::Crashed {
             mapping.frame_uv(Control::Crashed)
+        } else if let Some(attack) = race.bike_attack_pose(slot) {
+            mapping.swing_uv(attack, slot)
+        } else if slot == 0 {
+            mapping.frame_uv(control)
         } else {
             mapping.rival_uv(slot)
         };

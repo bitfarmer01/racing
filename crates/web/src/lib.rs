@@ -82,7 +82,9 @@ fn frame_inputs(
     brake: bool,
     steer_left: bool,
     steer_right: bool,
-) -> ([GameInput; 2], usize) {
+    punch: bool,
+    kick: bool,
+) -> ([GameInput; 3], usize) {
     let throttle = if brake {
         Some(GameInput::Brake)
     } else if accelerate {
@@ -97,9 +99,21 @@ fn frame_inputs(
     } else {
         None
     };
-    let mut inputs = [GameInput::Accelerate, GameInput::Accelerate];
+    // One swing per press; punch outranks kick if both land together.
+    let attack = if punch {
+        Some(GameInput::Punch)
+    } else if kick {
+        Some(GameInput::Kick)
+    } else {
+        None
+    };
+    let mut inputs = [
+        GameInput::Accelerate,
+        GameInput::Accelerate,
+        GameInput::Accelerate,
+    ];
     let mut count = 0;
-    for input in [throttle, steer].into_iter().flatten() {
+    for input in [throttle, steer, attack].into_iter().flatten() {
         inputs[count] = input;
         count += 1;
     }
@@ -236,8 +250,10 @@ impl BrowserGame {
         brake: bool,
         steer_left: bool,
         steer_right: bool,
+        punch: bool,
+        kick: bool,
     ) -> Result<(), JsError> {
-        let (inputs, count) = frame_inputs(accelerate, brake, steer_left, steer_right);
+        let (inputs, count) = frame_inputs(accelerate, brake, steer_left, steer_right, punch, kick);
         advance_game_frame(
             &mut self.race,
             &self.geometry,
@@ -320,6 +336,11 @@ impl BrowserGame {
             state |= 4;
         }
         state
+    }
+
+    /// The player's combat stamina bar, 0..1, for the HUD strip.
+    pub fn player_stamina(&self) -> f32 {
+        self.race.player_stamina()
     }
 
     /// Whether the player has finished every lap.

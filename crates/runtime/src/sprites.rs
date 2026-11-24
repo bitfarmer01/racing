@@ -544,15 +544,153 @@ fn crash_frame(palette: &BikePalette) -> RgbaImage {
     img
 }
 
+/// The punch swing: rider twisted off-line, one fist thrown past the
+/// shoulder at whoever is alongside. Same rear-view grammar as the ride
+/// frame, with the throwing arm replacing the left bar grip.
+fn punch_frame(palette: &BikePalette) -> RgbaImage {
+    let mut img = riding_frame(palette);
+    // Clear the upper body to redraw the throw.
+    clear_rect(&mut img, 4, 0, 92, 62);
+    // Right hand still braced low on the bars.
+    fill_rect_gradient(
+        &mut img,
+        62.0,
+        44.0,
+        80.0,
+        58.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_rect_gradient(
+        &mut img,
+        74.0,
+        38.0,
+        88.0,
+        56.0,
+        METAL,
+        [120, 122, 130, 255],
+    );
+    // Torso twisted into the swing, shading across the back.
+    fill_rect_gradient(
+        &mut img,
+        30.0,
+        38.0,
+        66.0,
+        74.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_round_rect_soft(&mut img, 26.0, 32.0, 72.0, 52.0, 8.0, palette.suit);
+    // The throw: a gradient arm up past the shoulder, ending in a big
+    // shaded fist — the point of contact, lit from above.
+    fill_rect_gradient(
+        &mut img,
+        12.0,
+        14.0,
+        34.0,
+        44.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_disc_shaded(
+        &mut img,
+        16.0,
+        14.0,
+        11.0,
+        palette.suit,
+        lighten(palette.suit, 0.45),
+    );
+    // Helmet, tucked behind the swing.
+    fill_disc_shaded(
+        &mut img,
+        54.0,
+        20.0,
+        14.0,
+        palette.helmet,
+        lighten(palette.helmet, 0.4),
+    );
+    img
+}
+
+/// The kick swing: one boot swung out wide of the bike at rider height —
+/// a shaded leg off the peg, boot disc at the end of the arc.
+fn kick_frame(palette: &BikePalette) -> RgbaImage {
+    let mut img = riding_frame(palette);
+    // Clear the upper body and the right flank for the swung leg.
+    clear_rect(&mut img, 4, 0, 92, 62);
+    clear_rect(&mut img, 58, 56, 96, 78);
+    // Left hand stays on the bars.
+    fill_rect_gradient(
+        &mut img,
+        16.0,
+        44.0,
+        34.0,
+        58.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_rect_gradient(&mut img, 8.0, 38.0, 24.0, 56.0, METAL, [120, 122, 130, 255]);
+    // Torso leaned away from the kick.
+    fill_rect_gradient(
+        &mut img,
+        28.0,
+        36.0,
+        62.0,
+        74.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_round_rect_soft(&mut img, 24.0, 30.0, 66.0, 50.0, 8.0, palette.suit);
+    // The swung leg: gradient shin out of the frame right, boot disc at
+    // the end of the arc.
+    fill_rect_gradient(
+        &mut img,
+        56.0,
+        54.0,
+        86.0,
+        72.0,
+        palette.suit,
+        palette.suit_dark,
+    );
+    fill_disc_shaded(&mut img, 86.0, 60.0, 10.0, TIRE, lighten(TIRE, 0.5));
+    // Helmet, upright over the lean.
+    fill_disc_shaded(
+        &mut img,
+        44.0,
+        20.0,
+        14.0,
+        palette.helmet,
+        lighten(palette.helmet, 0.4),
+    );
+    img
+}
+
 /// All placeholder frames as `(name, image)` pairs, ready for the packer.
 pub fn placeholder_frames() -> Vec<(String, RgbaImage)> {
     vec![
         ("bike_ride".to_owned(), riding_frame(&PLAYER_PALETTE)),
         ("bike_brake".to_owned(), braking_frame(&PLAYER_PALETTE)),
         ("bike_crash".to_owned(), crash_frame(&PLAYER_PALETTE)),
+        ("bike_punch".to_owned(), punch_frame(&PLAYER_PALETTE)),
+        ("bike_kick".to_owned(), kick_frame(&PLAYER_PALETTE)),
         ("bike_rival".to_owned(), riding_frame(RIVAL_PALETTES[0])),
+        (
+            "bike_punch_rival".to_owned(),
+            punch_frame(RIVAL_PALETTES[0]),
+        ),
+        ("bike_kick_rival".to_owned(), kick_frame(RIVAL_PALETTES[0])),
         ("bike_rival2".to_owned(), riding_frame(RIVAL_PALETTES[1])),
+        (
+            "bike_punch_rival2".to_owned(),
+            punch_frame(RIVAL_PALETTES[1]),
+        ),
+        ("bike_kick_rival2".to_owned(), kick_frame(RIVAL_PALETTES[1])),
         ("bike_rival3".to_owned(), riding_frame(RIVAL_PALETTES[2])),
+        (
+            "bike_punch_rival3".to_owned(),
+            punch_frame(RIVAL_PALETTES[2]),
+        ),
+        ("bike_kick_rival3".to_owned(), kick_frame(RIVAL_PALETTES[2])),
         ("tree".to_owned(), tree_frame()),
         ("tree2".to_owned(), broadleaf_frame()),
         ("tree3".to_owned(), tall_pine_frame()),
@@ -898,10 +1036,10 @@ mod tests {
         // Every combat frame obeys the HD bar: no flat fills, no banding.
         let mut failed = Vec::new();
         for (name, img) in frames {
-            if name.starts_with("bike_punch") || name.starts_with("bike_kick") {
-                if !is_smooth_gradient_shaded(&img) {
-                    failed.push(name);
-                }
+            if (name.starts_with("bike_punch") || name.starts_with("bike_kick"))
+                && !is_smooth_gradient_shaded(&img)
+            {
+                failed.push(name);
             }
         }
         assert!(

@@ -96,6 +96,25 @@
       background: linear-gradient(90deg, #34d399, #86efac);
       border-radius: 2px;
     }
+    /* Combat stamina bar, under the lap bar: amber while fighting, red
+       when the bar runs low. */
+    #stamina-bar {
+      width: 180px;
+      height: 4px;
+      margin-top: 3px;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.14);
+      overflow: hidden;
+    }
+    #stamina-fill {
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, #fbbf24, #fde68a);
+      border-radius: 2px;
+    }
+    #stamina-fill.low {
+      background: linear-gradient(90deg, #ef4444, #fca5a5);
+    }
     /* Rider-state badge, top-right (playtest E5). */
     #rider-state:not([hidden]) {
       position: absolute;
@@ -225,13 +244,14 @@
         <div id="hud-pos"></div>
         <div id="hud-lap"></div>
         <div id="lap-bar"><div id="lap-fill"></div></div>
+        <div id="stamina-bar"><div id="stamina-fill"></div></div>
       </div>
     </div>
     <div id="focus-overlay" hidden><div>
       <div id="focus-title">CLICK TO RIDE</div>
       <div id="focus-keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
     </div></div>
-    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
+    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · X punch · Z kick · R restart · Esc pause</div>
     <div id="rider-state" hidden></div>
     <div id="countdown" hidden></div>
     <div id="paused" hidden>PAUSED — Esc to resume</div>

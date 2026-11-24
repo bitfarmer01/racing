@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn punch_is_shorter_and_kick_is_longer() {
-        assert!(PUNCH_REACH < KICK_REACH);
+        const { assert!(PUNCH_REACH < KICK_REACH) };
         assert!(reach(Attack::Punch) == PUNCH_REACH);
         assert!(in_reach(Attack::Punch, PUNCH_REACH, 0.0));
         assert!(!in_reach(Attack::Punch, PUNCH_REACH + 0.01, 0.0));
@@ -217,9 +217,15 @@ mod tests {
         // swing cooldown: punch-punch with the cooldown between must cross.
         let gap_secs = ATTACK_COOLDOWN;
         let punch_chain = PUNCH_HIT + PUNCH_HIT - INSTABILITY_DECAY * gap_secs;
-        assert!(punch_chain >= INSTABILITY_DISMOUNT, "punch chain: {punch_chain}");
+        assert!(
+            punch_chain >= INSTABILITY_DISMOUNT,
+            "punch chain: {punch_chain}"
+        );
         let kick_chain = KICK_HIT * 3.0 - INSTABILITY_DECAY * 2.0 * ATTACK_COOLDOWN;
-        assert!(kick_chain >= INSTABILITY_DISMOUNT, "kick chain: {kick_chain}");
+        assert!(
+            kick_chain >= INSTABILITY_DISMOUNT,
+            "kick chain: {kick_chain}"
+        );
     }
 
     #[test]
@@ -252,7 +258,10 @@ mod tests {
     fn traffic_rage_shortens_the_retaliation_cooldown() {
         let plain = retaliation_cooldown(1.0, false);
         let angry = retaliation_cooldown(1.0, true);
-        assert!(angry < plain, "traffic alongside makes a rival swing sooner");
+        assert!(
+            angry < plain,
+            "traffic alongside makes a rival swing sooner"
+        );
         // Aggression stacks the same way.
         assert!(retaliation_cooldown(1.4, false) < plain);
         assert_eq!(plain, RETALIATION_COOLDOWN);
@@ -261,15 +270,24 @@ mod tests {
     #[test]
     fn a_hit_at_zero_stamina_dismounts_but_a_full_rider_needs_instability() {
         assert!(takes_dismount(INSTABILITY_DISMOUNT, 0.5));
-        assert!(takes_dismount(0.0, 0.0), "a hit on an empty rider is a dismount");
+        assert!(
+            takes_dismount(0.0, 0.0),
+            "a hit on an empty rider is a dismount"
+        );
         assert!(!takes_dismount(INSTABILITY_DISMOUNT - 1.0, 0.5));
     }
 
     #[test]
     fn combat_timers_step_and_stamina_regen_is_clean_only() {
-        let mut combat = Combat { swing: SWING_SECS, ..Combat::default() };
+        let mut combat = Combat {
+            swing: SWING_SECS,
+            ..Combat::default()
+        };
         step_combat(&mut combat, false, false, 1.0 / 60.0);
-        assert!(combat.cooldown > ATTACK_COOLDOWN, "cooldown counts toward ready");
+        assert!(
+            combat.cooldown > ATTACK_COOLDOWN,
+            "cooldown counts toward ready"
+        );
         assert!(combat.swing < SWING_SECS, "the pose decays");
         assert!(combat.stamina <= 1.0);
 
@@ -279,10 +297,16 @@ mod tests {
         assert_eq!(full.stamina, 1.0);
 
         // Attacking or being hit this tick blocks the regen.
-        let mut spent = Combat { stamina: 0.5, ..Combat::default() };
+        let mut spent = Combat {
+            stamina: 0.5,
+            ..Combat::default()
+        };
         step_combat(&mut spent, true, false, 1.0);
         assert_eq!(spent.stamina, 0.5);
-        let mut beaten = Combat { stamina: 0.5, ..Combat::default() };
+        let mut beaten = Combat {
+            stamina: 0.5,
+            ..Combat::default()
+        };
         step_combat(&mut beaten, false, true, 1.0);
         assert_eq!(beaten.stamina, 0.5);
     }
@@ -291,7 +315,10 @@ mod tests {
     fn combat_starts_ready_and_fresh() {
         let combat = Combat::default();
         assert_eq!(combat.stamina, 1.0);
-        assert!(combat.cooldown >= ATTACK_COOLDOWN, "the first swing is ready");
+        assert!(
+            combat.cooldown >= ATTACK_COOLDOWN,
+            "the first swing is ready"
+        );
         assert_eq!(combat.swing, 0.0);
         assert_eq!(combat.swing_attack, None);
     }

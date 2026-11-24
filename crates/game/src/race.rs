@@ -464,6 +464,7 @@ impl Race {
             );
         }
 
+        self.resolve_combat(intent.attack, dt);
         self.resolve_collisions();
         self.resolve_hazards();
         self.advance_traffic(dt);
@@ -512,6 +513,156 @@ impl Race {
             self.tick();
         }
         ticks
+    }
+
+    /// The wave 7b combat pass: the player's swing from this tick's intent,
+    /// rival retaliation, and every rider's combat timers. Runs after the
+    /// movement loop — attacks resolve against where riders actually are,
+    /// and a kick's shove is visible to this tick's collision pass.
+    fn resolve_combat(&mut self, player_attack: Option<Attack>, dt: f32) {
+        let mut attacked = [false; MAX_BIKES];
+        let mut was_hit = [false; MAX_BIKES];
+
+        // The player's swing: auto-target the nearest rider in reach.
+        // No target, no swing, no cost.
+        if let Some(attack) = player_attack {
+            let player_ready = self.aux[0].snapshot.control != Control::Crashed
+                && self.aux[0].combat.cooldown >= combat::ATTACK_COOLDOWN;
+            if player_ready {
+                let attacker = self.state(0);
+                let target = combat::pick_target(
+                    attacker.pos_x,
+                    attacker.pos_y,
+                    self.upright_riders_except(0)
+                        .filter(|(_, other)| {
+                            combat::in_reach(
+                                attack,
+                                other.pos_x - attacker.pos_x,
+                                other.pos_y - attacker.pos_y,
+                            )
+                        })
+                        .map(|(slot, other)| (slot, other.pos_x, other.pos_y)),
+                );
+                if let Some(target) = target {
+                    self.land_hit(0, target, attack);
+                    attacked[0] = true;
+                    was_hit[target] = true;
+                }
+            }
+        }
+
+        // Rival retaliation: swing at the nearest rider in reach once the
+        // aggression-weighted cooldown is up — sooner with a car alongside,
+        // because a rider shoved toward traffic is angrier.
+        for slot in 1..self.bike_count {
+            if self.aux[slot].snapshot.control == Control::Crashed {
+                continue;
+            }
+            let attacker = self.state(slot);
+            let near_traffic = self.traffic_alongside(attacker.pos_x, attacker.pos_y);
+            let ready =
+                combat::retaliation_cooldown(self.aux[slot].aggression, near_traffic.is_some());
+            if self.aux[slot].combat.cooldown < ready {
+                continue;
+            }
+            let target = combat::pick_target(
+                attacker.pos_x,
+                attacker.pos_y,
+                self.upright_riders_except(slot)
+                    .filter(|(_, other)| {
+                        combat::in_reach(
+                            Attack::Punch,
+                            other.pos_x - attacker.pos_x,
+                            other.pos_y - attacker.pos_y,
+                        )
+                    })
+                    .map(|(slot, other)| (slot, other.pos_x, other.pos_y)),
+            );
+            if let Some(target) = target {
+                self.land_hit(slot, target, Attack::Punch);
+                attacked[slot] = true;
+                was_hit[target] = true;
+            }
+        }
+
+        // Timers: instability decays while not being hit; cooldowns count
+        // up, poses decay, stamina regenerates while clean. A downed rider
+        // freezes its combat state until the crash flow hands the bike back.
+        for slot in 0..self.bike_count {
+            if self.aux[slot].snapshot.control == Control::Crashed {
+                continue;
+            }
+            if !was_hit[slot] {
+                self.aux[slot].instability =
+                    (self.aux[slot].instability - combat::INSTABILITY_DECAY * dt).max(0.0);
+            }
+            combat::step_combat(
+                &mut self.aux[slot].combat,
+                attacked[slot],
+                was_hit[slot],
+                dt,
+            );
+        }
+    }
+
+    /// Land one hit from `attacker` on `target`: the swing costs the
+    /// attacker stamina and opens the pose; the target takes instability
+    /// and a stamina drain, a kick's lateral shove (toward traffic when it
+    /// is there), and — past the threshold, or on an empty bar — a
+    /// dismount through the existing crash flow.
+    fn land_hit(&mut self, attacker: usize, target: usize, attack: Attack) {
+        self.aux[attacker].combat.cooldown = 0.0;
+        self.aux[attacker].combat.stamina =
+            (self.aux[attacker].combat.stamina - combat::stamina_cost(attack)).max(0.0);
+        combat::start_swing(&mut self.aux[attacker].combat, attack);
+
+        let target_state = self.state(target);
+        self.aux[target].instability += combat::hit_instability(attack);
+        self.aux[target].combat.stamina =
+            (self.aux[target].combat.stamina - combat::HIT_STAMINA_DRAIN).max(0.0);
+        if attack == Attack::Kick {
+            let traffic_y = self.traffic_alongside(target_state.pos_x, target_state.pos_y);
+            let attacker_y = self.state(attacker).pos_y;
+            let push = combat::KICK_PUSH
+                * combat::kick_push_side(attacker_y, target_state.pos_y, traffic_y);
+            self.write_lateral(target, target_state.pos_y + push);
+        }
+        if combat::takes_dismount(
+            self.aux[target].instability,
+            self.aux[target].combat.stamina,
+        ) {
+            self.crash_slot(target);
+        }
+    }
+
+    /// The lateral position of the nearest car alongside a rider, within
+    /// the near-traffic window — both the "toward traffic" kick direction
+    /// and the retaliation rage read it. `None` on a clear road.
+    fn traffic_alongside(&self, pos_x: f32, pos_y: f32) -> Option<f32> {
+        let mut best: Option<(f32, f32)> = None; // (|dx|, car_y)
+        for car in &self.traffic {
+            let dx = (car.state.pos_x - pos_x).abs();
+            let dy = (car.state.pos_y - pos_y).abs();
+            if dx <= combat::NEAR_TRAFFIC_RANGE
+                && dy <= combat::ADJACENT_LATERAL + 1.5
+                && best.is_none_or(|(best_dx, _)| dx < best_dx)
+            {
+                best = Some((dx, car.state.pos_y));
+            }
+        }
+        best.map(|(_, car_y)| car_y)
+    }
+
+    /// Every upright rider except `excluded`, with their pooled state.
+    fn upright_riders_except(
+        &self,
+        excluded: usize,
+    ) -> impl Iterator<Item = (usize, BikeState)> + '_ {
+        (0..self.bike_count)
+            .filter(move |&slot| {
+                slot != excluded && self.aux[slot].snapshot.control != Control::Crashed
+            })
+            .map(move |slot| (slot, self.state(slot)))
     }
 
     /// Push overlapping bikes apart laterally and scrub their speed; hard
@@ -604,6 +755,20 @@ impl Race {
             },
             cruise: 0.0,
         });
+    }
+
+    /// Test seam: skips the green-light countdown so combat tests stage and
+    /// fight immediately, without the grid waiting on the lights.
+    #[cfg(test)]
+    pub(crate) fn skip_countdown(&mut self) {
+        self.countdown_ticks = 0;
+    }
+
+    /// Test seam: sets one rider's stamina bar, so a test can stage the
+    /// empty-bar dismount rule in isolation.
+    #[cfg(test)]
+    pub(crate) fn set_stamina(&mut self, slot: usize, stamina: f32) {
+        self.aux[slot].combat.stamina = stamina;
     }
 
     fn write_lateral(&mut self, slot: usize, lateral: f32) {
@@ -1303,15 +1468,17 @@ mod tests {
 
     const STAGE_DY: f32 = 1.5;
 
-    /// Stages a duel: the rival 1 m ahead of the player and [`STAGE_DY`] to
-    /// the side — inside punch reach, clear of the bike-vs-bike overlap
-    /// envelope. Both riders sit on the rival's own preferred lane so the
-    /// AI holds the line instead of wandering out of the fight.
+    /// Stages a duel: the rider 1 m ahead of the player and [`STAGE_DY`]
+    /// to the side — inside punch reach, clear of the bike-vs-bike overlap
+    /// envelope — and skips the green-light countdown so the fight starts
+    /// immediately. The rider sits on its own preferred lane; the chase
+    /// logic settles it just behind the player, holding the adjacency.
     fn staged_fight(rivals: usize, seed: u64) -> Race {
         let mut race = flat_race(rivals, seed);
         race.clear_traffic();
+        race.skip_countdown();
         let lane = race.bike_states().nth(1).expect("rival staged").pos_y;
-        race.place_bike(1, 1.0, lane);
+        race.place_bike(1, -1.0, lane);
         race.place_bike(0, 0.0, lane - STAGE_DY);
         race
     }
@@ -1320,12 +1487,14 @@ mod tests {
     fn a_swing_with_no_adjacent_rival_costs_nothing() {
         let mut race = flat_race(1, 42);
         race.clear_traffic();
+        race.skip_countdown();
         let lane = race.bike_states().nth(1).expect("rival staged").pos_y;
         // Nobody alongside: the rival is staged far up the road.
         race.place_bike(1, 60.0, lane);
         race.place_bike(0, 0.0, lane);
 
-        for _ in 0..10 {
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
             race.push_input(GameInput::Punch);
             race.tick();
         }
@@ -1366,7 +1535,7 @@ mod tests {
         // a third can never land because the second already put them down.
         let rival_stamina = race.bike_stamina(1);
         assert!(
-            rival_stamina < 0.6 - 1e-4 && rival_stamina >= 0.2 - 1e-4,
+            (0.2 - 1e-4..0.6 - 1e-4).contains(&rival_stamina),
             "exactly two punches landed (rival stamina {rival_stamina})"
         );
         assert!(
@@ -1412,23 +1581,29 @@ mod tests {
             assert!(ticks < 600, "the rival never went down");
         }
         // The rider is down and scrubbing to a stop while the player rides on.
-        run(&mut race, 30, &[GameInput::Accelerate]);
-        let player_lead =
-            race.player_distance() - race.bike_states().nth(1).unwrap().pos_x;
+        run(&mut race, 90, &[GameInput::Accelerate]);
+        let player_lead = race.player_distance() - race.bike_states().nth(1).unwrap().pos_x;
         assert!(player_lead > 10.0, "the dismount dropped the rival behind");
 
         // After the crash flow runs its course the rival is back in the
-        // saddle, from a standstill — rejoining at a reduced speed, not a
-        // teleport back up to pace.
+        // saddle — from the crash's standstill, so the rejoin is at a
+        // reduced speed. Asserted at the recovery moment: any ticks of
+        // live racing after it and the chase logic converges the rival
+        // back up to pace, hiding the rejoin speed.
         let recovery_ticks =
-            (bike::CRASH_DURATION_SECS / TICK_DURATION_SECS as f32).ceil() as usize + 30;
-        run(&mut race, recovery_ticks, &[GameInput::Accelerate]);
-        let rival = race.bike_states().nth(1).unwrap();
-        assert_ne!(race.bike_control(1), Control::Crashed, "back on the bike");
+            (bike::CRASH_DURATION_SECS / TICK_DURATION_SECS as f32).ceil() as usize + 120;
+        let mut rejoined_speed = None;
+        for _ in 0..recovery_ticks {
+            race.tick();
+            if race.bike_control(1) != Control::Crashed {
+                rejoined_speed = Some(race.bike_states().nth(1).unwrap().speed);
+                break;
+            }
+        }
+        let rejoined_speed = rejoined_speed.expect("back on the bike");
         assert!(
-            rival.speed < bike::MAX_SPEED * 0.5,
-            "rejoining at a reduced speed ({})",
-            rival.speed
+            rejoined_speed < bike::MAX_SPEED * 0.5,
+            "rejoining at a reduced speed ({rejoined_speed})"
         );
     }
 
@@ -1499,15 +1674,19 @@ mod tests {
     #[test]
     fn a_hit_on_an_empty_stamina_bar_dismounts_the_player_through_crash_recover() {
         let mut race = staged_fight(1, 42);
-        // Stand in the fight and soak retaliation until the player's bar
-        // runs dry and the next landed hit puts them down through the
-        // existing crash flow.
+        // Ride the fight and soak retaliation until one more landed hit
+        // puts the player down through the existing crash flow. The bar is
+        // pinned empty through regen so the test isolates the rule under
+        // test: a hit landing at zero stamina dismounts — and nothing else
+        // (full swings would trip the instability threshold first and mask
+        // this rule).
         let mut ticks = 0;
         while race.player_control() != Control::Crashed {
+            race.set_stamina(0, 0.0);
             race.push_input(GameInput::Accelerate);
             race.tick();
             ticks += 1;
-            assert!(ticks < 3600, "the player was never dismounted");
+            assert!(ticks < 1800, "the player was never dismounted");
         }
         assert!(
             race.player_stamina() <= 1e-4,
