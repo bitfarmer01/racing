@@ -873,6 +873,44 @@ mod tests {
     }
 
     #[test]
+    fn combat_swing_frames_exist_and_shade_in_the_hd_style() {
+        let frames = placeholder_frames();
+        let names: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
+        // The player's swing poses.
+        for name in ["bike_punch", "bike_kick"] {
+            assert!(
+                names.contains(&name),
+                "{name} missing — combat ships with HD swing poses"
+            );
+        }
+        // And the rivals' — one swing pair per rival livery, so a rival
+        // mid-retaliation poses in its own colors.
+        for name in [
+            "bike_punch_rival",
+            "bike_kick_rival",
+            "bike_punch_rival2",
+            "bike_kick_rival2",
+            "bike_punch_rival3",
+            "bike_kick_rival3",
+        ] {
+            assert!(names.contains(&name), "{name} missing");
+        }
+        // Every combat frame obeys the HD bar: no flat fills, no banding.
+        let mut failed = Vec::new();
+        for (name, img) in frames {
+            if name.starts_with("bike_punch") || name.starts_with("bike_kick") {
+                if !is_smooth_gradient_shaded(&img) {
+                    failed.push(name);
+                }
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "{failed:?} — swing poses must shade smoothly like the rest of the HD set"
+        );
+    }
+
+    #[test]
     fn atlas_regeneration_is_deterministic() {
         let first = pack_placeholder_atlas().expect("placeholder atlas packs");
         let second = pack_placeholder_atlas().expect("placeholder atlas packs");

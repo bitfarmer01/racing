@@ -9,6 +9,7 @@
 //! - [`input`]: player intent, distilled from the sim input ring
 //! - [`bike`]: the per-bike control state machine and its tuning constants
 //! - [`ai`]: deterministic rival rider logic over world-crate lookahead
+//! - [`combat`]: adjacent-rider attacks, stamina, and dismounts (wave 7b)
 //! - [`race`]: the race driver that advances one 60 Hz tick per call
 //!
 //! Determinism: a tick depends only on the pushed input sequence and the
@@ -18,5 +19,6 @@
 
 pub mod ai;
 pub mod bike;
+pub mod combat;
 pub mod input;
 pub mod race;
