@@ -49,6 +49,18 @@ pub const RUBBER_BAND_RAMP: f32 = 15.0;
 pub const RUBBER_BAND_ACCEL: f32 = 30.0;
 /// Speed multiplier for leaders too far ahead to stay in the race.
 pub const RUBBER_BAND_EASE: f32 = 0.85;
+/// How much faster than the player a leader may ride at the window's inner
+/// edge, in m/s. The slack shrinks to zero as the gap grows toward
+/// [`RUBBER_BAND_AHEAD`], so the rider in front is always catchable and
+/// never holds a static gap.
+pub const LEADER_SLACK: f32 = 8.0;
+
+/// Width of the rumble strip along the tarmac edge, in meters: inside this
+/// shoulder band the surface scrubs speed and the camera shakes — the
+/// warning a rider gets before running off the road at speed is a crash.
+pub const RUMBLE_BAND: f32 = 1.5;
+/// Per-tick speed fraction kept while on the rumble strip or gravel.
+pub const RUMBLE_SCRUB: f32 = 0.995;
 /// Half the lateral span of lanes the grid spreads across, in meters.
 pub const GRID_HALF_SPAN: f32 = 3.0;
 /// Closing speed above which running into the bike ahead is a crash, in m/s.
@@ -154,6 +166,8 @@ pub struct Race {
     traffic: Vec<TrafficCar>,
     /// Static cone hazards on the road.
     hazards: Vec<Hazard>,
+    /// Whether the player was on the rumble strip this tick.
+    player_rumble: bool,
 }
 
 /// Aux state per rider, mirroring the pool's slot order.
@@ -267,6 +281,7 @@ impl Race {
             track_length: config.track_length,
             total_laps: config.total_laps,
             finished: false,
+            player_rumble: false,
             countdown_ticks: COUNTDOWN_TICKS,
             traffic,
             hazards,
@@ -296,6 +311,7 @@ impl Race {
 
     /// Advance exactly one 60 Hz tick. Inputs drained once, at tick start.
     pub fn tick(&mut self) {
+        self.player_rumble = false;
         let mut intent = Intent::default();
         for input in self.inputs.drain() {
             intent.absorb(input);
@@ -338,8 +354,24 @@ impl Race {
                 (cap, ease)
             } else if gap > RUBBER_BAND_AHEAD {
                 (self.aux[slot].top_speed * RUBBER_BAND_EASE, 0.0)
+            } else if gap > 0.0 {
+                // Ahead inside the window: the leader paces the player —
+                // capped at a small slack that shrinks with the gap, so a
+                // rider in front is always catchable, never a static gap.
+                let depth = (gap / RUBBER_BAND_AHEAD).min(1.0);
+                let ease = 1.0 - (1.0 - RUBBER_BAND_EASE) * depth;
+                let cap = (self.aux[slot].top_speed * ease)
+                    .min(player_speed + LEADER_SLACK * (1.0 - depth));
+                (cap, 0.0)
             } else {
-                (self.aux[slot].top_speed, 0.0)
+                // Behind but inside the chase window: shadow the player's
+                // pace at a small positive slack — close, pass, never ram.
+                // Without it a rival shares the player's exact acceleration
+                // curve and holds a static gap for seconds at a time.
+                (
+                    self.aux[slot].top_speed.min(player_speed + LEADER_SLACK),
+                    0.0,
+                )
             };
 
             let intent = if slot == 0 {
@@ -357,10 +389,26 @@ impl Race {
 
             let curvature = self.geometry.curvature_at(state.pos_x);
             let off_road = snapshot.is_off_road(half_width);
+            let was_crashed = snapshot.control == Control::Crashed;
             let mut snapshot = bike::step_bike(snapshot, intent, off_road, curvature, dt);
             if slot != 0 {
                 // Rivals never exceed their rubber-band cap.
                 snapshot.speed = snapshot.speed.min(cap);
+                // On straights the cap is a PACE, not just a ceiling: a
+                // rival converges on it directly, because sharing the
+                // player's acceleration curve otherwise pins the whole
+                // field in lockstep at whatever gaps the grid dealt. In
+                // corners and off the road, plain physics plus the clamp.
+                let on_straight =
+                    self.geometry.curvature_at(state.pos_x).abs() < ai::CURVE_DEADZONE;
+                if on_straight && snapshot.control != Control::Crashed && !off_road {
+                    let rate = RUBBER_BAND_ACCEL * dt;
+                    snapshot.speed = if snapshot.speed < cap {
+                        (snapshot.speed + rate).min(cap)
+                    } else {
+                        (snapshot.speed - rate).max(cap)
+                    };
+                }
                 // A chasing rival also accelerates above the nominal
                 // throttle — the cap alone never closes a gap on a player
                 // already at speed. Crashed and off-road riders chase on
@@ -372,6 +420,26 @@ impl Race {
             }
             if bike::should_crash(&snapshot, half_width) {
                 bike::crash(&mut snapshot);
+            }
+            if was_crashed
+                && snapshot.control != Control::Crashed
+                && snapshot.is_off_road(half_width)
+            {
+                // Back in the saddle, stranded in the dirt: glide the rider
+                // onto the tarmac shoulder so a recovered racer rejoins the
+                // race instead of grinding off-road at the dirt cap.
+                snapshot.lateral = snapshot.lateral.signum() * (half_width - 1.0);
+            }
+            // Shoulder rumble: the last meters before the tarmac ends warn
+            // the rider — a scrub and a shake — before the off-road crash
+            // threshold. True off the tarmac, it is gravel: keep scrubbing.
+            let on_rumble = snapshot.control != Control::Crashed
+                && (half_width - snapshot.lateral.abs()) < RUMBLE_BAND;
+            if on_rumble {
+                snapshot.speed *= RUMBLE_SCRUB;
+                if slot == 0 {
+                    self.player_rumble = true;
+                }
             }
 
             // Integrate forward motion: speed is meters per second.
@@ -611,6 +679,12 @@ impl Race {
         }
     }
 
+    /// Whether the player was on the shoulder rumble strip this tick —
+    /// the warning before running off the road at speed is a crash.
+    pub fn player_on_rumble(&self) -> bool {
+        self.player_rumble
+    }
+
     /// Live bike count, player included.
     pub fn bike_count(&self) -> usize {
         self.bike_count
@@ -718,7 +792,7 @@ mod tests {
     #[test]
     fn ramming_the_bike_ahead_at_speed_crashes_the_rammer() {
         let mut race = flat_race(1, 42);
-        run(&mut race, 70, &[GameInput::Accelerate]);
+        run(&mut race, 100, &[GameInput::Accelerate]);
         // Stage the rival just ahead, stopped, in the player's line.
         race.place_bike(1, race.player_distance() + 2.0, 0.0);
         let player_speed = race.player_speed();
@@ -734,11 +808,11 @@ mod tests {
         let mut race = flat_race(0, 42);
         run(&mut race, 1, &[]);
         // Stage the player 30 m behind a car, in its lane, from a stop: full
-        // throttle reaches 40+ m/s before catching the car, way over the
-        // 12 m/s closing-speed crash threshold.
+        // throttle reaches 40+ m/s down the road and runs the car down well
+        // over the 12 m/s closing-speed crash threshold.
         let car = race.traffic_cars()[0].state;
         race.place_bike(0, car.pos_x - 30.0, car.pos_y);
-        run(&mut race, 200, &[GameInput::Accelerate]);
+        run(&mut race, 300, &[GameInput::Accelerate]);
         assert_eq!(race.player_control(), Control::Crashed, "traffic bites");
     }
 
@@ -775,13 +849,15 @@ mod tests {
         run(&mut race, 30, &[GameInput::Accelerate]);
         let speed = race.player_speed();
         assert!(speed >= bike::MIN_STEER_SPEED, "full steering authority");
-        // Three steering pulses in one tick count once.
+        // Three steering pulses in one tick count once. The pulse's lateral
+        // nudge is the nominal rate times the first tick's ramp fraction.
         for _ in 0..3 {
             race.push_input(GameInput::SteerRight);
         }
         race.tick();
         let one_pulse = race.player_lateral();
-        assert!((one_pulse - bike::STEER_RATE * TICK_DURATION_SECS as f32).abs() < 1e-5);
+        let ramp = (TICK_DURATION_SECS as f32 / bike::STEER_RAMP_SECS).min(1.0);
+        assert!((one_pulse - bike::STEER_RATE * TICK_DURATION_SECS as f32 * ramp).abs() < 1e-5);
 
         // The next tick sees nothing: coast, no further lateral motion.
         race.tick();
@@ -823,21 +899,76 @@ mod tests {
         race.clear_traffic();
         // 180 ticks of throttle exceeds the 30 m/s crash threshold.
         run(&mut race, 180, &[GameInput::Accelerate]);
-        // Hold right until off-road.
+        // Hold right WITH throttle so the bike crosses the edge still over
+        // the crash threshold (coasting bleeds under it on the way out).
         race.clear_traffic();
         let mut steering = 0;
         while race.player_lateral() <= 6.0 {
-            run(&mut race, 1, &[GameInput::SteerRight]);
+            run(
+                &mut race,
+                1,
+                &[GameInput::SteerRight, GameInput::Accelerate],
+            );
             steering += 1;
             assert!(steering < 200, "never left the road");
         }
         assert_eq!(race.player_control(), Control::Crashed);
 
-        // After the crash duration the rider is back on coast.
+        // After the crash duration the rider is back on coast — and back on
+        // the tarmac: a recovered racer rejoins the race instead of being
+        // stranded off-road at the dirt cap.
         let recovery_ticks =
             (bike::CRASH_DURATION_SECS / TICK_DURATION_SECS as f32).ceil() as usize + 10;
         run(&mut race, recovery_ticks, &[]);
         assert_eq!(race.player_control(), Control::Coast);
+        assert!(
+            race.player_lateral() <= 6.0,
+            "recovered rider glided back onto the tarmac"
+        );
+    }
+
+    #[test]
+    fn the_shoulder_rumbles_and_scrubs_before_the_edge() {
+        // The player sits just inside the shoulder band (half width 6,
+        // band 1.5) and brings them up to speed on the straight.
+        let mut race = flat_race(0, 7);
+        race.clear_traffic();
+        race.place_bike(0, 60.0, 5.5);
+        run(&mut race, 60, &[GameInput::Accelerate]);
+        // One coast tick on the strip: flagged, and scrubbed harder than
+        // the same tick on the centreline.
+        race.tick();
+        assert!(race.player_on_rumble(), "on the rumble strip");
+        let rumble_speed = race.player_speed();
+
+        let mut centre = flat_race(0, 7);
+        centre.clear_traffic();
+        centre.place_bike(0, 60.0, 0.0);
+        run(&mut centre, 60, &[GameInput::Accelerate]);
+        centre.tick();
+        assert!(!centre.player_on_rumble(), "centreline is clean");
+        assert!(
+            centre.player_speed() - rumble_speed > 0.04,
+            "the strip scrubs speed"
+        );
+    }
+
+    #[test]
+    fn race_position_trades_places_as_the_pack_races() {
+        let mut race = flat_race(3, 7);
+        race.clear_traffic();
+        let start_position = race.race_position();
+        assert!(start_position > 1, "rivals start ahead of the player");
+
+        // A straight full-throttle run: the player claws through the field.
+        // Rivals pace the player through the mid-race, so the pass comes as
+        // the slower top speeds fall behind the player's top-gear tail.
+        run(&mut race, 900, &[GameInput::Accelerate]);
+        assert!(
+            race.race_position() < start_position,
+            "the player gained places (now {})",
+            race.race_position()
+        );
     }
 
     #[test]
@@ -1029,7 +1160,7 @@ mod tests {
 
         assert!(
             race.player_speed() * 3.6 > 120.0,
-            "120 km/h within three seconds of throttle"
+            "120 km/h within four seconds of throttle"
         );
         assert!(
             race.player_distance() > start_distance + 60.0,

@@ -106,6 +106,9 @@ const CAMERA_LEAN_MAX: f32 = 1.5;
 const SPEED_WIDENING: f32 = 0.25;
 /// Camera shake amplitude while crashed, in world units.
 const CRASH_SHAKE: f32 = 0.35;
+/// Camera shake while on the shoulder rumble strip — the warning the
+/// rider feels before running off the road at speed is a crash.
+const RUMBLE_SHAKE: f32 = 0.09;
 
 /// One road-mesh vertex: screen-space position plus a flat color. The type
 /// lives in the `render` crate (the shared GPU path draws it); re-exported
@@ -313,7 +316,10 @@ pub fn track_geometry() -> RoadGeometry {
             world::CurveSegment {
                 start: 200.0,
                 length: 700.0,
-                curvature: -0.004,
+                // Opening bend: winnable flat out under the corner-force
+                // balance — 4.75 m/s of push against 5.0 of steer at top
+                // speed, a fight but a survivable one.
+                curvature: -0.003,
             },
             world::CurveSegment {
                 start: 1200.0,
@@ -674,6 +680,8 @@ fn compose(
     let mut jitter = sim::rng::XorShift64::new(race.tick_index() | 1);
     let shake = if player_control == Control::Crashed {
         CRASH_SHAKE * (race.player_crash_timer() / game::bike::CRASH_DURATION_SECS)
+    } else if race.player_on_rumble() {
+        RUMBLE_SHAKE
     } else {
         0.0
     };

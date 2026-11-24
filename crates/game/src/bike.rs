@@ -11,7 +11,9 @@ use crate::input::{Intent, Steer, Throttle};
 
 /// Top speed on tarmac, in meters per second (~216 km/h).
 pub const MAX_SPEED: f32 = 60.0;
-/// Throttle acceleration, in meters per second squared.
+/// Throttle acceleration at the line, in meters per second squared. The
+/// launch pull tapers to [`SHIFT_ACCEL`] at [`LAUNCH_SPEED`], then the
+/// top-gear tail below takes over.
 pub const ACCEL: f32 = 18.0;
 /// Brake deceleration, in meters per second squared.
 pub const BRAKE_DECEL: f32 = 35.0;
@@ -24,6 +26,10 @@ pub const OFFROAD_MAX_SPEED: f32 = 18.0;
 pub const OFFROAD_DRAG: f32 = 14.0;
 /// Lateral speed while leaning, in meters per second.
 pub const STEER_RATE: f32 = 5.0;
+/// Seconds of held steering to reach full lateral authority. A tap nudges,
+/// a hold bites: the ramp eases steering in so the all-or-nothing jolt of
+/// the fixed rate disappears.
+pub const STEER_RAMP_SECS: f32 = 0.2;
 /// Forward speed at which steering reaches full authority, in m/s. Below it
 /// the bike is upright and barely steers, so a stopped bike cannot wiggle.
 pub const MIN_STEER_SPEED: f32 = 8.0;
@@ -35,8 +41,20 @@ pub const LEAN_MAX: f32 = 0.42;
 /// Fast enough to be visibly leaning within two 60 Hz frames.
 pub const LEAN_RATE: f32 = 6.0;
 /// Cornering force: taking a curve at speed throws the bike outward at
-/// `speed² · curvature · CORNER_FORCE` m/s. Corners cost speed or skill.
-pub const CORNER_FORCE: f32 = 0.32;
+/// `speed² · curvature · CORNER_FORCE` m/s. With [`STEER_RATE`] at 5.0 the
+/// balance is: the opening bend (curvature 0.003) is winnable flat out —
+/// 4.75 m/s of push against 5.0 of steer, a fight — while the long bend
+/// (0.005) needs 5.5 m/s at 216 km/h and is only survivable under braking
+/// (below ~180 km/h). Corners cost speed or skill.
+pub const CORNER_FORCE: f32 = 0.44;
+/// Speed of the launch-to-top-gear shift point, in m/s (~119 km/h): full
+/// throttle reaches it in about three seconds, then the pull eases off.
+pub const LAUNCH_SPEED: f32 = 33.0;
+/// Launch acceleration remaining at the shift point, in m/s². Above it the
+/// pull is `SHIFT_ACCEL · (1 - speed / MAX_SPEED) / (1 - LAUNCH_SPEED /
+/// MAX_SPEED)` — a long tail that brings top speed in down the road, not
+/// off the line.
+pub const SHIFT_ACCEL: f32 = 5.0;
 /// How hard the bike scrubs speed while sliding in a crash, in meters per
 /// second squared.
 pub const CRASH_DRAG: f32 = 25.0;
@@ -74,6 +92,9 @@ pub struct BikeSnapshot {
     /// Follows the steering intent and the corner's bend; carried so the
     /// renderer can roll the sprite quad without re-deriving the lean.
     pub lean: f32,
+    /// Signed seconds of held steering (sign = direction): the accumulator
+    /// behind the steering ramp. Reset by releasing or reversing input.
+    pub steer_hold: f32,
 }
 
 impl BikeSnapshot {
@@ -127,7 +148,15 @@ pub fn step_bike(
     };
     bike.speed = match bike.control {
         Control::Accelerate => {
-            let next = bike.speed + ACCEL * dt;
+            // Launch pull tapering to the shift point, then a long
+            // top-gear tail: the last stretch of top speed arrives down
+            // the road, not off the line.
+            let pull = if bike.speed < LAUNCH_SPEED {
+                ACCEL + (SHIFT_ACCEL - ACCEL) * (bike.speed / LAUNCH_SPEED)
+            } else {
+                SHIFT_ACCEL * (1.0 - bike.speed / MAX_SPEED) / (1.0 - LAUNCH_SPEED / MAX_SPEED)
+            };
+            let next = bike.speed + pull * dt;
             if off_road && next > speed_cap {
                 // Too fast for the dirt: heavy drag pulls the bike back down.
                 (bike.speed - OFFROAD_DRAG * dt).max(speed_cap)
@@ -139,13 +168,20 @@ pub fn step_bike(
         _ => (bike.speed - COAST_DRAG * dt).max(0.0),
     };
 
-    // Steering authority scales with speed: the bike must be moving to lean.
+    // Steering authority scales with speed (the bike must be moving to
+    // lean) and ramps in over held input: a tap nudges, a hold bites.
     let steer_scale = (bike.speed / MIN_STEER_SPEED).min(1.0);
-    let steer_nudge = match intent.steer {
-        Steer::Left => -STEER_RATE * dt,
-        Steer::Right => STEER_RATE * dt,
+    let steer_dir = match intent.steer {
+        Steer::Left => -1.0,
+        Steer::Right => 1.0,
         Steer::None => 0.0,
     };
+    if steer_dir == 0.0 || bike.steer_hold.signum() != steer_dir {
+        bike.steer_hold = 0.0;
+    }
+    bike.steer_hold = (bike.steer_hold + steer_dir * dt).clamp(-STEER_RAMP_SECS, STEER_RAMP_SECS);
+    let steer_ramp = (bike.steer_hold.abs() / STEER_RAMP_SECS).min(1.0);
+    let steer_nudge = steer_dir * STEER_RATE * steer_ramp * dt;
     // Outward cornering force: positive curvature bends left, so the push
     // is to the right (positive lateral) — the road flings you wide.
     let corner_push = bike.speed * bike.speed * corner_curvature * CORNER_FORCE * dt;
@@ -157,7 +193,8 @@ pub fn step_bike(
     // a rider coasting through a bend banks into it by that much. Positive
     // curvature bends left, and into a left bend is a leftward (negative)
     // lean.
-    let steer_lean = steer_scale
+    let steer_lean = steer_ramp
+        * steer_scale
         * match intent.steer {
             Steer::Left => -1.0,
             Steer::Right => 1.0,
@@ -310,6 +347,7 @@ mod tests {
             control: Control::Crashed,
             crash_timer: 1.0,
             lean: 0.0,
+            steer_hold: 0.0,
         };
         let speed_before = bike.speed;
         bike = stepped(bike, &[GameInput::SteerRight, GameInput::Accelerate], true);
@@ -329,6 +367,7 @@ mod tests {
             control: Control::Crashed,
             crash_timer: sim::clock::TICK_DURATION_SECS as f32,
             lean: 0.0,
+            steer_hold: 0.0,
         };
         bike = stepped(bike, &[], false);
         assert_eq!(bike.control, Control::Coast, "timer expired this tick");
@@ -370,19 +409,16 @@ mod tests {
             speed: 30.0,
             ..BikeSnapshot::at_rest()
         };
-        // Two ticks of full-left steer at 60 Hz: visibly banked left.
-        let left = stepped(
-            stepped(rolling, &[GameInput::SteerLeft], false),
-            &[GameInput::SteerLeft],
-            false,
-        );
-        assert!(left.lean < -0.1, "banked left within two ticks");
+        // Held left steer at 60 Hz: the ramp is full after STEER_RAMP_SECS
+        // (12 ticks), and the bank is visibly deep by then.
+        let left = (0..12).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerLeft], false)
+        });
+        assert!(left.lean < -0.2, "banked left within the ramp");
 
-        let right = stepped(
-            stepped(rolling, &[GameInput::SteerRight], false),
-            &[GameInput::SteerRight],
-            false,
-        );
+        let right = (0..12).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerRight], false)
+        });
         assert!((left.lean + right.lean).abs() < 1e-5, "symmetric bank");
 
         // Full authority never exceeds the cap, and coasting settles flat.
@@ -392,6 +428,32 @@ mod tests {
         assert!((held.lean - LEAN_MAX).abs() < 1e-4, "bank caps at LEAN_MAX");
         let settled = (0..30).fold(held, |bike, _| stepped(bike, &[], false));
         assert!(settled.lean.abs() < 1e-4, "no input settles the rider up");
+    }
+
+    #[test]
+    fn steering_ramps_in_and_bites_when_held() {
+        let rolling = BikeSnapshot {
+            speed: 30.0,
+            ..BikeSnapshot::at_rest()
+        };
+        // The first tick's lateral nudge is the rate times the ramp fraction
+        // (dt / STEER_RAMP_SECS) — a tap nudges, it does not snap.
+        let first = stepped(rolling, &[GameInput::SteerRight], false);
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let ramp = (dt / STEER_RAMP_SECS).min(1.0);
+        let expected = STEER_RATE * dt * ramp;
+        assert!((first.lateral - expected).abs() < 1e-6, "ramped first tick");
+
+        // Held long enough, the ramp is full: per-tick nudge reaches the
+        // nominal STEER_RATE.
+        let held = (0..12).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerRight], false)
+        });
+        let next = stepped(held, &[GameInput::SteerRight], false);
+        assert!(
+            (next.lateral - held.lateral - STEER_RATE * dt).abs() < 1e-4,
+            "full authority after the ramp"
+        );
     }
 
     #[test]
@@ -422,6 +484,7 @@ mod tests {
             lean: 0.3,
             control: Control::Crashed,
             crash_timer: 1.0,
+            steer_hold: 0.0,
         };
         let bike = step_bike(down, Intent::default(), false, 0.0, dt);
         assert!(bike.lean.abs() < 0.3, "crash settles the bank");
