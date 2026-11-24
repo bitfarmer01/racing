@@ -113,6 +113,13 @@ fn fs_main(out: VSOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Index pattern for the 4-vertex road quad starting at `base`: triangles
+/// (0,1,2) and (2,1,3) — the two triangles a triangle-strip read of the
+/// quad would have produced, now drawn without inter-quad bridging.
+fn make_quad_indices(base: u32) -> [u32; 6] {
+    [base, base + 1, base + 2, base + 2, base + 1, base + 3]
+}
+
 /// One road-mesh vertex: screen-space position plus a flat color. Owned here
 /// so the shared GPU path can draw the road; `runtime` composes meshes of
 /// these and re-exports the type.
@@ -240,6 +247,8 @@ pub struct GpuRenderer {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     road_pipeline: wgpu::RenderPipeline,
+    road_index_buf: wgpu::Buffer,
+    road_index_capacity: usize,
     bind_group: wgpu::BindGroup,
     /// The road and sprite pipelines share one camera uniform buffer; both
     /// WGSL `CameraUniform` structs are field-identical.
@@ -395,15 +404,21 @@ impl GpuRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState::default(),
+            // Sprite quads are 4 vertices per instance spanning two
+            // triangles. A triangle list would render only the first
+            // triangle — half of every sprite.
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..wgpu::PrimitiveState::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });
 
-        // Road pipeline: flat-color triangle strips over the same camera
-        // uniform. Opaque — the road always covers its pixels fully.
+        // Road pipeline: flat-color indexed triangle list over the same
+        // camera uniform. Opaque — the road always covers its pixels fully.
         let road_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render.road_shader"),
             source: wgpu::ShaderSource::Wgsl(ROAD_SHADER.into()),
@@ -458,10 +473,10 @@ impl GpuRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..wgpu::PrimitiveState::default()
-            },
+            // Road quads are independent: an indexed triangle list, 6
+            // indices per 4-vertex quad. Strip topology would join
+            // consecutive quads with bridging triangles.
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -490,6 +505,12 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let road_index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render.road_indices"),
+            size: 0,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Ok(Self {
             surface,
@@ -497,6 +518,8 @@ impl GpuRenderer {
             queue,
             pipeline,
             road_pipeline,
+            road_index_buf,
+            road_index_capacity: 0,
             bind_group,
             road_bind_group,
             camera_buf,
@@ -550,6 +573,25 @@ impl GpuRenderer {
             self.queue
                 .write_buffer(&self.road_vertex_buf, 0, bytemuck::cast_slice(road));
         }
+        // One index pattern per 4-vertex quad: triangles (0,1,2) and
+        // (2,1,3) match the old per-quad strip winding.
+        let index_count: u32 = (road.len() / 4 * 6) as u32;
+        if index_count as usize > self.road_index_capacity {
+            self.road_index_capacity = index_count as usize;
+            self.road_index_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render.road_indices"),
+                size: index_count as u64 * 4,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if index_count > 0 {
+            let indices: Vec<u32> = (0..road.len() as u32 / 4)
+                .flat_map(|q| make_quad_indices(q * 4))
+                .collect();
+            self.queue
+                .write_buffer(&self.road_index_buf, 0, bytemuck::cast_slice(&indices));
+        }
 
         let view = frame
             .texture
@@ -579,7 +621,8 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.road_pipeline);
                 pass.set_bind_group(0, &self.road_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.road_vertex_buf.slice(..));
-                pass.draw(0..road.len() as u32, 0..1);
+                pass.set_index_buffer(self.road_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..index_count, 0, 0..1);
             }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
