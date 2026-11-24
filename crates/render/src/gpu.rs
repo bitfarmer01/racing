@@ -230,6 +230,10 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array!
     4 => Float32x4,
 ];
 
+/// Samples per pixel on the frame attachment. 4x kills road-edge
+/// stair-stepping at a cost every WebGL2 adapter (and SwiftShader) supports.
+const MSAA_SAMPLE_COUNT: u32 = 4;
+
 /// A warmed-up GPU renderer: surface, one sprite pipeline, one road pipeline,
 /// atlas texture, and fixed-capacity instance/road-vertex buffers. Built once
 /// at load (pipelines warm behind the loading screen per the blueprint), then
@@ -249,6 +253,15 @@ pub struct GpuRenderer {
     capacity: usize,
     road_vertex_buf: wgpu::Buffer,
     road_vertex_capacity: usize,
+    /// Six u16 indices per quad, pattern-filled once per capacity growth —
+    /// the index pattern never varies with the mesh contents.
+    road_index_buf: wgpu::Buffer,
+    road_index_quads: usize,
+    /// Multisampled attachment the frame resolves from. Recreated in
+    /// [`GpuRenderer::draw`] whenever the frame size or format drifts.
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    msaa_key: (u32, u32, wgpu::TextureFormat),
 }
 
 impl GpuRenderer {
@@ -290,8 +303,10 @@ impl GpuRenderer {
         let (_, view) = upload_atlas(&device, &queue, atlas);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("render.atlas.sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            // Pixel art scaled up: nearest keeps texel edges crisp — linear
+            // smoothing washes the atlas into pale halos.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
 
@@ -395,15 +410,26 @@ impl GpuRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState::default(),
+            // Four corners per instance, one instance per sprite: the vertex
+            // shader fans the quad out from `vertex_index`, so a strip is the
+            // correct topology — a list would render only the first triangle.
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..wgpu::PrimitiveState::default()
+            },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLE_COUNT,
+                ..wgpu::MultisampleState::default()
+            },
             multiview: None,
             cache: None,
         });
 
-        // Road pipeline: flat-color triangle strips over the same camera
-        // uniform. Opaque — the road always covers its pixels fully.
+        // Road pipeline: flat-color indexed triangle list over the same
+        // camera uniform — one six-index quad per mesh strip, so separate
+        // quads never bridge into one another as they would in one long
+        // strip. Opaque — the road always covers its pixels fully.
         let road_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render.road_shader"),
             source: wgpu::ShaderSource::Wgsl(ROAD_SHADER.into()),
@@ -459,11 +485,14 @@ impl GpuRenderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 ..wgpu::PrimitiveState::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLE_COUNT,
+                ..wgpu::MultisampleState::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -490,6 +519,15 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let road_index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render.road_indices"),
+            size: 0,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let msaa_key = (config.width, config.height, config.format);
+        let (msaa_texture, msaa_view) = create_msaa_target(&device, msaa_key, MSAA_SAMPLE_COUNT);
 
         Ok(Self {
             surface,
@@ -504,6 +542,11 @@ impl GpuRenderer {
             capacity,
             road_vertex_buf,
             road_vertex_capacity: 0,
+            road_index_buf,
+            road_index_quads: 0,
+            msaa_texture,
+            msaa_view,
+            msaa_key,
         })
     }
 
@@ -550,10 +593,40 @@ impl GpuRenderer {
             self.queue
                 .write_buffer(&self.road_vertex_buf, 0, bytemuck::cast_slice(road));
         }
+        let quad_count = road.len() / 4;
+        debug_assert_eq!(quad_count * 4, road.len(), "road mesh must be whole quads");
+        if quad_count > self.road_index_quads {
+            self.road_index_quads = quad_count;
+            self.road_index_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render.road_indices"),
+                size: (quad_count * std::mem::size_of::<[u16; 6]>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // The index pattern depends only on quad count, never on mesh
+            // contents, so it is uploaded once per capacity growth.
+            self.queue.write_buffer(
+                &self.road_index_buf,
+                0,
+                bytemuck::cast_slice(&quad_index_pattern(quad_count)),
+            );
+        }
 
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_key = (
+            frame.texture.width(),
+            frame.texture.height(),
+            frame.texture.format(),
+        );
+        if frame_key != self.msaa_key {
+            let (texture, msaa_view) =
+                create_msaa_target(&self.device, frame_key, MSAA_SAMPLE_COUNT);
+            self.msaa_texture = texture;
+            self.msaa_view = msaa_view;
+            self.msaa_key = frame_key;
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -563,11 +636,13 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render.frame_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &self.msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(BACKDROP_CLEAR),
-                        store: wgpu::StoreOp::Store,
+                        // Resolved into the frame already; the multisample
+                        // buffer itself is dead on store.
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -579,7 +654,8 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.road_pipeline);
                 pass.set_bind_group(0, &self.road_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.road_vertex_buf.slice(..));
-                pass.draw(0..road.len() as u32, 0..1);
+                pass.set_index_buffer(self.road_index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..(quad_count * 6) as u32, 0, 0..1);
             }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -592,6 +668,45 @@ impl GpuRenderer {
         frame.present();
         Ok(())
     }
+}
+
+/// Builds the draw pattern for a road mesh of `quads` flat-colored quads:
+/// six u16 indices per quad — two triangles over the four vertices pushed per
+/// strip (`near-left, near-right, far-left, far-right`). Pure, so the pattern
+/// is testable on the host without a device.
+fn quad_index_pattern(quads: usize) -> Vec<u16> {
+    let mut indices = Vec::with_capacity(quads * 6);
+    for q in 0..quads as u16 {
+        let base = q * 4;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    }
+    indices
+}
+
+/// Creates the multisampled render attachment the frame pass draws into and
+/// resolves from: same size and format as the frame, `samples` samples.
+fn create_msaa_target(
+    device: &wgpu::Device,
+    key: (u32, u32, wgpu::TextureFormat),
+    samples: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let (width, height, format) = key;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("render.msaa_target"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: samples,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// Uploads atlas RGBA bytes into a texture binding pair. Row padding: the
@@ -635,4 +750,34 @@ fn upload_atlas(
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quad_index_pattern;
+
+    #[test]
+    fn one_quad_covers_both_triangles_over_its_four_vertices() {
+        assert_eq!(quad_index_pattern(1), vec![0, 1, 2, 2, 1, 3]);
+    }
+
+    #[test]
+    fn each_quad_indexes_only_its_own_vertices() {
+        // No index ever reaches past its own quad, so a rumble strip can
+        // never bridge triangles across into the neighboring quad.
+        let quads = 7;
+        for (i, index) in quad_index_pattern(quads).into_iter().enumerate() {
+            let quad = i / 6;
+            let base = (quad * 4) as u16;
+            assert!(
+                index >= base && index < base + 4,
+                "quad {quad} indexed {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_mesh_yields_no_indices() {
+        assert!(quad_index_pattern(0).is_empty());
+    }
 }
