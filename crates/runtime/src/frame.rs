@@ -41,8 +41,9 @@ pub const BIKE_WORLD_HEIGHT: f32 = 1.7;
 /// Asphalt light shade. The light/dark pair differs by ~40% so the strip
 /// rhythm survives small screens and motion (B5).
 const ROAD_LIGHT: [f32; 4] = [0.36, 0.36, 0.38, 1.0];
-/// Asphalt dark shade — the alternation reads as forward motion.
-const ROAD_DARK: [f32; 4] = [0.21, 0.21, 0.23, 1.0];
+/// Asphalt dark shade — the alternation reads as forward motion, softened
+/// toward the HD bar (≤ 0.08 delta).
+const ROAD_DARK: [f32; 4] = [0.29, 0.29, 0.31, 1.0];
 /// Rumble-strip red and white, alternating along the road edges.
 const RUMBLE_RED: [f32; 4] = [0.72, 0.13, 0.10, 1.0];
 const RUMBLE_WHITE: [f32; 4] = [0.93, 0.93, 0.91, 1.0];
@@ -74,8 +75,9 @@ const SKY_GRADIENT: [[f32; 4]; 3] = [
 const RIVAL_SCALES: [f32; 3] = [1.0, 0.92, 1.06];
 
 /// The sky's color as a function of height, `0.0` at the zenith (screen top)
-/// and `1.0` at the horizon. Mirrors the composed band stack, haze band
-/// included. Pure — tests hold the look to a smooth gradient through this.
+/// and `1.0` at the horizon: the same stops the composed quad uses, linearly
+/// interpolated between them — the gradient is continuous, with no band
+/// edges to see (B1, HD direction). Pure — tests hold the look to this.
 pub fn sky_color_at(frac: f32) -> [f32; 4] {
     let stops = [
         (0.0, SKY_GRADIENT[0]),
@@ -84,22 +86,27 @@ pub fn sky_color_at(frac: f32) -> [f32; 4] {
         (0.85, SKY),
         (1.0, lerp_color(SKY, HAZE, 0.7)),
     ];
-    let mut color = stops[0].1;
-    for (stop, c) in stops {
-        if frac >= stop {
-            color = c;
+    let frac = frac.clamp(0.0, 1.0);
+    for window in stops.windows(2) {
+        let (a0, ca) = window[0];
+        let (a1, cb) = window[1];
+        if frac <= a1 {
+            let t = if a1 > a0 {
+                (frac - a0) / (a1 - a0)
+            } else {
+                0.0
+            };
+            return lerp_color(ca, cb, t);
         }
     }
-    color
+    stops[stops.len() - 1].1
 }
 
-/// Height of the haze band painted above the horizon, in pixels, so the sky
-/// and the fading road meet without a hard line (B2).
-const SKY_HAZE_BAND_PX: f32 = 24.0;
 /// Grass light band (B4).
 const GRASS_LIGHT: [f32; 4] = [0.33, 0.56, 0.27, 1.0];
-/// Grass dark band — the alternation makes off-road motion read (B4).
-const GRASS_DARK: [f32; 4] = [0.27, 0.47, 0.22, 1.0];
+/// Grass dark band — the alternation makes off-road motion read (B4),
+/// softened toward the HD bar (≤ 0.06 delta).
+const GRASS_DARK: [f32; 4] = [0.29, 0.51, 0.24, 1.0];
 /// How far grass fades toward the haze at the draw distance. Kept just
 /// under 1.0 so a whisper of green survives to the horizon — the far road
 /// must not read as a detached white patch on white (B2).
@@ -222,6 +229,39 @@ impl RoadMesh {
             },
             color,
         );
+    }
+
+    /// Appends a screen-space rectangle as one quad shading from `top` at
+    /// `y0` to `bottom` at `y1`. Vertex colors interpolate linearly across
+    /// the quad, so the shade is continuous — the sky gradient and the
+    /// depth-fogged grass bands ride through here (B1, HD direction).
+    fn push_screen_rect_gradient(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        top: [f32; 4],
+        bottom: [f32; 4],
+    ) {
+        self.vertices.extend([
+            RoadVertex {
+                position: [x0, y1],
+                color: bottom,
+            },
+            RoadVertex {
+                position: [x1, y1],
+                color: bottom,
+            },
+            RoadVertex {
+                position: [x0, y0],
+                color: top,
+            },
+            RoadVertex {
+                position: [x1, y0],
+                color: top,
+            },
+        ]);
     }
 }
 
@@ -779,32 +819,23 @@ fn compose(
     let projector = world::Projector::new(geometry, camera);
     let half_width = geometry.road_width() * 0.5;
 
-    // Sky above the horizon, a haze band where sky meets distance, the
-    // parallax backdrop, then the banded grass and the road over it.
+    // Sky above the horizon, the parallax backdrop, then the banded grass
+    // and the road over it.
     let horizon = projector.horizon_y();
     road.vertices.clear();
 
     batch.clear();
-    // Sky above the horizon: a deep-blue-to-haze gradient in four stacked
-    // bands, so the empty flat fill gains depth for the cost of three extra
-    // quads (B1).
-    let sky_bands = [
-        (0.0, SKY_GRADIENT[0]),
-        (horizon * 0.3, SKY_GRADIENT[1]),
-        (horizon * 0.6, SKY_GRADIENT[2]),
-        (horizon * 0.85, SKY),
-    ];
-    for (band, next) in sky_bands.iter().zip(sky_bands.iter().skip(1)) {
-        let (y0, color) = *band;
-        road.push_screen_rect(0.0, y0, VIEWPORT_WIDTH, next.0, color);
-    }
-    road.push_screen_rect(0.0, horizon * 0.85, VIEWPORT_WIDTH, horizon, SKY);
-    road.push_screen_rect(
+    // Sky: one quad shading continuously from the zenith blue down to the
+    // horizon haze — vertex colors interpolate, so there are no band edges
+    // anywhere in the sky (B1, HD direction). The haze blend the old haze
+    // band carried is the gradient's horizon stop.
+    road.push_screen_rect_gradient(
         0.0,
-        horizon - SKY_HAZE_BAND_PX,
+        0.0,
         VIEWPORT_WIDTH,
         horizon,
-        lerp_color(SKY, HAZE, 0.7),
+        sky_color_at(0.0),
+        sky_color_at(1.0),
     );
     push_backdrop(geometry, &camera, road, horizon);
 
@@ -825,18 +856,24 @@ fn compose(
         let depth = (strip_index + 1) as f32 * ROAD_STEP;
         let fog = fog_at(depth);
 
-        // Grass band for this strip's depth range, full width (B4).
+        // Grass band for this strip's depth range, full width (B4),
+        // shading from the near edge's fog level to the far edge's — the
+        // depth fade becomes a continuous gradient per band instead of one
+        // flat shade (HD direction).
         let grass_shade = if strip_index.is_multiple_of(2) {
             GRASS_LIGHT
         } else {
             GRASS_DARK
         };
-        road.push_screen_rect(
+        let fog_near = fog_at(depth - ROAD_STEP);
+        let fog_far = fog_at(depth);
+        road.push_screen_rect_gradient(
             0.0,
             strip.far_y,
             VIEWPORT_WIDTH,
             strip.near_y,
-            lerp_color(grass_shade, HAZE, fog * GRASS_FOG),
+            lerp_color(grass_shade, HAZE, fog_far * GRASS_FOG),
+            lerp_color(grass_shade, HAZE, fog_near * GRASS_FOG),
         );
 
         // Asphalt: alternating shades fading into the haze with depth.
@@ -1201,7 +1238,7 @@ mod tests {
     /// it: every four vertices are one quad (near-left, near-right, far-left,
     /// far-right).
     fn road_quads(road: &RoadMesh) -> impl Iterator<Item = &[RoadVertex]> {
-        road.vertices.chunks_exact(4)
+        road.vertices.as_chunks::<4>().0.iter().map(|q| &q[..])
     }
 
     /// A full-width quad: a screen-space band (sky, grass, the horizon
@@ -1226,7 +1263,7 @@ mod tests {
         assert_eq!(sky.len(), 1, "the sky composes as one quad, not bands");
         let quad = sky[0];
         assert!(
-            quad[0].position[1] >= VIEWPORT_HEIGHT * 0.85,
+            quad[0].position[1] >= VIEWPORT_HEIGHT * HORIZON_FRAC,
             "the gradient reaches the horizon (down to {}), not just the top third",
             quad[0].position[1]
         );

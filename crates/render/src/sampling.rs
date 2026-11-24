@@ -8,13 +8,11 @@
 
 use wgpu::FilterMode;
 
-use crate::gpu::SPRITE_SHADER;
-
 /// How the atlas is sampled, mag and min. Linear (bilinear) filtering
 /// smooths the HD sprite shading as it scales; nearest re-introduces the
 /// texel stair-stepping the HD direction retired.
 pub const fn atlas_filter_mode() -> FilterMode {
-    FilterMode::Nearest
+    FilterMode::Linear
 }
 
 /// Lower edge of the fragment shader's smooth alpha ramp: coverage at or
@@ -26,6 +24,7 @@ pub const ALPHA_RAMP_HI: f32 = 0.06;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::SPRITE_SHADER;
 
     #[test]
     fn atlas_is_sampled_linear_not_nearest() {

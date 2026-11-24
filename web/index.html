@@ -49,8 +49,9 @@
       padding: 1rem;
     }
     #overlay.error { color: #ff8383; }
-    /* HUD: translucent dark strip with bright figures, readable over the
-       pale sky (playtest E1). */
+    /* HUD: translucent glass strip with bright figures, readable over the
+       pale sky (playtest E1); blurred and gradient-shaded to match the HD
+       in-game look. */
     #hud:not([hidden]) {
       position: absolute;
       top: 12px;
@@ -59,9 +60,11 @@
       align-items: center;
       gap: 16px;
       padding: 8px 16px;
-      background: rgba(8, 10, 14, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.09);
+      background: linear-gradient(180deg, rgba(18, 20, 28, 0.72), rgba(8, 10, 14, 0.84));
+      border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 10px;
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(6px);
       color: #f2f4f8;
       pointer-events: none;
     }
@@ -90,7 +93,7 @@
     #lap-fill {
       width: 0%;
       height: 100%;
-      background: #4ade80;
+      background: linear-gradient(90deg, #34d399, #86efac);
       border-radius: 2px;
     }
     /* Rider-state badge, top-right (playtest E5). */
@@ -103,11 +106,12 @@
       color: #ffffff;
       padding: 6px 14px;
       border-radius: 999px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
       pointer-events: none;
     }
-    #rider-state.crashed { background: #c62828; }
-    #rider-state.offroad { background: #b45309; }
-    #rider-state.braking { background: #1d4ed8; }
+    #rider-state.crashed { background: linear-gradient(180deg, #d63a3a, #a52222); }
+    #rider-state.offroad { background: linear-gradient(180deg, #cd6a1b, #99450c); }
+    #rider-state.braking { background: linear-gradient(180deg, #2f63e0, #1c3f9e); }
     #rider-state.grid {
       background: rgba(8, 10, 14, 0.78);
       border: 1px solid rgba(255, 255, 255, 0.2);

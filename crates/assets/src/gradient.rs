@@ -2,12 +2,17 @@
 //! rather than flat or hard-banded pixel art? Pure functions over RGBA, so
 //! the HD direction is testable on the host without a device.
 //!
-//! The metric must tolerate material boundaries — a dark tyre meeting a
-//! bright fairing is a legitimate hard edge — while still rejecting flat
-//! fills and banded (quantized) shading. It therefore scores only the
-//! *gradual* fraction of adjacent-pixel color steps inside the sprite:
-//! smooth shading makes nearly every nonzero step small; banding makes them
-//! all large at once.
+//! The metric separates two signals:
+//!
+//! - **Span** — the shading range across the sprite. Flat fills have none.
+//! - **Flat fraction** — the share of opaque pixels whose every opaque
+//!   4-neighbour has the same luminance. Flat fills and quantized banding
+//!   are almost entirely such pixels; gradient shading almost none.
+//!
+//! Material boundaries are deliberately invisible to the metric: a dark
+//! tyre meeting a bright fairing is one hard edge between two shaded
+//! regions, which is legitimate HD art — what the metric rejects is the
+//! flat/banded *interior* the pixel-art look is made of.
 
 /// Thresholds for [`is_smooth_gradient_shaded`], as tunable numbers rather
 /// than magic constants in the predicate.
@@ -16,65 +21,77 @@ pub struct GradientCheck {
     /// Smallest channel spread (max − min over opaque pixels, per channel)
     /// that counts as "actually shaded, not a flat fill".
     pub min_span: u32,
-    /// Largest per-channel step between adjacent opaque pixels that still
-    /// counts as gradual (smooth shading, not a band boundary).
-    pub gradual_step: u32,
-    /// Fraction of nonzero adjacent steps that must be gradual.
-    pub min_gradual_frac: f32,
+    /// Largest share of opaque pixels allowed to sit in locally flat
+    /// regions (all opaque 4-neighbours at the same luminance).
+    pub max_flat_frac: f32,
 }
 
 impl GradientCheck {
-    /// The HD bar: real shading spread, steps that never jump a band.
+    /// The HD bar: real shading spread, and shading almost everywhere.
     pub const fn hd() -> Self {
         Self {
             min_span: 24,
-            gradual_step: 12,
-            min_gradual_frac: 0.9,
+            max_flat_frac: 0.30,
         }
     }
 }
 
+/// Integer luminance of one pixel, `0..=255`. Pure.
+fn luminance(px: [u8; 4]) -> u32 {
+    (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3
+}
+
 /// Shading statistics over one sprite's opaque pixels (alpha > 0):
-/// `(channel_span, gradual_fraction)`. `gradual_fraction` is `None` when no
-/// adjacent opaque pair differs at all — a flat fill, shaded nowhere.
-/// A step counts as gradual when it stays within `gradual_step` levels.
-/// Pure.
-pub fn gradient_shading_stats(img: &image::RgbaImage, gradual_step: u32) -> (u32, Option<f32>) {
+/// `(channel_span, flat_fraction)`. The span is the widest per-channel
+/// spread; the flat fraction is the share of opaque pixels whose opaque
+/// 4-neighbours all share their luminance. Isolated pixels (no opaque
+/// neighbours) count as neither. Pure.
+pub fn gradient_shading_stats(img: &image::RgbaImage) -> (u32, f32) {
     let (w, h) = (img.width(), img.height());
     let mut min = [u8::MAX; 3];
     let mut max = [u8::MIN; 3];
-    let mut nonzero_steps = 0u64;
-    let mut gradual_steps = 0u64;
+    let mut opaque = 0u64;
+    let mut flat = 0u64;
 
-    let mut visit = |a: [u8; 4], b: [u8; 4]| {
-        if a[3] > 0 && b[3] > 0 {
-            for c in 0..3 {
-                min[c] = min[c].min(a[c]).min(b[c]);
-                max[c] = max[c].max(a[c]).max(b[c]);
-            }
-            let step = a
-                .iter()
-                .zip(b.iter())
-                .take(3)
-                .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
-                .max()
-                .unwrap_or(0);
-            if step > 0 {
-                nonzero_steps += 1;
-                if step as u32 <= gradual_step {
-                    gradual_steps += 1;
-                }
-            }
+    let lum = |x: u32, y: u32| -> Option<u32> {
+        let px: [u8; 4] = img.get_pixel(x, y).0;
+        if px[3] > 0 {
+            Some(luminance(px))
+        } else {
+            None
         }
     };
+
     for y in 0..h {
         for x in 0..w {
-            let a: [u8; 4] = img.get_pixel(x, y).0;
-            if x + 1 < w {
-                visit(a, img.get_pixel(x + 1, y).0);
+            let Some(here) = lum(x, y) else { continue };
+            let px: [u8; 4] = img.get_pixel(x, y).0;
+            for c in 0..3 {
+                min[c] = min[c].min(px[c]);
+                max[c] = max[c].max(px[c]);
             }
-            if y + 1 < h {
-                visit(a, img.get_pixel(x, y + 1).0);
+            opaque += 1;
+            let mut has_neighbour = false;
+            let mut all_equal = true;
+            for (nx, ny) in [
+                (x.checked_sub(1), Some(y)),
+                (Some(x + 1), Some(y)),
+                (Some(x), y.checked_sub(1)),
+                (Some(x), Some(y + 1)),
+            ] {
+                let (Some(nx), Some(ny)) = (nx, ny) else {
+                    continue;
+                };
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                if let Some(there) = lum(nx, ny) {
+                    has_neighbour = true;
+                    all_equal &= there == here;
+                }
+            }
+            if has_neighbour && all_equal {
+                flat += 1;
             }
         }
     }
@@ -85,12 +102,12 @@ pub fn gradient_shading_stats(img: &image::RgbaImage, gradual_step: u32) -> (u32
         .map(|(hi, lo)| u32::from(*hi) - u32::from(*lo))
         .max()
         .unwrap_or(0);
-    let gradual_frac = if nonzero_steps == 0 {
-        None
+    let flat_frac = if opaque == 0 {
+        0.0
     } else {
-        Some(gradual_steps as f32 / nonzero_steps as f32)
+        flat as f32 / opaque as f32
     };
-    (span, gradual_frac)
+    (span, flat_frac)
 }
 
 /// Whether `img` reads as smoothly gradient-shaded under the HD check.
@@ -102,14 +119,8 @@ pub fn is_smooth_gradient_shaded(img: &image::RgbaImage) -> bool {
 /// [`is_smooth_gradient_shaded`] with explicit thresholds, so the predicate
 /// itself is testable at the boundaries.
 pub fn is_smooth_gradient_under(img: &image::RgbaImage, check: GradientCheck) -> bool {
-    let (span, gradual_frac) = gradient_shading_stats(img, check.gradual_step);
-    if span < check.min_span {
-        return false;
-    }
-    match gradual_frac {
-        Some(frac) => frac >= check.min_gradual_frac,
-        None => false,
-    }
+    let (span, flat_frac) = gradient_shading_stats(img);
+    span >= check.min_span && flat_frac <= check.max_flat_frac
 }
 
 #[cfg(test)]
@@ -130,11 +141,28 @@ mod tests {
     }
 
     fn banded_gradient() -> RgbaImage {
-        // A gradient quantized into 4 hard bands: big jumps, no gradual steps.
+        // A gradient quantized into 4 hard bands: the pixel-art staircase.
         RgbaImage::from_fn(32, 32, |x, y| {
             let band = ((x + y) / 16) as u8; // 0..=4
             let v = band.saturating_mul(63);
             [v, v, v, 255].into()
+        })
+    }
+
+    /// A stand-in for the retired pixel-art look: small flat regions of
+    /// different colors meeting at hard edges, like the original 24x32
+    /// sprite frames.
+    fn pixel_art_sprawl() -> RgbaImage {
+        RgbaImage::from_fn(24, 32, |x, y| {
+            if y < 4 {
+                [238, 238, 238, 255].into()
+            } else if x < 8 {
+                [196, 38, 46, 255].into()
+            } else if x < 16 {
+                [46, 78, 178, 255].into()
+            } else {
+                [24, 24, 26, 255].into()
+            }
         })
     }
 
@@ -157,10 +185,18 @@ mod tests {
     }
 
     #[test]
+    fn a_pixel_art_sprawl_fails() {
+        assert!(
+            !is_smooth_gradient_shaded(&pixel_art_sprawl()),
+            "flat regions behind hard edges — the retired pixel-art look — must fail"
+        );
+    }
+
+    #[test]
     fn material_boundaries_do_not_defeat_the_check() {
         // Two smoothly shaded halves meeting at one hard edge — like a tyre
-        // against a fairing — must still read as gradient-shaded: the single
-        // boundary step is diluted by the many gradual steps inside each half.
+        // against a fairing — must still read as gradient-shaded: the
+        // boundary touches two pixel rows, the shading covers everything.
         let mut img = RgbaImage::from_fn(32, 32, |x, y| {
             if x < 16 {
                 let v = (y as f32 / 31.0 * 80.0) as u8;
