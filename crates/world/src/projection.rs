@@ -52,7 +52,7 @@ impl<'a> Projector<'a> {
             geometry,
             camera,
             camera_elevation: geometry.elevation_at(camera.distance) + camera.height,
-            camera_offset: geometry.center_offset(camera.distance),
+            camera_offset: geometry.center_offset(camera.distance) + camera.lateral,
         }
     }
 
@@ -164,6 +164,7 @@ mod tests {
         Camera {
             distance,
             height: 1.2,
+            lateral: 0.0,
             focal: 300.0,
             viewport: VIEWPORT,
         }

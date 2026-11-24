@@ -17,14 +17,18 @@ impl Viewport {
     }
 }
 
-/// Viewer state for the projection. The camera sits on the road centreline
-/// at `distance`, `height` above the surface, looking straight down the road.
+/// Viewer state for the projection. The camera sits at `distance` along the
+/// road, `height` above the surface, offset `lateral` meters across it, looking
+/// straight down the road.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     /// Distance along the road where the camera sits.
     pub distance: f32,
     /// Height above the road surface.
     pub height: f32,
+    /// Lateral offset across the road, in meters: the camera lean. Positive
+    /// shifts the view right.
+    pub lateral: f32,
     /// Focal length in pixels: the pixels-per-world-unit scale at one world
     /// unit of depth.
     pub focal: f32,

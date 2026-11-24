@@ -23,7 +23,13 @@ pub const OFFROAD_MAX_SPEED: f32 = 18.0;
 /// per second squared.
 pub const OFFROAD_DRAG: f32 = 14.0;
 /// Lateral speed while leaning, in meters per second.
-pub const STEER_RATE: f32 = 3.5;
+pub const STEER_RATE: f32 = 5.0;
+/// Forward speed at which steering reaches full authority, in m/s. Below it
+/// the bike is upright and barely steers, so a stopped bike cannot wiggle.
+pub const MIN_STEER_SPEED: f32 = 8.0;
+/// Cornering force: taking a curve at speed throws the bike outward at
+/// `speed² · curvature · CORNER_FORCE` m/s. Corners cost speed or skill.
+pub const CORNER_FORCE: f32 = 0.32;
 /// How hard the bike scrubs speed while sliding in a crash, in meters per
 /// second squared.
 pub const CRASH_DRAG: f32 = 25.0;
@@ -77,8 +83,15 @@ impl BikeSnapshot {
 /// Pure: no pool access, no RNG, no clock. Crashed riders cannot steer and
 /// only scrub speed; a crash timer at or below zero hands control back on
 /// coast. Off-road riders accelerate no faster than tarmac but bleed down to
-/// [`OFFROAD_MAX_SPEED`].
-pub fn step_bike(mut bike: BikeSnapshot, intent: Intent, off_road: bool, dt: f32) -> BikeSnapshot {
+/// [`OFFROAD_MAX_SPEED`]. `corner_curvature` is the road curvature under the
+/// bike (1/meters, positive bends left): speed throws the bike outward.
+pub fn step_bike(
+    mut bike: BikeSnapshot,
+    intent: Intent,
+    off_road: bool,
+    corner_curvature: f32,
+    dt: f32,
+) -> BikeSnapshot {
     if bike.control == Control::Crashed {
         bike.crash_timer = (bike.crash_timer - dt).max(0.0);
         bike.speed = (bike.speed - CRASH_DRAG * dt).max(0.0);
@@ -113,11 +126,17 @@ pub fn step_bike(mut bike: BikeSnapshot, intent: Intent, off_road: bool, dt: f32
         _ => (bike.speed - COAST_DRAG * dt).max(0.0),
     };
 
-    bike.lateral += match intent.steer {
+    // Steering authority scales with speed: the bike must be moving to lean.
+    let steer_scale = (bike.speed / MIN_STEER_SPEED).min(1.0);
+    let steer_nudge = match intent.steer {
         Steer::Left => -STEER_RATE * dt,
         Steer::Right => STEER_RATE * dt,
         Steer::None => 0.0,
     };
+    // Outward cornering force: positive curvature bends left, so the push
+    // is to the right (positive lateral) — the road flings you wide.
+    let corner_push = bike.speed * bike.speed * corner_curvature * CORNER_FORCE * dt;
+    bike.lateral += steer_nudge * steer_scale + corner_push;
 
     bike
 }
@@ -155,6 +174,7 @@ mod tests {
             bike,
             intent_of(events),
             off_road,
+            0.0,
             sim::clock::TICK_DURATION_SECS as f32,
         )
     }
@@ -216,22 +236,13 @@ mod tests {
 
     #[test]
     fn steering_moves_lateral_both_ways() {
-        let left = stepped(
-            BikeSnapshot {
-                lateral: 0.0,
-                ..BikeSnapshot::at_rest()
-            },
-            &[GameInput::SteerLeft],
-            false,
-        );
-        let right = stepped(
-            BikeSnapshot {
-                lateral: 0.0,
-                ..BikeSnapshot::at_rest()
-            },
-            &[GameInput::SteerRight],
-            false,
-        );
+        // Steering needs speed: the bike must be moving to lean.
+        let rolling = BikeSnapshot {
+            speed: 20.0,
+            ..BikeSnapshot::at_rest()
+        };
+        let left = stepped(rolling, &[GameInput::SteerLeft], false);
+        let right = stepped(rolling, &[GameInput::SteerRight], false);
         assert!(left.lateral < 0.0);
         assert!(right.lateral > 0.0);
         assert!(
@@ -289,6 +300,41 @@ mod tests {
         bike = stepped(bike, &[], false);
         assert_eq!(bike.control, Control::Coast, "timer expired this tick");
         assert_eq!(bike.crash_timer, 0.0);
+    }
+
+    #[test]
+    fn cornering_force_pushes_outward_and_grows_with_speed() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let at_speed = |speed: f32, curvature: f32| {
+            step_bike(
+                BikeSnapshot {
+                    speed,
+                    ..BikeSnapshot::at_rest()
+                },
+                Intent::default(),
+                false,
+                curvature,
+                dt,
+            )
+        };
+        // Left-hand curve (positive curvature) pushes a fast bike right.
+        let fast = at_speed(50.0, 0.005);
+        assert!(fast.lateral > 0.0, "left curve throws the bike right");
+        // The same curve at walking pace barely moves the bike.
+        let slow = at_speed(5.0, 0.005);
+        assert!(
+            slow.lateral.abs() < fast.lateral.abs() * 0.05,
+            "slow is stable"
+        );
+        // Mirror symmetry: a right-hand curve pushes left.
+        let mirrored = at_speed(50.0, -0.005);
+        assert!((mirrored.lateral + fast.lateral).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_stopped_bike_cannot_steer() {
+        let bike = stepped(BikeSnapshot::at_rest(), &[GameInput::SteerRight], false);
+        assert!(bike.lateral.abs() < 0.01, "no lean-move at zero speed");
     }
 
     #[test]
