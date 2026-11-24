@@ -28,6 +28,7 @@ const speedValue = document.getElementById('speed-value');
 const hudPos = document.getElementById('hud-pos');
 const hudLap = document.getElementById('hud-lap');
 const lapFill = document.getElementById('lap-fill');
+const staminaFill = document.getElementById('stamina-fill');
 const riderStateEl = document.getElementById('rider-state');
 const countdownEl = document.getElementById('countdown');
 const finishEl = document.getElementById('finish');
@@ -151,13 +152,23 @@ async function boot() {
   hud.hidden = false;
   hudKeys.hidden = false;
 
-  const keys = { accelerate: false, brake: false, steerLeft: false, steerRight: false };
+  const keys = {
+    accelerate: false,
+    brake: false,
+    steerLeft: false,
+    steerRight: false,
+    punch: false,
+    kick: false,
+  };
   const map = {
     ArrowUp: 'accelerate', KeyW: 'accelerate',
     ArrowDown: 'brake', KeyS: 'brake', Space: 'brake',
     ArrowLeft: 'steerLeft', KeyA: 'steerLeft',
     ArrowRight: 'steerRight', KeyD: 'steerRight',
   };
+  // Combat keys are action semantics, not flag-sets: one swing per press,
+  // so key repeats don't re-arm a swing while the key is held.
+  const attackMap = { KeyX: 'punch', KeyZ: 'kick' };
 
   // Keys are captured on BOTH window and document: inside an iframe, which
   // of the two receives an event depends on how the embedding page targets
@@ -169,7 +180,9 @@ async function boot() {
   // and held-key repeats just re-set the same flag.
   const onKeyDown = (e) => {
     const key = map[e.code];
-    if (key) { keys[key] = true; e.preventDefault(); }
+    if (key) { keys[key] = true; e.preventDefault(); return; }
+    const attack = attackMap[e.code];
+    if (attack && !e.repeat) { keys[attack] = true; e.preventDefault(); }
   };
   const onKeyUp = (e) => {
     const key = map[e.code];
@@ -283,7 +296,17 @@ async function boot() {
       accumulator += Math.min(now - lastFrameTime, MAX_CATCH_UP_TICKS * TICK_MS);
       lastFrameTime = now;
       while (accumulator >= TICK_MS) {
-        game.advance_frame(keys.accelerate, keys.brake, keys.steerLeft, keys.steerRight);
+        game.advance_frame(
+          keys.accelerate,
+          keys.brake,
+          keys.steerLeft,
+          keys.steerRight,
+          keys.punch,
+          keys.kick,
+        );
+        // One swing per press: the first tick of the frame consumes it.
+        keys.punch = false;
+        keys.kick = false;
         accumulator -= TICK_MS;
       }
     }
@@ -302,6 +325,15 @@ async function boot() {
     );
     const progressPct = `${(Math.min(game.lap_progress(), 1) * 100).toFixed(1)}%`;
     if (lapFill.style.width !== progressPct) lapFill.style.width = progressPct;
+
+    // Combat stamina: amber bar while fighting, red once it runs low.
+    const stamina = Math.min(Math.max(game.player_stamina(), 0), 1);
+    const staminaPct = `${(stamina * 100).toFixed(1)}%`;
+    if (staminaFill.style.width !== staminaPct) staminaFill.style.width = staminaPct;
+    const low = stamina < 0.25;
+    if (staminaFill.classList.contains('low') !== low) {
+      staminaFill.classList.toggle('low', low);
+    }
 
     updateStateBadge(game.rider_state(), game.is_counting_down());
 

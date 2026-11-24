@@ -80,7 +80,13 @@ pub fn decide(
         Steer::None
     };
 
-    Intent { throttle, steer }
+    // Rival pursuit never attacks: retaliation resolves in the race's
+    // combat pass, not through a steering intent.
+    Intent {
+        throttle,
+        steer,
+        attack: None,
+    }
 }
 
 #[cfg(test)]
