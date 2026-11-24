@@ -451,7 +451,7 @@ impl Race {
                     pos_x,
                     pos_y: snapshot.lateral,
                     speed: snapshot.speed,
-                    heading: 0.0,
+                    heading: snapshot.heading,
                 },
             );
         }
@@ -663,6 +663,13 @@ impl Race {
     /// screen), for rendering and HUD feel.
     pub fn player_lean(&self) -> f32 {
         self.aux[0].snapshot.lean
+    }
+
+    /// The player's heading, in radians — the angle of the bike's velocity
+    /// against the road centreline (positive points right of straight
+    /// ahead). The camera leans with this first, road bend second.
+    pub fn player_heading(&self) -> f32 {
+        self.aux[0].snapshot.heading
     }
 
     /// Visual bank angle of one bike (spawn-order slot), for rendering.
