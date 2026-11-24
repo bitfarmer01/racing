@@ -146,6 +146,30 @@ struct QuadEdge {
     y: f32,
 }
 
+/// Clamps a road strip to the viewport: strips entirely below the screen
+/// vanish, and a strip straddling the bottom edge has its near edge pulled
+/// up to the screen bottom, interpolating along the strip axis. Without
+/// this, the nearest strips are near-plane-deep wedges whose edges sweep
+/// across the whole viewport as diagonals.
+fn clamp_strip_to_viewport(strip: RoadStrip) -> Option<RoadStrip> {
+    if strip.far_y >= VIEWPORT_HEIGHT {
+        return None;
+    }
+    if strip.near_y <= VIEWPORT_HEIGHT {
+        return Some(strip);
+    }
+    let t = (VIEWPORT_HEIGHT - strip.far_y) / (strip.near_y - strip.far_y);
+    let lerp = |far: f32, near: f32| far + (near - far) * t;
+    Some(RoadStrip {
+        near_x: lerp(strip.far_x, strip.near_x),
+        near_y: VIEWPORT_HEIGHT,
+        near_half_width: lerp(strip.far_half_width, strip.near_half_width),
+        far_x: strip.far_x,
+        far_y: strip.far_y,
+        far_half_width: strip.far_half_width,
+    })
+}
+
 /// Where each sprite frame lives in the packed atlas, as shader UV rects.
 pub struct AtlasMapping {
     dims: AtlasDims,
@@ -416,10 +440,15 @@ fn compose(
 
     // Road: near-to-far trapezoid strips, alternating shades, fading into
     // the haze with depth so the horizon reads as distance.
-    for (strip_index, strip) in projector
+    for (strip_index, unclamped) in projector
         .road_strips(ROAD_STEP, camera.distance + ROAD_DRAW_DISTANCE)
         .enumerate()
     {
+        // Near-plane strips would sweep across the screen as diagonals;
+        // clamp them to the viewport bottom or drop them.
+        let Some(strip) = clamp_strip_to_viewport(unclamped) else {
+            continue;
+        };
         let depth = (strip_index + 1) as f32 * ROAD_STEP;
         let fog = (depth / ROAD_DRAW_DISTANCE).powi(2);
         let shade = if strip_index.is_multiple_of(2) {
@@ -466,6 +495,11 @@ fn compose(
                     projector.project(near_d, lane),
                     projector.project(far_d, lane),
                 ) {
+                    // A dash whose near edge is below the screen would sweep
+                    // in from off-screen; skip it like the clamped strips.
+                    if n.screen_y > VIEWPORT_HEIGHT {
+                        continue;
+                    }
                     road.push_quad(
                         QuadEdge {
                             lx: n.screen_x - LANE_LINE_WIDTH * n.scale * 0.5,
