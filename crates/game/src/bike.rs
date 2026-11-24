@@ -27,6 +27,13 @@ pub const STEER_RATE: f32 = 5.0;
 /// Forward speed at which steering reaches full authority, in m/s. Below it
 /// the bike is upright and barely steers, so a stopped bike cannot wiggle.
 pub const MIN_STEER_SPEED: f32 = 8.0;
+/// Full visual bank of the rider, in radians (~24°): the lean the state
+/// machine targets at full steering authority. Cosmetic — steering moves
+/// the bike; the lean shows it.
+pub const LEAN_MAX: f32 = 0.42;
+/// How fast the rider banks toward the target lean, in radians per second.
+/// Fast enough to be visibly leaning within two 60 Hz frames.
+pub const LEAN_RATE: f32 = 6.0;
 /// Cornering force: taking a curve at speed throws the bike outward at
 /// `speed² · curvature · CORNER_FORCE` m/s. Corners cost speed or skill.
 pub const CORNER_FORCE: f32 = 0.32;
@@ -63,6 +70,10 @@ pub struct BikeSnapshot {
     pub control: Control,
     /// Seconds remaining before a crashed rider is back up; unused otherwise.
     pub crash_timer: f32,
+    /// Visual bank angle, in radians (positive tips right on screen).
+    /// Follows the steering intent and the corner's bend; carried so the
+    /// renderer can roll the sprite quad without re-deriving the lean.
+    pub lean: f32,
 }
 
 impl BikeSnapshot {
@@ -95,6 +106,8 @@ pub fn step_bike(
     if bike.control == Control::Crashed {
         bike.crash_timer = (bike.crash_timer - dt).max(0.0);
         bike.speed = (bike.speed - CRASH_DRAG * dt).max(0.0);
+        // The crash pose is already sideways; settle the visual bank flat.
+        bike.lean += (-bike.lean).clamp(-LEAN_RATE * dt, LEAN_RATE * dt);
         if bike.crash_timer == 0.0 {
             bike.control = Control::Coast;
         }
@@ -137,6 +150,24 @@ pub fn step_bike(
     // is to the right (positive lateral) — the road flings you wide.
     let corner_push = bike.speed * bike.speed * corner_curvature * CORNER_FORCE * dt;
     bike.lateral += steer_nudge * steer_scale + corner_push;
+
+    // Visual bank: aim at the steering input plus the corner's inward lean,
+    // rate-limited so the bank reads as a motion, not a flip. The corner
+    // term is the outward force as a fraction of full steering authority —
+    // a rider coasting through a bend banks into it by that much. Positive
+    // curvature bends left, and into a left bend is a leftward (negative)
+    // lean.
+    let steer_lean = steer_scale
+        * match intent.steer {
+            Steer::Left => -1.0,
+            Steer::Right => 1.0,
+            Steer::None => 0.0,
+        };
+    let corner_lean = -corner_curvature.signum()
+        * (bike.speed * bike.speed * corner_curvature.abs() * CORNER_FORCE / STEER_RATE)
+            .clamp(0.0, 1.0);
+    let target_lean = (steer_lean + corner_lean).clamp(-1.0, 1.0) * LEAN_MAX;
+    bike.lean += (target_lean - bike.lean).clamp(-LEAN_RATE * dt, LEAN_RATE * dt);
 
     bike
 }
@@ -278,6 +309,7 @@ mod tests {
             lateral: 8.0,
             control: Control::Crashed,
             crash_timer: 1.0,
+            lean: 0.0,
         };
         let speed_before = bike.speed;
         bike = stepped(bike, &[GameInput::SteerRight, GameInput::Accelerate], true);
@@ -296,6 +328,7 @@ mod tests {
             lateral: 0.0,
             control: Control::Crashed,
             crash_timer: sim::clock::TICK_DURATION_SECS as f32,
+            lean: 0.0,
         };
         bike = stepped(bike, &[], false);
         assert_eq!(bike.control, Control::Coast, "timer expired this tick");
@@ -332,9 +365,66 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_bike_cannot_steer() {
+    fn steering_banks_the_rider_and_releasing_unbanks_it() {
+        let rolling = BikeSnapshot {
+            speed: 30.0,
+            ..BikeSnapshot::at_rest()
+        };
+        // Two ticks of full-left steer at 60 Hz: visibly banked left.
+        let left = stepped(
+            stepped(rolling, &[GameInput::SteerLeft], false),
+            &[GameInput::SteerLeft],
+            false,
+        );
+        assert!(left.lean < -0.1, "banked left within two ticks");
+
+        let right = stepped(
+            stepped(rolling, &[GameInput::SteerRight], false),
+            &[GameInput::SteerRight],
+            false,
+        );
+        assert!((left.lean + right.lean).abs() < 1e-5, "symmetric bank");
+
+        // Full authority never exceeds the cap, and coasting settles flat.
+        let held = (0..30).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerRight], false)
+        });
+        assert!((held.lean - LEAN_MAX).abs() < 1e-4, "bank caps at LEAN_MAX");
+        let settled = (0..30).fold(held, |bike, _| stepped(bike, &[], false));
+        assert!(settled.lean.abs() < 1e-4, "no input settles the rider up");
+    }
+
+    #[test]
+    fn a_stopped_bike_neither_banks_nor_wiggles() {
         let bike = stepped(BikeSnapshot::at_rest(), &[GameInput::SteerRight], false);
         assert!(bike.lateral.abs() < 0.01, "no lean-move at zero speed");
+        assert!(bike.lean.abs() < 0.01, "no bank at zero speed");
+    }
+
+    #[test]
+    fn coasting_through_a_corner_banks_into_the_bend() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let fast = BikeSnapshot {
+            speed: 50.0,
+            ..BikeSnapshot::at_rest()
+        };
+        // Positive curvature bends left; the rider banks left with no input.
+        let banked = step_bike(fast, Intent::default(), false, 0.005, dt);
+        assert!(banked.lean < -0.05, "corner leans the rider inward");
+    }
+
+    #[test]
+    fn crashed_riders_settle_their_bank() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let down = BikeSnapshot {
+            speed: 25.0,
+            lateral: 0.0,
+            lean: 0.3,
+            control: Control::Crashed,
+            crash_timer: 1.0,
+        };
+        let bike = step_bike(down, Intent::default(), false, 0.0, dt);
+        assert!(bike.lean.abs() < 0.3, "crash settles the bank");
     }
 
     #[test]

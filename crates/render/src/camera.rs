@@ -73,6 +73,9 @@ pub struct RoadPlacement {
     pub world_width: f32,
     /// Sprite height in world units (projected to screen height).
     pub world_height: f32,
+    /// Screen-space roll of the quad, in radians (positive tips the top of
+    /// the sprite right). The rider's visual bank; everything else uses 0.0.
+    pub roll: f32,
 }
 
 /// Atlas region and tint for one sprite — the two appearance inputs shared by
@@ -103,7 +106,115 @@ pub fn push_projected(
         placement.world_width,
         placement.world_height,
     ) {
-        Some(billboard) => batch.push(instance_from_billboard(billboard, style)),
+        Some(billboard) => batch.push(instance_rolled(billboard, style, placement.roll)),
         None => false,
+    }
+}
+
+/// Builds a screen-space instance rotated about the sprite's ground-contact
+/// point rather than its centre, so a banked rider keeps its wheel on the
+/// road. `roll` is radians, positive tipping the top of the sprite right —
+/// the shader's rotation convention under screen-space y-down. Zero roll
+/// builds the plain billboard instance.
+pub fn instance_rolled(billboard: Billboard, style: SpriteStyle, roll: f32) -> SpriteInstance {
+    let base = instance_from_billboard(billboard, style);
+    if roll == 0.0 {
+        return base;
+    }
+    let half_height = billboard.height * 0.5;
+    let (s, c) = roll.sin_cos();
+    SpriteInstance {
+        // Rotating the quad about its bottom edge: the centre swings
+        // sideways by h/2·sin(roll) and drops by h/2·(1 − cos(roll)).
+        position: [
+            base.position[0] + half_height * s,
+            base.position[1] + half_height * (1.0 - c),
+        ],
+        rotation: base.rotation + roll,
+        ..base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use world::Viewport;
+
+    const STYLE: SpriteStyle = SpriteStyle {
+        uv_rect: [0.0, 0.0, 1.0, 1.0],
+        tint: [1.0, 1.0, 1.0, 1.0],
+    };
+
+    fn billboard() -> world::Billboard {
+        world::Billboard {
+            center_x: 100.0,
+            bottom_y: 200.0,
+            width: 40.0,
+            height: 80.0,
+        }
+    }
+
+    #[test]
+    fn zero_roll_is_the_plain_billboard() {
+        let plain = instance_rolled(billboard(), STYLE, 0.0);
+        let base = instance_from_billboard(billboard(), STYLE);
+        assert_eq!(plain, base);
+        assert_eq!(plain.rotation, 0.0);
+    }
+
+    #[test]
+    fn roll_tips_right_and_keeps_the_ground_contact() {
+        let roll = 0.3_f32;
+        let plain = instance_from_billboard(billboard(), STYLE);
+        let rolled = instance_rolled(billboard(), STYLE, roll);
+        assert_eq!(rolled.rotation, roll);
+
+        // The centre swings right and rides lower — the top of the sprite
+        // tips right while the pivot stays at the road-contact bottom edge.
+        assert!(rolled.position[0] > plain.position[0]);
+        assert!(rolled.position[1] > plain.position[1]);
+
+        // The pivot is preserved exactly: rotating the centre back about
+        // the bottom edge lands on it for both axes' magnitudes.
+        let half_height = billboard().height * 0.5;
+        let pivot_x = rolled.position[0] - half_height * roll.sin();
+        assert!((pivot_x - billboard().center_x).abs() < 1e-4);
+    }
+
+    #[test]
+    fn push_projected_carries_roll_into_the_batch() {
+        let mut batch = SpriteBatch::with_capacity(16);
+        // Any in-front placement works: a straight road keeps it on screen.
+        let geometry = world::RoadGeometry::new(Vec::new(), Vec::new(), 12.0);
+        let camera = world::Camera {
+            distance: 0.0,
+            height: 1.9,
+            lateral: 0.0,
+            focal: 300.0,
+            horizon_y_px: 180.0,
+            viewport: Viewport {
+                width: 800.0,
+                height: 450.0,
+            },
+        };
+        let projector = world::Projector::new(&geometry, camera);
+        let pushed = push_projected(
+            &mut batch,
+            &projector,
+            RoadPlacement {
+                distance: 10.0,
+                lateral: 0.0,
+                world_width: 1.0,
+                world_height: 1.7,
+                roll: -0.25,
+            },
+            STYLE,
+        );
+        assert!(pushed, "on-screen placement pushes");
+        assert_eq!(
+            batch.instances()[0].rotation,
+            -0.25,
+            "roll lands on the instance"
+        );
     }
 }

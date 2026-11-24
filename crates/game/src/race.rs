@@ -30,6 +30,25 @@ pub const COLLISION_SCRUB: f32 = 0.985;
 /// enough that rivals start strung out down the road instead of bunched at
 /// one depth (C4).
 pub const GRID_SPACING: f32 = 14.0;
+/// Gap behind the player beyond which a rival gets the rubber-band boost,
+/// in meters: drop far enough back and the field holds the race together.
+pub const RUBBER_BAND_BEHIND: f32 = 25.0;
+/// Gap ahead of the player beyond which a leader eases off, in meters: a
+/// breakaway is catchable, not untouchable.
+pub const RUBBER_BAND_AHEAD: f32 = 60.0;
+/// Closing pace of a fully rubber-banded rival over the player, in m/s.
+/// Scaled down to zero as the rival approaches the window edge, so it
+/// rejoins at the player's pace instead of ramming it.
+pub const RUBBER_BAND_MARGIN: f32 = 12.0;
+/// Depth outside the window, in meters, over which the rubber-band boost
+/// ramps in from the window edge.
+pub const RUBBER_BAND_RAMP: f32 = 15.0;
+/// Acceleration of a fully rubber-banded rival, in meters per second
+/// squared — well above the nominal throttle, so a dropped rival visibly
+/// rides back into the race instead of clawing at cruise acceleration.
+pub const RUBBER_BAND_ACCEL: f32 = 30.0;
+/// Speed multiplier for leaders too far ahead to stay in the race.
+pub const RUBBER_BAND_EASE: f32 = 0.85;
 /// Half the lateral span of lanes the grid spreads across, in meters.
 pub const GRID_HALF_SPAN: f32 = 3.0;
 /// Closing speed above which running into the bike ahead is a crash, in m/s.
@@ -180,8 +199,12 @@ impl Race {
         let mut rng = XorShift64::new(config.seed);
         for rival in 0..rivals {
             let lane = rng.next_f32_in(-GRID_HALF_SPAN, GRID_HALF_SPAN);
+            // Spread the grid ahead of and behind the player: even-indexed
+            // rivals up the road, odd-indexed ones behind the line, strung
+            // out by GRID_SPACING. The pack starts racing, not queued.
+            let stagger = (rival / 2 + 1) as f32 * GRID_SPACING;
             let state = BikeState {
-                pos_x: (rival + 1) as f32 * GRID_SPACING,
+                pos_x: if rival % 2 == 0 { stagger } else { -stagger },
                 pos_y: lane,
                 speed: 0.0,
                 heading: 0.0,
@@ -191,7 +214,7 @@ impl Race {
             aux[slot].target_lane = lane;
             // Rider variety: each rival gets a top speed and an aggression,
             // so the pack spreads out instead of riding as one block.
-            aux[slot].top_speed = MAX_SPEED * rng.next_f32_in(0.78, 0.97);
+            aux[slot].top_speed = MAX_SPEED * rng.next_f32_in(0.72, 0.95);
             aux[slot].aggression = rng.next_f32_in(0.6, 1.4);
         }
 
@@ -287,6 +310,7 @@ impl Race {
         let dt = TICK_DURATION_SECS as f32;
         let half_width = self.geometry.road_width() * 0.5;
         let player_x = self.state(0).pos_x;
+        let player_speed = self.state(0).speed;
 
         // Player (slot 0) follows the drained intent; rivals follow the AI.
         for slot in 0..self.bike_count {
@@ -295,16 +319,27 @@ impl Race {
             snapshot.speed = state.speed;
             snapshot.lateral = state.pos_y;
 
-            // Catch-up: rivals far behind get a mild boost, leaders ease off,
-            // so the pack stays in the race without teleporting.
-            let catch_up = if slot == 0 {
-                1.0
-            } else if state.pos_x < player_x - 30.0 {
-                1.10
-            } else if state.pos_x > player_x + 80.0 {
-                0.92
+            // Rubber band: a closed-loop gap controller around the player.
+            // A rival dropped well behind races above the player's pace and
+            // accelerates harder — scaled by how far out it is, easing to
+            // the player's own pace at the window edge so it rejoins rather
+            // than ramming. A leader far ahead eases off. Inside the window
+            // a rival races at its own pace, so the pack spreads, overtakes,
+            // and never holds a static gap.
+            let gap = state.pos_x - player_x;
+            let (cap, chasing) = if slot == 0 {
+                (MAX_SPEED, 0.0)
+            } else if gap < -RUBBER_BAND_BEHIND {
+                let depth = (-gap - RUBBER_BAND_BEHIND).min(RUBBER_BAND_RAMP);
+                let ease = depth / RUBBER_BAND_RAMP;
+                let cap = self.aux[slot]
+                    .top_speed
+                    .max((player_speed + RUBBER_BAND_MARGIN * ease).min(MAX_SPEED * 1.2));
+                (cap, ease)
+            } else if gap > RUBBER_BAND_AHEAD {
+                (self.aux[slot].top_speed * RUBBER_BAND_EASE, 0.0)
             } else {
-                1.0
+                (self.aux[slot].top_speed, 0.0)
             };
 
             let intent = if slot == 0 {
@@ -315,7 +350,7 @@ impl Race {
                     snapshot.lateral,
                     state.pos_x,
                     self.aux[slot].target_lane,
-                    self.aux[slot].top_speed * catch_up,
+                    cap,
                     &self.geometry,
                 )
             };
@@ -324,8 +359,16 @@ impl Race {
             let off_road = snapshot.is_off_road(half_width);
             let mut snapshot = bike::step_bike(snapshot, intent, off_road, curvature, dt);
             if slot != 0 {
-                // Rivals never exceed their (possibly catch-up-adjusted) cap.
-                snapshot.speed = snapshot.speed.min(self.aux[slot].top_speed * catch_up);
+                // Rivals never exceed their rubber-band cap.
+                snapshot.speed = snapshot.speed.min(cap);
+                // A chasing rival also accelerates above the nominal
+                // throttle — the cap alone never closes a gap on a player
+                // already at speed. Crashed and off-road riders chase on
+                // foot like everyone else.
+                if chasing > 0.0 && snapshot.control != Control::Crashed && !off_road {
+                    let boost = bike::ACCEL + (RUBBER_BAND_ACCEL - bike::ACCEL) * chasing;
+                    snapshot.speed = snapshot.speed.max((state.speed + boost * dt).min(cap));
+                }
             }
             if bike::should_crash(&snapshot, half_width) {
                 bike::crash(&mut snapshot);
@@ -548,6 +591,17 @@ impl Race {
         self.state(0).pos_y
     }
 
+    /// The player's visual bank angle, in radians (positive tips right on
+    /// screen), for rendering and HUD feel.
+    pub fn player_lean(&self) -> f32 {
+        self.aux[0].snapshot.lean
+    }
+
+    /// Visual bank angle of one bike (spawn-order slot), for rendering.
+    pub fn bike_lean(&self, slot: usize) -> f32 {
+        self.aux[slot].snapshot.lean
+    }
+
     /// Seconds left on the player's crash timer, or 0 when upright.
     pub fn player_crash_timer(&self) -> f32 {
         if self.aux[0].snapshot.control == Control::Crashed {
@@ -691,8 +745,9 @@ mod tests {
     #[test]
     fn race_position_counts_riders_ahead() {
         let mut race = flat_race(2, 7);
-        assert_eq!(race.race_position(), 3, "rivals start ahead on the grid");
-        // Push the player just past both rivals.
+        // Even-indexed rivals start ahead of the line, odd-indexed behind.
+        assert_eq!(race.race_position(), 2, "one rival starts ahead");
+        // Push the player just past the rival ahead.
         let lead = race.bike_states().map(|s| s.pos_x).fold(0.0_f32, f32::max);
         race.place_bike(0, lead + 5.0, 0.0);
         assert_eq!(race.race_position(), 1);
@@ -946,11 +1001,107 @@ mod tests {
         for (lane, state) in lanes_a.iter().zip(lanes_b) {
             assert_eq!(*lane, state.pos_y);
         }
-        // Rivals start ahead of the player, evenly spaced longitudinally.
+        // Rivals start staggered ahead of and behind the player, spaced by
+        // GRID_SPACING on their side of the line.
         let states: Vec<BikeState> = a.bike_states().collect();
         for (slot, state) in states.iter().enumerate().skip(1) {
-            assert!((state.pos_x - slot as f32 * GRID_SPACING).abs() < 1e-5);
+            let rival = slot - 1;
+            let stagger = (rival / 2 + 1) as f32 * GRID_SPACING;
+            let expected = if rival % 2 == 0 { stagger } else { -stagger };
+            assert!((state.pos_x - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn held_throttle_after_release_advances_the_player_and_the_pack() {
+        let mut race = flat_race(3, 7);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let start_distance = race.player_distance();
+        let start_rivals: Vec<BikeState> = race.bike_states().skip(1).collect();
+
+        // Four seconds of held throttle at 60 Hz.
+        for _ in 0..240 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+
+        assert!(
+            race.player_speed() * 3.6 > 120.0,
+            "120 km/h within three seconds of throttle"
+        );
+        assert!(
+            race.player_distance() > start_distance + 60.0,
+            "the player is down the road"
+        );
+        // Every rival has advanced, and no rival holds a static gap: each
+        // gap to the player changed since the lights went green.
+        for (slot, before) in start_rivals.iter().enumerate() {
+            let after = race.bike_states().nth(slot + 1).unwrap();
+            assert!(
+                after.pos_x > before.pos_x + 5.0,
+                "rival {slot} advanced up the road"
+            );
+            let gap_before = before.pos_x - start_distance;
+            let gap_after = after.pos_x - race.player_distance();
+            assert!(
+                (gap_after - gap_before).abs() > 1.0,
+                "rival {slot}'s gap to the player changed"
+            );
+        }
+    }
+
+    #[test]
+    fn rubber_band_pulls_a_dropped_rival_back_into_the_race() {
+        let mut race = flat_race(1, 7);
+        race.clear_traffic();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Roll the player out ahead, then drop the rival well behind the
+        // rubber-band window.
+        run(&mut race, 120, &[GameInput::Accelerate]);
+        race.place_bike(1, race.player_distance() - RUBBER_BAND_BEHIND - 20.0, 0.0);
+        let gap = race.player_distance() - race.bike_states().nth(1).unwrap().pos_x;
+        assert!(gap > RUBBER_BAND_BEHIND);
+
+        // Ten seconds of held throttle later, the pack has regrouped: the
+        // staged 45 m gap closes to the window edge (~25 m), where the
+        // rival rejoins at the player's pace instead of ramming it.
+        for _ in 0..600 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let gap_after = race.player_distance() - race.bike_states().nth(1).unwrap().pos_x;
+        assert!(
+            gap_after < gap - 10.0,
+            "rubber band closed the gap from {gap} m to {gap_after} m"
+        );
+        assert_eq!(
+            race.player_control(),
+            Control::Accelerate,
+            "no ram from behind"
+        );
+    }
+
+    #[test]
+    fn steering_banks_the_player_within_a_few_ticks() {
+        let mut race = flat_race(0, 7);
+        race.clear_traffic();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Roll first: steering authority needs speed.
+        run(&mut race, 30, &[GameInput::Accelerate]);
+        for _ in 0..3 {
+            race.push_input(GameInput::SteerLeft);
+            race.tick();
+        }
+        let lean = race.player_lean();
+        assert!(lean < -0.1, "visibly banked left within three ticks");
+        assert!(lean >= -bike::LEAN_MAX - 1e-4, "bank respects the cap");
+        assert!(race.player_lateral() < 0.0, "bank came with lateral motion");
     }
 
     #[test]
