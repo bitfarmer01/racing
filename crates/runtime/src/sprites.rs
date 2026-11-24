@@ -351,3 +351,47 @@ fn cone_frame() -> RgbaImage {
 pub fn pack_placeholder_atlas() -> Result<assets::PackedAtlas, assets::PackError> {
     assets::pack(PackOptions::default(), &placeholder_frames())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assets::gradient::is_smooth_gradient_shaded;
+
+    /// The original pixel-art frame scale the HD direction replaces.
+    const PIXEL_ART_FRAME: (u32, u32) = (24, 32);
+
+    #[test]
+    fn frames_render_at_hd_resolution() {
+        assert!(
+            FRAME_WIDTH >= 3 * PIXEL_ART_FRAME.0 && FRAME_HEIGHT >= 3 * PIXEL_ART_FRAME.1,
+            "frames are {FRAME_WIDTH}x{FRAME_HEIGHT}: HD direction wants at least 3x the \
+             pixel-art scale ({:?})",
+            PIXEL_ART_FRAME
+        );
+    }
+
+    #[test]
+    fn every_frame_is_smooth_gradient_shaded() {
+        for (name, img) in placeholder_frames() {
+            assert!(
+                is_smooth_gradient_shaded(&img),
+                "'{name}' is flat or banded — HD sprites shade smoothly, no pixel art"
+            );
+        }
+    }
+
+    #[test]
+    fn atlas_regeneration_is_deterministic() {
+        let first = pack_placeholder_atlas().expect("placeholder atlas packs");
+        let second = pack_placeholder_atlas().expect("placeholder atlas packs");
+        assert_eq!(first.atlas.dimensions(), second.atlas.dimensions());
+        assert!(
+            first
+                .atlas
+                .pixels()
+                .zip(second.atlas.pixels())
+                .all(|(p, q)| p == q),
+            "same frames, same atlas pixels — dressing and packing stay pure functions"
+        );
+    }
+}

@@ -72,6 +72,27 @@ const SKY_GRADIENT: [[f32; 4]; 3] = [
 /// Rival size spread per pack slot: same rider class, slight build
 /// differences so the field doesn't read as clones.
 const RIVAL_SCALES: [f32; 3] = [1.0, 0.92, 1.06];
+
+/// The sky's color as a function of height, `0.0` at the zenith (screen top)
+/// and `1.0` at the horizon. Mirrors the composed band stack, haze band
+/// included. Pure — tests hold the look to a smooth gradient through this.
+pub fn sky_color_at(frac: f32) -> [f32; 4] {
+    let stops = [
+        (0.0, SKY_GRADIENT[0]),
+        (0.3, SKY_GRADIENT[1]),
+        (0.6, SKY_GRADIENT[2]),
+        (0.85, SKY),
+        (1.0, lerp_color(SKY, HAZE, 0.7)),
+    ];
+    let mut color = stops[0].1;
+    for (stop, c) in stops {
+        if frac >= stop {
+            color = c;
+        }
+    }
+    color
+}
+
 /// Height of the haze band painted above the horizon, in pixels, so the sky
 /// and the fading road meet without a hard line (B2).
 const SKY_HAZE_BAND_PX: f32 = 24.0;
@@ -1174,5 +1195,115 @@ mod tests {
             batch.instances().iter().map(|i| i.position).collect();
         let fresh_positions: Vec<[f32; 2]> = fresh.instances().iter().map(|i| i.position).collect();
         assert_eq!(reused_positions, fresh_positions, "no stale sprites");
+    }
+
+    /// Groups the road mesh's vertex stream back into the quads that pushed
+    /// it: every four vertices are one quad (near-left, near-right, far-left,
+    /// far-right).
+    fn road_quads(road: &RoadMesh) -> impl Iterator<Item = &[RoadVertex]> {
+        road.vertices.chunks_exact(4)
+    }
+
+    /// A full-width quad: a screen-space band (sky, grass, the horizon
+    /// sliver) rather than a road trapezoid.
+    fn is_full_width_band(quad: &[RoadVertex]) -> bool {
+        let left_ok = quad[0].position[0] == 0.0 && quad[2].position[0] == 0.0;
+        let right_ok =
+            quad[1].position[0] == VIEWPORT_WIDTH && quad[3].position[0] == VIEWPORT_WIDTH;
+        left_ok && right_ok
+    }
+
+    #[test]
+    fn the_sky_is_one_smooth_gradient_not_stacked_bands() {
+        let mapping = mapping();
+        let (race, geometry) = demo_race();
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+
+        // The sky is the band whose far (top) edge is the screen top.
+        let sky: Vec<&[RoadVertex]> = road_quads(&frame.road)
+            .filter(|q| is_full_width_band(q) && q[2].position[1] == 0.0)
+            .collect();
+        assert_eq!(sky.len(), 1, "the sky composes as one quad, not bands");
+        let quad = sky[0];
+        assert!(
+            quad[0].position[1] >= VIEWPORT_HEIGHT * 0.85,
+            "the gradient reaches the horizon (down to {}), not just the top third",
+            quad[0].position[1]
+        );
+        assert_ne!(
+            quad[0].color, quad[2].color,
+            "the sky shades from zenith to horizon haze — not one flat fill"
+        );
+    }
+
+    #[test]
+    fn the_sky_gradient_is_continuous_from_zenith_to_haze() {
+        // Adjacent samples 1% of the sky apart may not jump: a step over
+        // ~8 levels of 255 reads as a band edge, which is the pixel-art
+        // look the HD direction retires.
+        for step in 0..100 {
+            let a = sky_color_at(step as f32 * 0.01);
+            let b = sky_color_at((step as f32 + 1.0) * 0.01);
+            for c in 0..3 {
+                let delta = ((a[c] - b[c]).abs() * 255.0).round();
+                assert!(
+                    delta <= 8.0,
+                    "sky at {step}% jumps {delta} levels per 1% of height — banded, not smooth"
+                );
+            }
+        }
+        assert_ne!(
+            sky_color_at(0.0),
+            sky_color_at(1.0),
+            "the gradient actually spans zenith to haze"
+        );
+    }
+
+    #[test]
+    fn near_ground_bands_shade_as_gradients() {
+        let mapping = mapping();
+        let (race, geometry) = banked_left_race();
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+
+        // Close ground = the full-width bands at the bottom of the screen.
+        let near_ground: Vec<&[RoadVertex]> = road_quads(&frame.road)
+            .filter(|q| is_full_width_band(q) && q[0].position[1] > 400.0)
+            .collect();
+        assert!(!near_ground.is_empty(), "ground reaches the screen bottom");
+        assert!(
+            near_ground.iter().any(|q| q[0].color != q[2].color),
+            "near ground bands shade as vertical gradients, not flat fills"
+        );
+    }
+
+    #[test]
+    fn band_contrast_is_softened_not_removed() {
+        // The light/dark alternation is the off-road motion cue (B4/B5) and
+        // must survive; the HD direction only softens how hard the bands
+        // snap. Deltas are per-channel, in 0..=1 color space.
+        let max_delta = |a: [f32; 4], b: [f32; 4]| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f32, f32::max)
+        };
+        let grass = max_delta(GRASS_LIGHT, GRASS_DARK);
+        assert!(
+            grass > 0.0,
+            "the grass alternation must survive — it is the off-road motion cue"
+        );
+        assert!(
+            grass <= 0.06,
+            "grass band contrast {grass} is harsh; soften toward 0.06"
+        );
+        let road = max_delta(ROAD_LIGHT, ROAD_DARK);
+        assert!(
+            road > 0.0,
+            "the asphalt alternation must survive — it reads as forward motion"
+        );
+        assert!(
+            road <= 0.08,
+            "road band contrast {road} is harsh; soften toward 0.08"
+        );
     }
 }
