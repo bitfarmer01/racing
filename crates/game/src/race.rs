@@ -511,6 +511,16 @@ impl Race {
         lap_progress(self.player_distance(), self.track_length)
     }
 
+    /// Laps needed to finish, for the HUD's `lap x of N` display.
+    pub fn total_laps(&self) -> u32 {
+        self.total_laps
+    }
+
+    /// Length of one lap, in meters, for the HUD's progress display.
+    pub fn lap_length(&self) -> f32 {
+        self.track_length
+    }
+
     /// Whether the player has completed every lap.
     pub fn is_finished(&self) -> bool {
         self.finished

@@ -14,11 +14,18 @@
 //! road mesh refill, and [`render::GpuRenderer::draw`] presents.
 //!
 //! Boundaries:
-//! - The canvas is sized by the loader before construction; the shell reads
-//!   `canvas.width()/height()` once at boot. `GpuRenderer` owns the surface
-//!   configuration privately, so there is no resize path yet — a resize
-//!   would rebuild the renderer. This is a recorded follow-up, not a
-//!   silent gap.
+//! - The canvas backing store is sized by the loader (window size ×
+//!   devicePixelRatio, capped) before construction and refreshed on window
+//!   resize. The renderer was built for the boot size and reconfigures its
+//!   surface implicitly when the canvas element's size changes — wgpu 25
+//!   checks the canvas size at `get_current_texture` — so no explicit
+//!   resize path lives here.
+//! - The camera's clip transform is a fixed ortho over the runtime's
+//!   800×450 pixel-space viewport (per-frame rider positions already live
+//!   in screen space), so one camera serves every frame at any surface
+//!   size; a non-16:9 window stretches the composition non-uniformly. That
+//!   fixed viewport is load-bearing in `runtime`'s frame builder, so it is
+//!   documented rather than changed.
 //! - No browser here on the dev host: this crate is compile-checked for
 //!   wasm32 (`cargo check -p web --target wasm32-unknown-unknown`, both
 //!   feature builds) and exercised in a browser only by the recorded
@@ -44,6 +51,8 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use world::RoadGeometry;
 
+#[cfg(target_arch = "wasm32")]
+use game::bike::Control;
 #[cfg(target_arch = "wasm32")]
 use game::input::GameInput;
 
@@ -275,6 +284,42 @@ impl BrowserGame {
     /// Whether the lights are still red.
     pub fn is_counting_down(&self) -> bool {
         self.race.is_counting_down()
+    }
+
+    /// Progress through the player's current lap, in `[0, 1)`, for the HUD's
+    /// progress bar.
+    pub fn lap_progress(&self) -> f32 {
+        self.race.lap_progress()
+    }
+
+    /// Laps needed to finish, for the HUD's `lap x of N` display.
+    pub fn total_laps(&self) -> u32 {
+        self.race.total_laps()
+    }
+
+    /// Length of one lap in meters, for the HUD's progress display.
+    pub fn lap_length(&self) -> f32 {
+        self.race.lap_length()
+    }
+
+    /// The rider's state as a bitmask for the HUD badge: 1 = crashed,
+    /// 2 = off-road, 4 = braking. A stable u32 rather than a string keeps
+    /// the per-frame HUD read allocation-free; the loader maps bits to
+    /// labels and colors. Off-road is derived here the same way the bike
+    /// state machine draws the line: lateral distance beyond the road's
+    /// half width.
+    pub fn rider_state(&self) -> u32 {
+        let mut state = 0;
+        if self.race.player_control() == Control::Crashed {
+            state |= 1;
+        }
+        if self.race.player_lateral().abs() > self.geometry.road_width() * 0.5 {
+            state |= 2;
+        }
+        if self.race.player_control() == Control::Brake {
+            state |= 4;
+        }
+        state
     }
 
     /// Whether the player has finished every lap.
