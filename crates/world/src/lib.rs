@@ -8,5 +8,8 @@ mod geometry;
 mod projection;
 
 pub use camera::{Camera, Viewport};
-pub use geometry::{CurveSegment, ElevationKey, RoadGeometry};
+pub use geometry::{
+    course_landmarks, pick_dressing, CurveSegment, DressingKind, DressingMix, ElevationKey,
+    Landmark, LandmarkKind, RoadGeometry, Zone, ZoneLayout, ZoneSample,
+};
 pub use projection::{Billboard, Projected, Projector, RoadStrip, RoadStrips, NEAR_PLANE};

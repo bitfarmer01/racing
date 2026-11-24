@@ -116,6 +116,41 @@ const GRASS_FOG: f32 = 0.9;
 const HAZE: [f32; 4] = [0.72, 0.80, 0.88, 1.0];
 /// Muted blue-green of the backdrop ridge silhouettes (B3).
 const BACKDROP: [f32; 4] = [0.40, 0.50, 0.45, 1.0];
+/// Lap length of the demo course, in meters — zones and landmarks wrap
+/// per lap (7c).
+pub const LAP_LENGTH: f32 = 2_000.0;
+/// How strongly the zone's sky tint pulls the gradient, per channel (7c).
+const SKY_TINT_STRENGTH: f32 = 0.45;
+/// How strongly the zone's grass tint pulls the alternating bands (7c).
+const GRASS_TINT_STRENGTH: f32 = 0.45;
+/// Zone dressing sizes in world units: palm, town block, ridge boulder (7c).
+const PALM_SIZE: (f32, f32) = (5.0, 9.0);
+const BUILDING_SIZE: (f32, f32) = (11.0, 14.0);
+const BUILDING_SHADOW: (f32, f32) = (10.0, 3.0);
+const ROCK_SIZE: (f32, f32) = (3.4, 2.4);
+const ROCK_SHADOW: (f32, f32) = (3.2, 0.9);
+/// Dense-zone detail: fence runs and power poles (7c).
+const FENCE_SIZE: (f32, f32) = (8.0, 1.3);
+const FENCE_SHADOW: (f32, f32) = (7.0, 0.5);
+const POLE_SIZE: (f32, f32) = (1.6, 9.0);
+const POLE_SHADOW: (f32, f32) = (1.6, 0.6);
+/// Power-pole spacing in dense zones, in meters (7c).
+const POLE_SPACING: f32 = 66.0;
+/// Distance-marker posts: one every 500 m on both road edges, on a fixed
+/// world-anchored grid (7c).
+const MARKER_STEP: f32 = 500.0;
+const MARKER_LATERAL: f32 = 7.2;
+const MARKER_SIZE: (f32, f32) = (0.8, 1.6);
+/// How far landmarks stay on the draw list: beyond this they are haze (7c).
+const LANDMARK_DRAW_DISTANCE: f32 = 800.0;
+/// Fog cap on landmarks: a ghost of the shape survives in the haze, so the
+/// structure fades in instead of popping (7c).
+const LANDMARK_FOG_MAX: f32 = 0.85;
+/// Landmark sizes in world units: the large "you are here" anchors (7c).
+const WATER_TOWER_SIZE: (f32, f32) = (14.0, 20.0);
+const WINDMILL_SIZE: (f32, f32) = (12.0, 22.0);
+const BILLBOARD_SIZE: (f32, f32) = (10.0, 8.0);
+const LANDMARK_SHADOW: (f32, f32) = (12.0, 3.0);
 /// Width of each rumble strip, in meters.
 const RUMBLE_WIDTH: f32 = 1.1;
 /// Spacing between roadside scenery slots, in meters.
@@ -321,6 +356,16 @@ pub struct AtlasMapping {
     sign: [f32; 4],
     car: [f32; 4],
     cone: [f32; 4],
+    /// Wave 7c zone dressing and landmark frames.
+    palm: [f32; 4],
+    building: [f32; 4],
+    fence: [f32; 4],
+    pole: [f32; 4],
+    marker: [f32; 4],
+    rock: [f32; 4],
+    water_tower: [f32; 4],
+    windmill: [f32; 4],
+    billboard: [f32; 4],
 }
 
 impl AtlasMapping {
@@ -364,6 +409,15 @@ impl AtlasMapping {
             sign: uv("sign"),
             car: uv("car"),
             cone: uv("cone"),
+            palm: uv("palm"),
+            building: uv("building"),
+            fence: uv("fence"),
+            pole: uv("pole"),
+            marker: uv("marker"),
+            rock: uv("rock"),
+            water_tower: uv("water_tower"),
+            windmill: uv("windmill"),
+            billboard: uv("billboard"),
         }
     }
 
@@ -432,6 +486,44 @@ impl AtlasMapping {
 
     pub fn cone_uv(&self) -> [f32; 4] {
         self.cone
+    }
+
+    /// Wave 7c zone dressing frames.
+    pub fn palm_uv(&self) -> [f32; 4] {
+        self.palm
+    }
+
+    pub fn building_uv(&self) -> [f32; 4] {
+        self.building
+    }
+
+    pub fn fence_uv(&self) -> [f32; 4] {
+        self.fence
+    }
+
+    pub fn pole_uv(&self) -> [f32; 4] {
+        self.pole
+    }
+
+    pub fn marker_uv(&self) -> [f32; 4] {
+        self.marker
+    }
+
+    pub fn rock_uv(&self) -> [f32; 4] {
+        self.rock
+    }
+
+    /// Landmark frames — the large "you are here" anchors.
+    pub fn water_tower_uv(&self) -> [f32; 4] {
+        self.water_tower
+    }
+
+    pub fn windmill_uv(&self) -> [f32; 4] {
+        self.windmill
+    }
+
+    pub fn billboard_uv(&self) -> [f32; 4] {
+        self.billboard
     }
 }
 
@@ -504,7 +596,9 @@ pub fn demo_race() -> (Race, RoadGeometry) {
     let geometry = track_geometry();
     let race = Race::new(RaceConfig {
         rivals: 3,
-        track_length: 2_000.0,
+        // One lap = one pass through every zone; landmarks and dressing
+        // repeat per lap on the same fixed distances (7c).
+        track_length: LAP_LENGTH,
         total_laps: 3,
         seed: 0x5EED_C0DE,
         geometry: geometry.clone(),
@@ -576,6 +670,15 @@ struct DrawItem {
     world_height: f32,
     uv: [f32; 4],
     roll: f32,
+    /// How far this item is pulled into the haze: 0 for everything on the
+    /// road's fog budget, up to a capped ghost for distant landmarks (7c).
+    fog: f32,
+}
+
+/// Zone grass band: the alternating base tone pulled toward the zone's
+/// grass tint (7c). Pure — the same base and tint always blend the same way.
+fn grass_shade_for(base: [f32; 4], tint: [f32; 4]) -> [f32; 4] {
+    lerp_color(base, tint, GRASS_TINT_STRENGTH)
 }
 
 /// Blends `a` toward `b` by `t` in [0, 1], per channel. Pure.
@@ -595,15 +698,21 @@ fn fog_at(depth: f32) -> f32 {
     (depth / ROAD_DRAW_DISTANCE).powi(2)
 }
 
-/// One parallax layer of the distant backdrop (B3): a base height, an
-/// amplitude, and how strongly the road's bend over the next stretch shifts
-/// it sideways (far layers shift less — cheap depth parallax).
+/// One parallax layer of the distant backdrop (B3, 7c). The ridge profile
+/// is a function of *backdrop meters*: the camera's course distance scrolls
+/// it (far layers scroll less), each screen column samples a slice of it,
+/// and a road bend ahead shifts it — so the horizon changes on straights,
+/// which a screen-x sine never does.
 struct BackdropLayer {
     base_px: f32,
     amp_px: f32,
     wavelength_px: f32,
     phase: f32,
-    /// Lateral pixels of shift per meter of road bend.
+    /// Fraction of the camera's course distance that scrolls this layer.
+    parallax: f32,
+    /// Backdrop meters per screen column.
+    world_per_px: f32,
+    /// Backdrop meters of shift per meter of road bend ahead.
     shift_per_m: f32,
     /// How far this layer's color is blended into the haze: farther layers
     /// sit closer to the sky.
@@ -617,7 +726,9 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 6.0,
         wavelength_px: 110.0,
         phase: 4.4,
-        shift_per_m: 0.10,
+        parallax: 0.25,
+        world_per_px: 1.0,
+        shift_per_m: 0.3,
         haze: 0.55,
     },
     BackdropLayer {
@@ -625,7 +736,9 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 9.0,
         wavelength_px: 150.0,
         phase: 2.1,
-        shift_per_m: 0.20,
+        parallax: 0.45,
+        world_per_px: 1.2,
+        shift_per_m: 0.5,
         haze: 0.38,
     },
     BackdropLayer {
@@ -633,7 +746,9 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 12.0,
         wavelength_px: 210.0,
         phase: 0.8,
-        shift_per_m: 0.35,
+        parallax: 0.7,
+        world_per_px: 1.5,
+        shift_per_m: 0.8,
         haze: 0.15,
     },
 ];
@@ -647,34 +762,52 @@ const BACKDROP_COLUMN_PX: f32 = 12.0;
 /// straight runs and long curves alike.
 const BACKDROP_BEND_AHEAD: f32 = 150.0;
 
-/// Silhouette height for one backdrop layer at screen x, in [0, 1]: two
-/// incommensurate sines so the ridge line never visibly repeats. Pure.
-fn hill_height(px: f32, layer: &BackdropLayer) -> f32 {
-    let k = std::f32::consts::TAU / layer.wavelength_px;
-    let a = (px * k + layer.phase).sin();
-    let b = (px * k * 2.7 + layer.phase * 1.6).sin();
+/// Ridge profile value for one layer at backdrop coordinate `u`, in [0, 1]:
+/// two incommensurate sines of backdrop meters so the ridge line never
+/// visibly repeats as it scrolls. Pure.
+fn ridge_value(u: f32, layer: &BackdropLayer) -> f32 {
+    let k = std::f32::consts::TAU / (layer.wavelength_px * layer.world_per_px);
+    let a = (u * k + layer.phase).sin();
+    let b = (u * k * 2.7 + layer.phase * 1.6).sin();
     (0.5 + 0.5 * (0.65 * a + 0.35 * b)).clamp(0.0, 1.0)
 }
 
+/// The world-anchored ridge profile for one screen column at a camera
+/// distance and bend shift, in [0, 1]. Pure — the frozen-horizon regression
+/// holds this: on a straight, changing `camera_distance` must change the
+/// value. `push_backdrop` renders through this same function, so the tested
+/// profile is the shipped one.
+fn backdrop_profile(camera_distance: f32, px: f32, shift: f32, layer: &BackdropLayer) -> f32 {
+    ridge_value(
+        camera_distance * layer.parallax + px * layer.world_per_px + shift,
+        layer,
+    )
+}
+
 /// Paints the layered hill silhouettes between the sky and the horizon
-/// (B3): one flat-color column quad per [`BACKDROP_COLUMN_PX`] pixels of
-/// screen, their tops traced by [`hill_height`], shifted sideways by the
-/// road's bend ahead.
+/// (B3, 7c): one flat-color column quad per [`BACKDROP_COLUMN_PX`] pixels of
+/// screen, their tops traced by the world-anchored
+/// [`backdrop_profile`], shifted by the road's bend ahead and scaled by the
+/// zone's backdrop amplitude.
 fn push_backdrop(
     geometry: &RoadGeometry,
     camera: &world::Camera,
     road: &mut RoadMesh,
     horizon: f32,
+    backdrop_amp: f32,
 ) {
     let bend = geometry.center_offset(camera.distance + BACKDROP_BEND_AHEAD)
         - geometry.center_offset(camera.distance);
     for layer in &BACKDROP_LAYERS {
-        let shift = -bend * layer.shift_per_m;
+        // The bend shift moves in backdrop meters now, on the same
+        // world-anchored coordinate the camera scrolls.
+        let bend_shift = -bend * layer.shift_per_m;
         let color = lerp_color(BACKDROP, HAZE, layer.haze);
         let mut x = 0.0;
         while x < VIEWPORT_WIDTH {
             let x1 = (x + BACKDROP_COLUMN_PX).min(VIEWPORT_WIDTH);
-            let top = horizon - layer.base_px - layer.amp_px * hill_height(x + shift, layer);
+            let height = backdrop_profile(camera.distance, x, bend_shift, layer);
+            let top = horizon - layer.base_px - layer.amp_px * backdrop_amp * height;
             // One pixel past the horizon: the grass bands below cover the
             // seam, so no hairline gap opens between ridge and ground.
             road.push_screen_rect(x, top, x1, horizon + 1.0, color);
@@ -855,19 +988,24 @@ fn compose(
     road.vertices.clear();
 
     batch.clear();
+    // Zone sample at the camera (7c): one sample drives the sky tint and
+    // backdrop amplitude; per-strip samples drive the grass.
+    let zones = world::ZoneLayout::for_track();
+    let zone = zones.sample(camera.distance);
     // Sky: one quad shading continuously from the zenith blue down to the
     // horizon haze — vertex colors interpolate, so there are no band edges
     // anywhere in the sky (B1, HD direction). The haze blend the old haze
-    // band carried is the gradient's horizon stop.
+    // band carried is the gradient's horizon stop. The zone's tint pulls
+    // both stops, so the whole sky shifts with the place you ride through.
     road.push_screen_rect_gradient(
         0.0,
         0.0,
         VIEWPORT_WIDTH,
         horizon,
-        sky_color_at(0.0),
-        sky_color_at(1.0),
+        lerp_color(sky_color_at(0.0), zone.sky_tint, SKY_TINT_STRENGTH),
+        lerp_color(sky_color_at(1.0), zone.sky_tint, SKY_TINT_STRENGTH),
     );
-    push_backdrop(geometry, &camera, road, horizon);
+    push_backdrop(geometry, &camera, road, horizon, zone.backdrop_amp);
 
     // Road: near-to-far trapezoid strips, alternating shades, with grass
     // bands behind every strip so the whole ground plane fades with depth
@@ -889,21 +1027,27 @@ fn compose(
         // Grass band for this strip's depth range, full width (B4),
         // shading from the near edge's fog level to the far edge's — the
         // depth fade becomes a continuous gradient per band instead of one
-        // flat shade (HD direction).
-        let grass_shade = if strip_index.is_multiple_of(2) {
-            GRASS_LIGHT
-        } else {
-            GRASS_DARK
-        };
-        let fog_near = fog_at(depth - ROAD_STEP);
+        // flat shade (HD direction). The tint is the zone at the strip's
+        // mid-point in world space, so bands blend across zone boundaries.
+        let light_band = strip_index.is_multiple_of(2);
+        let zone_mid = zones.sample(camera.distance + (strip_index as f32 + 0.5) * ROAD_STEP);
         let fog_far = fog_at(depth);
+        let band = if light_band { GRASS_LIGHT } else { GRASS_DARK };
         road.push_screen_rect_gradient(
             0.0,
             strip.far_y,
             VIEWPORT_WIDTH,
             strip.near_y,
-            lerp_color(grass_shade, HAZE, fog_far * GRASS_FOG),
-            lerp_color(grass_shade, HAZE, fog_near * GRASS_FOG),
+            lerp_color(
+                grass_shade_for(band, zone_mid.grass_tint),
+                HAZE,
+                fog_far * GRASS_FOG,
+            ),
+            lerp_color(
+                grass_shade_for(band, zone_mid.grass_tint),
+                HAZE,
+                fog_at(depth - ROAD_STEP) * GRASS_FOG,
+            ),
         );
 
         // Asphalt: alternating shades fading into the haze with depth.
@@ -979,6 +1123,7 @@ fn compose(
             world_height: BIKE_SHADOW.1 * rival_scale,
             uv: shadow_uv,
             roll: 0.0,
+            fog: 0.0,
         });
         draws.push(DrawItem {
             distance: state.pos_x,
@@ -989,6 +1134,7 @@ fn compose(
             // The rider's bank: the sim carries the lean, the instance
             // transform rolls the quad about its ground contact.
             roll: race.bike_lean(slot),
+            fog: 0.0,
         });
     }
     for car in race.traffic_cars() {
@@ -999,6 +1145,7 @@ fn compose(
             world_height: CAR_SHADOW.1,
             uv: shadow_uv,
             roll: 0.0,
+            fog: 0.0,
         });
         draws.push(DrawItem {
             distance: car.state.pos_x,
@@ -1007,6 +1154,7 @@ fn compose(
             world_height: 1.5,
             uv: mapping.car_uv(),
             roll: 0.0,
+            fog: 0.0,
         });
     }
     for hazard in race.hazards() {
@@ -1017,6 +1165,7 @@ fn compose(
             world_height: CONE_SHADOW.1,
             uv: shadow_uv,
             roll: 0.0,
+            fog: 0.0,
         });
         draws.push(DrawItem {
             distance: hazard.pos_x,
@@ -1025,14 +1174,25 @@ fn compose(
             world_height: CONE_SIZE.1,
             uv: mapping.cone_uv(),
             roll: 0.0,
+            fog: 0.0,
         });
     }
     push_scenery(geometry, mapping, &mut draws, camera.distance);
+    push_landmarks(geometry, mapping, &mut draws, camera.distance);
+    push_distance_markers(
+        mapping,
+        &mut draws,
+        camera.distance + 2.0,
+        camera.distance + ROAD_DRAW_DISTANCE,
+    );
+    push_poles(geometry, mapping, &mut draws, camera.distance);
     draws.sort_by(|a, b| b.distance.total_cmp(&a.distance));
     for item in draws {
         let style = SpriteStyle {
             uv_rect: item.uv,
-            tint: [1.0, 1.0, 1.0, 1.0],
+            // Fog pulls distant sprites into the haze; landmarks cap it so
+            // their shape ghosts in before they arrive.
+            tint: lerp_color([1.0, 1.0, 1.0, 1.0], HAZE, item.fog),
         };
         // Items behind the camera plane are culled by the projector —
         // push_projected reports that as `false` and that is expected.
@@ -1051,11 +1211,144 @@ fn compose(
     }
 }
 
+/// Large one-off landmarks per lap (7c): the "you are here" anchors. Each
+/// lap's instances are placed at fixed world distances; the closest not yet
+/// passed is drawn from [`LANDMARK_DRAW_DISTANCE`] out, fog-capped so the
+/// shape ghosts in through the haze long before the rider reaches it. Pure
+/// — same seed, same landmarks.
+fn push_landmarks(
+    _geometry: &RoadGeometry,
+    mapping: &AtlasMapping,
+    draws: &mut Vec<DrawItem>,
+    camera_distance: f32,
+) {
+    let shadow_uv = mapping.shadow_uv();
+    let zones = world::ZoneLayout::for_track();
+    let lap_length = zones.lap_length;
+    for landmark in world::course_landmarks() {
+        // All instances of this landmark: every lap it belongs to that is
+        // still within the draw window ahead.
+        for lap in 0..2 {
+            let distance = landmark.distance + lap as f32 * lap_length;
+            let depth = distance - camera_distance;
+            if depth <= world::NEAR_PLANE + 1.0 || depth > LANDMARK_DRAW_DISTANCE {
+                continue;
+            }
+            let (uv, size) = match landmark.kind {
+                world::LandmarkKind::WaterTower => (mapping.water_tower_uv(), WATER_TOWER_SIZE),
+                world::LandmarkKind::Windmill => (mapping.windmill_uv(), WINDMILL_SIZE),
+                world::LandmarkKind::Billboards => (mapping.billboard_uv(), BILLBOARD_SIZE),
+            };
+            let fog = fog_at(depth).min(LANDMARK_FOG_MAX);
+            draws.push(DrawItem {
+                distance: distance + SHADOW_DEPTH_BIAS,
+                lateral: landmark.lateral,
+                world_width: LANDMARK_SHADOW.0,
+                world_height: LANDMARK_SHADOW.1,
+                uv: shadow_uv,
+                roll: 0.0,
+                fog,
+            });
+            draws.push(DrawItem {
+                distance,
+                lateral: landmark.lateral,
+                world_width: size.0,
+                world_height: size.1,
+                uv,
+                roll: 0.0,
+                fog,
+            });
+        }
+    }
+}
+
+/// Distance-marker posts every [`MARKER_STEP`] meters on both road edges
+/// (7c): the cheap "how far along am I" rhythm. World-anchored grid — the
+/// posts sit still in the world as the rider passes.
+fn push_distance_markers(
+    mapping: &AtlasMapping,
+    draws: &mut Vec<DrawItem>,
+    window_near: f32,
+    window_far: f32,
+) {
+    let shadow_uv = mapping.shadow_uv();
+    let first = ((window_near + 2.0) / MARKER_STEP).floor() as u64;
+    let last = (window_far / MARKER_STEP).ceil() as u64;
+    for slot in first..=last {
+        let distance = slot as f32 * MARKER_STEP;
+        for side in [-1.0_f32, 1.0] {
+            let lateral = side * MARKER_LATERAL;
+            draws.push(DrawItem {
+                distance: distance + SHADOW_DEPTH_BIAS,
+                lateral,
+                world_width: MARKER_SIZE.0,
+                world_height: MARKER_SIZE.1,
+                uv: shadow_uv,
+                roll: 0.0,
+                fog: 0.0,
+            });
+            draws.push(DrawItem {
+                distance,
+                lateral,
+                world_width: MARKER_SIZE.0,
+                world_height: MARKER_SIZE.1,
+                uv: mapping.marker_uv(),
+                roll: 0.0,
+                fog: 0.0,
+            });
+        }
+    }
+}
+
+/// Power poles in the zones that ask for them (7c): repeating quads on a
+/// fixed world grid, alternating sides. Pure — same distance, same poles.
+fn push_poles(
+    geometry: &RoadGeometry,
+    mapping: &AtlasMapping,
+    draws: &mut Vec<DrawItem>,
+    camera_distance: f32,
+) {
+    let half_width = geometry.road_width() * 0.5;
+    let zones = world::ZoneLayout::for_track();
+    let shadow_uv = mapping.shadow_uv();
+    let first = ((camera_distance + 2.0) / POLE_SPACING).floor() as u64;
+    let last = ((camera_distance + ROAD_DRAW_DISTANCE) / POLE_SPACING).ceil() as u64;
+    for slot in first..=last {
+        let distance = slot as f32 * POLE_SPACING;
+        if !zones.sample(distance).poles {
+            continue;
+        }
+        let side = if slot % 2 == 0 { 1.0 } else { -1.0 };
+        let lateral = side * (half_width + 2.2);
+        draws.push(DrawItem {
+            distance: distance + SHADOW_DEPTH_BIAS,
+            lateral,
+            world_width: POLE_SHADOW.0,
+            world_height: POLE_SHADOW.1,
+            uv: shadow_uv,
+            roll: 0.0,
+            fog: 0.0,
+        });
+        draws.push(DrawItem {
+            distance,
+            lateral,
+            world_width: POLE_SIZE.0,
+            world_height: POLE_SIZE.1,
+            uv: mapping.pole_uv(),
+            roll: 0.0,
+            fog: 0.0,
+        });
+    }
+}
+
 /// Deterministic roadside scenery: every [`SCENERY_SPACING`] meters there is
 /// a slot whose seeded roll picks a tree, bush, or sign. Sides alternate by
 /// slot — guaranteed balance across the road, however the seeded rolls fall
 /// — with an occasional opposite-side understory bush (D4). Same distance,
-/// same dressing — no per-frame state.
+/// same dressing — no per-frame state. The zone at the slot's distance
+/// supplies the dressing mix (7c): the coast grows palms, the town grows
+/// buildings, and the ridge scatters boulders, while dense zones line the
+/// verge with fence runs.
 fn push_scenery(
     geometry: &RoadGeometry,
     mapping: &AtlasMapping,
@@ -1064,26 +1357,33 @@ fn push_scenery(
 ) {
     let half_width = geometry.road_width() * 0.5;
     let shadow_uv = mapping.shadow_uv();
+    let zones = world::ZoneLayout::for_track();
     let first = ((camera_distance + 2.0) / SCENERY_SPACING).floor() as u64;
     let last = ((camera_distance + ROAD_DRAW_DISTANCE) / SCENERY_SPACING).ceil() as u64;
     for slot in first..=last {
         let distance = slot as f32 * SCENERY_SPACING;
+        let zone = zones.sample(distance);
         let mut roll = sim::rng::XorShift64::new(slot.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let kind = roll.next_f32_in(0.0, 1.0);
-        let (uv, (width, height), shadow) = if kind < 0.55 {
-            // Trees come in three silhouettes (pine, broadleaf, tall pine),
-            // cycled by slot, so the verge is a treeline, not a stamp.
-            match slot % 3 {
-                0 => (mapping.tree_variant_uv(0), TREE_SIZE, TREE_SHADOW),
-                1 => (mapping.tree_variant_uv(1), BROADLEAF_SIZE, TREE_SHADOW),
-                _ => (mapping.tree_variant_uv(2), TALL_PINE_SIZE, (4.0, 1.2)),
+        let kind = world::pick_dressing(zone.dressing, roll.next_f32_in(0.0, 1.0));
+        let (uv, (width, height), shadow) = match kind {
+            world::DressingKind::Palm => (mapping.palm_uv(), PALM_SIZE, TREE_SHADOW),
+            world::DressingKind::Tree => {
+                // Trees come in three silhouettes (pine, broadleaf, tall
+                // pine), cycled by slot, so the verge is a treeline, not a
+                // stamp.
+                match slot % 3 {
+                    0 => (mapping.tree_variant_uv(0), TREE_SIZE, TREE_SHADOW),
+                    1 => (mapping.tree_variant_uv(1), BROADLEAF_SIZE, TREE_SHADOW),
+                    _ => (mapping.tree_variant_uv(2), TALL_PINE_SIZE, (4.0, 1.2)),
+                }
             }
-        } else if kind < 0.8 {
-            (mapping.bush_uv(), BUSH_SIZE, BUSH_SHADOW)
-        } else if kind < 0.92 {
-            (mapping.sign_uv(), SIGN_SIZE, SIGN_SHADOW)
-        } else {
-            continue;
+            world::DressingKind::Building => {
+                (mapping.building_uv(), BUILDING_SIZE, BUILDING_SHADOW)
+            }
+            world::DressingKind::Rock => (mapping.rock_uv(), ROCK_SIZE, ROCK_SHADOW),
+            world::DressingKind::Bush => (mapping.bush_uv(), BUSH_SIZE, BUSH_SHADOW),
+            world::DressingKind::Sign => (mapping.sign_uv(), SIGN_SIZE, SIGN_SHADOW),
+            world::DressingKind::Skip => continue,
         };
         // Alternate sides by slot parity: even slots right, odd slots left.
         let side = if slot % 2 == 0 { 1.0 } else { -1.0 };
@@ -1095,6 +1395,7 @@ fn push_scenery(
             world_height: shadow.1,
             uv: shadow_uv,
             roll: 0.0,
+            fog: 0.0,
         });
         draws.push(DrawItem {
             distance,
@@ -1103,7 +1404,33 @@ fn push_scenery(
             world_height: height,
             uv,
             roll: 0.0,
+            fog: 0.0,
         });
+        // Dense zones line both verges with fence sections: cheap
+        // repeating quads on the same slot grid (7c).
+        if zone.fences {
+            for fence_side in [-1.0_f32, 1.0] {
+                let fence_lateral = fence_side * (half_width + 0.9);
+                draws.push(DrawItem {
+                    distance: distance + SHADOW_DEPTH_BIAS,
+                    lateral: fence_lateral,
+                    world_width: FENCE_SHADOW.0,
+                    world_height: FENCE_SHADOW.1,
+                    uv: shadow_uv,
+                    roll: 0.0,
+                    fog: 0.0,
+                });
+                draws.push(DrawItem {
+                    distance,
+                    lateral: fence_lateral,
+                    world_width: FENCE_SIZE.0,
+                    world_height: FENCE_SIZE.1,
+                    uv: mapping.fence_uv(),
+                    roll: 0.0,
+                    fog: 0.0,
+                });
+            }
+        }
         // A quarter of slots also get a small bush on the opposite verge,
         // so neither side of the road ever reads empty (D4).
         if roll.next_f32_in(0.0, 1.0) < 0.25 {
@@ -1115,6 +1442,7 @@ fn push_scenery(
                 world_height: BUSH_SHADOW.1,
                 uv: shadow_uv,
                 roll: 0.0,
+                fog: 0.0,
             });
             draws.push(DrawItem {
                 distance,
@@ -1123,6 +1451,7 @@ fn push_scenery(
                 world_height: BUSH_SIZE.1,
                 uv: mapping.bush_uv(),
                 roll: 0.0,
+                fog: 0.0,
             });
         }
     }
@@ -1132,6 +1461,7 @@ fn push_scenery(
 mod tests {
     use super::*;
     use crate::pack_placeholder_atlas;
+    use world::ZoneLayout;
 
     /// A mapping over the packed placeholder atlas, shared by these tests.
     fn mapping() -> AtlasMapping {
@@ -1376,5 +1706,194 @@ mod tests {
             road <= 0.08,
             "road band contrast {road} is harsh; soften toward 0.08"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 7c — world construction: distance-anchored horizon, zones,
+    // landmarks. Red-first per the spec's verification list.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_backdrop_changes_with_camera_distance_on_a_straight() {
+        // Same screen column, two camera distances on the opening straight:
+        // the world-anchored ridge must differ — the frozen-horizon
+        // regression. A screen-anchored sine is frozen here.
+        let layer = &BACKDROP_LAYERS[1];
+        assert_ne!(
+            backdrop_profile(0.0, 400.0, 0.0, layer),
+            backdrop_profile(120.0, 400.0, 0.0, layer),
+            "on a straight the horizon must change with camera distance"
+        );
+        // Not just one column: the whole ridge line scrolls as the bike
+        // travels, so most columns read a different height.
+        let changed = (0..VIEWPORT_WIDTH as u32)
+            .step_by(50)
+            .filter(|px| {
+                backdrop_profile(0.0, *px as f32, 0.0, layer)
+                    != backdrop_profile(200.0, *px as f32, 0.0, layer)
+            })
+            .count();
+        assert!(
+            changed > 8,
+            "the whole ridge must scroll: {changed} columns changed"
+        );
+    }
+
+    #[test]
+    fn zone_tints_reach_the_composed_frame() {
+        let mapping = mapping();
+        // The zone table gives different zones different tints to deliver.
+        assert_ne!(
+            ZoneLayout::for_track().sample(200.0).sky_tint,
+            ZoneLayout::for_track().sample(800.0).sky_tint,
+        );
+        // The composed sky carries the zone tint: a frame composed at the
+        // start line (coast) differs from one composed in the town. The
+        // ride out is deterministic — same inputs, same sim.
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let early = GameFrame::build(&race, &geometry, &mapping);
+        let mut in_town = false;
+        for _ in 0..4000 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            if race.player_distance() > 700.0 {
+                in_town = true;
+                break;
+            }
+        }
+        assert!(in_town, "the race reaches the town zone");
+        let late = GameFrame::build(&race, &geometry, &mapping);
+        let early_sky = road_quads(&early.road)
+            .filter(|q| is_full_width_band(q) && q[2].position[1] == 0.0)
+            .map(|q| q[2].color)
+            .next()
+            .expect("the sky composes as one quad");
+        let late_sky = road_quads(&late.road)
+            .filter(|q| is_full_width_band(q) && q[2].position[1] == 0.0)
+            .map(|q| q[2].color)
+            .next()
+            .expect("the sky composes as one quad");
+        assert_ne!(
+            early_sky, late_sky,
+            "the zone's sky tint must reach the composed frame"
+        );
+    }
+
+    #[test]
+    fn grass_shade_follows_the_zone_tint() {
+        // The per-strip grass shade must carry the zone's tint: the same
+        // alternating base bands read differently in coast and forest.
+        let coast = ZoneLayout::for_track().sample(200.0).grass_tint;
+        let forest = ZoneLayout::for_track().sample(1300.0).grass_tint;
+        assert_ne!(
+            grass_shade_for(GRASS_LIGHT, coast),
+            grass_shade_for(GRASS_LIGHT, forest),
+            "the zone tint must actually reach the grass shade"
+        );
+    }
+
+    #[test]
+    fn landmarks_and_markers_ride_the_sprite_pipeline() {
+        let geometry = track_geometry();
+        let mapping = mapping();
+
+        // Landmarks: at the start line the water tower (380 m) is already on
+        // the draw list — visible well before you reach it — while nothing
+        // beyond the visibility range is.
+        let mut draws = Vec::new();
+        push_landmarks(&geometry, &mapping, &mut draws, 0.0);
+        assert!(
+            draws
+                .iter()
+                .any(|d| d.uv == mapping.water_tower_uv() && d.world_width > 8.0),
+            "the water tower is pushed as a large billboard sprite"
+        );
+        let mut from_tower = Vec::new();
+        push_landmarks(&geometry, &mapping, &mut from_tower, 380.0);
+        // From the tower's own distance the windmill (940 m) is listed; the
+        // tower itself is behind the camera and gone.
+        assert!(from_tower.iter().any(|d| d.uv == mapping.windmill_uv()));
+        assert!(!from_tower.iter().any(|d| d.uv == mapping.water_tower_uv()));
+
+        // Distance markers: every 500 m, both sides — pure function of the
+        // camera's distance window.
+        let mut marks = Vec::new();
+        push_distance_markers(&mapping, &mut marks, 100.0, 900.0);
+        let mark_distances: Vec<f32> = marks.iter().map(|d| d.distance).collect();
+        assert!(
+            mark_distances.iter().any(|d| (*d - 500.0).abs() < 1.0),
+            "a marker post sits at 500 m: {mark_distances:?}"
+        );
+        // Same window, same markers — no per-frame state.
+        let mut marks_again = Vec::new();
+        push_distance_markers(&mapping, &mut marks_again, 100.0, 900.0);
+        assert_eq!(
+            marks.iter().map(|d| d.distance).collect::<Vec<f32>>(),
+            marks_again.iter().map(|d| d.distance).collect::<Vec<f32>>(),
+        );
+    }
+
+    #[test]
+    fn scenery_mix_follows_the_zone_of_its_distance() {
+        let geometry = track_geometry();
+        let mapping = mapping();
+        // The coast grows palms; the town grows buildings. Same slot grid,
+        // different mixes — mile 800 must not look like mile 200.
+        let mut coast = Vec::new();
+        push_scenery(&geometry, &mapping, &mut coast, 200.0);
+        let mut town = Vec::new();
+        push_scenery(&geometry, &mapping, &mut town, 800.0);
+        assert!(
+            coast.iter().any(|d| d.uv == mapping.palm_uv()),
+            "palms on the coast"
+        );
+        assert!(
+            town.iter().any(|d| d.uv == mapping.building_uv()),
+            "buildings in the town"
+        );
+        // The mix actually switched: the coast window is palm-dominated,
+        // the town window (which still reaches back into the coast's
+        // dressing range) is not.
+        let coast_palms = coast.iter().filter(|d| d.uv == mapping.palm_uv()).count();
+        let town_palms = town.iter().filter(|d| d.uv == mapping.palm_uv()).count();
+        assert!(
+            coast_palms > town_palms,
+            "the coast grows more palms than the town: {coast_palms} vs {town_palms}"
+        );
+        // Same window twice, same dressing — the determinism pattern.
+        let mut town_again = Vec::new();
+        push_scenery(&geometry, &mapping, &mut town_again, 800.0);
+        assert_eq!(
+            town.len(),
+            town_again.len(),
+            "dressing is a pure function of distance"
+        );
+    }
+
+    #[test]
+    fn two_composes_of_one_state_build_identical_frames() {
+        // The world construction adds zone sampling to compose(); it must
+        // stay stateless: composing the same race twice gives the same
+        // batch, instance for instance.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let mut a = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut b = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut road_a = RoadMesh::default();
+        let mut road_b = RoadMesh::default();
+        compose(&race, &geometry, &mapping, &mut a, &mut road_a);
+        compose(&race, &geometry, &mapping, &mut b, &mut road_b);
+        assert_eq!(a.instances(), b.instances());
+        assert_eq!(road_a.vertices, road_b.vertices);
     }
 }
