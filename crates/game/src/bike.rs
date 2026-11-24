@@ -431,6 +431,80 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn steering_rotates_heading_with_matching_sign() {
+        let rolling = BikeSnapshot {
+            speed: 30.0,
+            ..BikeSnapshot::at_rest()
+        };
+        let right = (0..12).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerRight], false)
+        });
+        let left = (0..12).fold(rolling, |bike, _| {
+            stepped(bike, &[GameInput::SteerLeft], false)
+        });
+        assert!(right.heading > 0.0, "steering right points the bike right");
+        assert!(left.heading < 0.0, "steering left points the bike left");
+        assert!(
+            (right.heading + left.heading).abs() < 1e-6,
+            "symmetric heading rotation"
+        );
+    }
+
+    #[test]
+    fn steering_into_the_max_bend_beats_corner_drift_at_every_speed() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        // Maximum-curvature bend (k = 0.005, a left-hand bend: the inside is
+        // negative lateral). Full left steer held through it must keep the
+        // bike moving toward the inside at every speed — the road never wins.
+        for speed in [5.0, 8.0, 16.0, 30.0, 45.0, MAX_SPEED] {
+            let bike = BikeSnapshot {
+                speed,
+                ..BikeSnapshot::at_rest()
+            };
+            let held = (0..14).fold(bike, |bike, _| {
+                step_bike(
+                    bike,
+                    intent_of(&[GameInput::SteerLeft]),
+                    false,
+                    0.005,
+                    dt,
+                )
+            });
+            let next = step_bike(
+                held,
+                intent_of(&[GameInput::SteerLeft]),
+                false,
+                0.005,
+                dt,
+            );
+            let margin = held.lateral - next.lateral;
+            assert!(
+                margin > 0.0,
+                "speed {speed}: full steer holds the line toward the inside (margin {margin})"
+            );
+        }
+    }
+
+    #[test]
+    fn corner_drift_is_capped_below_full_steering_authority() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        // Flat out through the maximum bend, hands off: the grip limit caps
+        // the outward drift at 60% of what full steering could push inward.
+        let bike = BikeSnapshot {
+            speed: MAX_SPEED,
+            ..BikeSnapshot::at_rest()
+        };
+        let drifted = step_bike(bike, Intent::default(), false, 0.005, dt);
+        let drift = drifted.lateral - bike.lateral;
+        assert!(
+            drift <= CORNER_DRIFT_FRACTION * STEER_RATE * dt + 1e-6,
+            "grip limit caps drift at the fraction of steer authority ({drift})"
+        );
+        assert!(drift > 0.0, "an unsteered bike still drifts outward");
+    }
+
+    #[test]
     fn steering_ramps_in_and_bites_when_held() {
         let rolling = BikeSnapshot {
             speed: 30.0,

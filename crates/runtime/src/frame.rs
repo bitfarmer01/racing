@@ -1080,6 +1080,31 @@ mod tests {
     }
 
     #[test]
+    fn camera_lean_follows_player_heading_change() {
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Roll up to speed on the opening straight, before the first bend:
+        // same distance, same speed in both runs, so the only difference is
+        // the player's held steering.
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let neutral = player_camera(&race, &geometry, 0.0, 0.0);
+        for _ in 0..6 {
+            race.push_input(GameInput::SteerRight);
+            race.tick();
+        }
+        let steering = player_camera(&race, &geometry, 0.0, 0.0);
+        assert!(
+            steering.lateral > neutral.lateral,
+            "camera leans with the player's right-hand steer, not against it"
+        );
+    }
+
+    #[test]
     fn a_reused_batch_refills_per_frame_instead_of_piling_up() {
         // Regression: compose() reuses pre-owned batch and road buffers on
         // the steady-state path. A batch never cleared fills once, then
