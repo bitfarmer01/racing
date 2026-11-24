@@ -37,6 +37,24 @@ const HELMET: [u8; 4] = [238, 238, 238, 255];
 const TAIL_LIT: [u8; 4] = [255, 42, 30, 255];
 /// Scuff grey for the crash debris.
 const SCUFF: [u8; 4] = [120, 116, 108, 255];
+/// Foliage green, lit side.
+const LEAF: [u8; 4] = [34, 112, 48, 255];
+/// Foliage green, shadow side.
+const LEAF_DARK: [u8; 4] = [22, 78, 34, 255];
+/// Trunk brown.
+const TRUNK: [u8; 4] = [96, 64, 38, 255];
+/// Warning-sign yellow.
+const SIGN_YELLOW: [u8; 4] = [232, 188, 40, 255];
+/// Traffic-car body white.
+const CAR_BODY: [u8; 4] = [210, 212, 218, 255];
+/// Traffic-car glass dark.
+const CAR_GLASS: [u8; 4] = [40, 46, 58, 255];
+/// Traffic-car taillight red.
+const CAR_TAIL: [u8; 4] = [200, 40, 30, 255];
+/// Traffic-cone orange.
+const CONE_ORANGE: [u8; 4] = [232, 96, 22, 255];
+/// Traffic-cone white band.
+const CONE_WHITE: [u8; 4] = [240, 240, 238, 255];
 
 /// Fill an inclusive pixel rectangle, clipping to the image.
 fn fill_rect(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
@@ -128,7 +146,77 @@ pub fn placeholder_frames() -> Vec<(String, RgbaImage)> {
         ("bike_ride".to_owned(), riding_frame()),
         ("bike_brake".to_owned(), braking_frame()),
         ("bike_crash".to_owned(), crash_frame()),
+        ("tree".to_owned(), tree_frame()),
+        ("bush".to_owned(), bush_frame()),
+        ("sign".to_owned(), sign_frame()),
+        ("car".to_owned(), car_frame()),
+        ("cone".to_owned(), cone_frame()),
     ]
+}
+
+/// A roadside pine: trunk and a two-tier canopy. 24x40, anchored on the road.
+fn tree_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(24, 40, |_, _| CLEAR.into());
+    fill_rect(&mut img, 10, 30, 13, 39, TRUNK);
+    // Two canopy tiers, wider at the bottom, shadow on the left.
+    fill_rect(&mut img, 4, 18, 19, 30, LEAF);
+    fill_rect(&mut img, 4, 18, 9, 30, LEAF_DARK);
+    fill_rect(&mut img, 7, 6, 16, 18, LEAF);
+    fill_rect(&mut img, 7, 6, 10, 18, LEAF_DARK);
+    fill_rect(&mut img, 10, 0, 13, 6, LEAF);
+    img
+}
+
+/// A low roadside bush. 16x10.
+fn bush_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(16, 10, |_, _| CLEAR.into());
+    fill_rect(&mut img, 2, 4, 13, 9, LEAF);
+    fill_rect(&mut img, 2, 4, 6, 9, LEAF_DARK);
+    fill_disc(&mut img, 5, 4, 3, LEAF);
+    fill_disc(&mut img, 11, 4, 3, LEAF);
+    fill_disc(&mut img, 5, 4, 1, LEAF_DARK);
+    img
+}
+
+/// A roadside warning sign: pole and a chevron board. 18x24.
+fn sign_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(18, 24, |_, _| CLEAR.into());
+    fill_rect(&mut img, 8, 12, 10, 23, METAL);
+    fill_rect(&mut img, 2, 2, 15, 12, SIGN_YELLOW);
+    // Chevron pointing right (corners bend right around here).
+    for step in 0..5 {
+        fill_rect(&mut img, 4 + step, 4 + step, 5 + step, 10 - step, BODY);
+    }
+    img
+}
+
+/// A traffic car from behind: the view the player actually sees. 26x18.
+fn car_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(26, 18, |_, _| CLEAR.into());
+    // Body and cabin.
+    fill_rect(&mut img, 2, 6, 23, 16, CAR_BODY);
+    fill_rect(&mut img, 5, 1, 20, 7, CAR_BODY);
+    // Rear window.
+    fill_rect(&mut img, 7, 2, 18, 6, CAR_GLASS);
+    // Bumper shade.
+    fill_rect(&mut img, 2, 13, 23, 16, CAR_GLASS);
+    // Taillights.
+    fill_rect(&mut img, 3, 8, 6, 10, CAR_TAIL);
+    fill_rect(&mut img, 19, 8, 22, 10, CAR_TAIL);
+    // Tyres.
+    fill_rect(&mut img, 3, 16, 7, 17, TIRE);
+    fill_rect(&mut img, 18, 16, 22, 17, TIRE);
+    img
+}
+
+/// A traffic cone: the on-road hazard. 10x12.
+fn cone_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(10, 12, |_, _| CLEAR.into());
+    fill_rect(&mut img, 2, 10, 7, 11, CONE_ORANGE);
+    fill_rect(&mut img, 4, 6, 5, 9, CONE_ORANGE);
+    fill_rect(&mut img, 3, 5, 6, 6, CONE_WHITE);
+    fill_rect(&mut img, 4, 1, 5, 4, CONE_ORANGE);
+    img
 }
 
 /// Packs the placeholder frames into a deterministic atlas through the

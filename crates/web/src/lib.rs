@@ -251,4 +251,41 @@ impl BrowserGame {
     pub fn player_distance(&self) -> f32 {
         self.race.player_distance()
     }
+
+    /// Player speed in km/h, for the HUD.
+    pub fn speed_kmh(&self) -> u32 {
+        (self.race.player_speed() * 3.6) as u32
+    }
+
+    /// The player's race position, 1-based, for the HUD.
+    pub fn race_position(&self) -> usize {
+        self.race.race_position()
+    }
+
+    /// How many bikes are racing, for the HUD's `pos / total` display.
+    pub fn bike_count(&self) -> usize {
+        self.race.bike_count()
+    }
+
+    /// Seconds left on the green-light countdown, for the HUD.
+    pub fn countdown_secs(&self) -> u32 {
+        self.race.countdown_secs()
+    }
+
+    /// Whether the lights are still red.
+    pub fn is_counting_down(&self) -> bool {
+        self.race.is_counting_down()
+    }
+
+    /// Whether the player has finished every lap.
+    pub fn is_finished(&self) -> bool {
+        self.race.is_finished()
+    }
+
+    /// Back to the grid: a fresh race with the same track. Inputs and camera
+    /// state rebuild through the normal per-frame path.
+    pub fn restart(&mut self) {
+        let (race, _geometry) = demo_race();
+        self.race = race;
+    }
 }

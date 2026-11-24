@@ -17,7 +17,7 @@ use sim::rng::XorShift64;
 use world::RoadGeometry;
 
 use crate::ai;
-use crate::bike::{self, BikeSnapshot, Control};
+use crate::bike::{self, BikeSnapshot, Control, MAX_SPEED};
 use crate::input::{GameInput, Intent};
 
 /// Bike collision half-length along the road, in meters.
@@ -30,6 +30,42 @@ pub const COLLISION_SCRUB: f32 = 0.985;
 pub const GRID_SPACING: f32 = 6.0;
 /// Half the lateral span of lanes the grid spreads across, in meters.
 pub const GRID_HALF_SPAN: f32 = 3.0;
+/// Closing speed above which running into the bike ahead is a crash, in m/s.
+pub const CRASH_CLOSING_SPEED: f32 = 12.0;
+/// Speed above which a heavy side-by-side overlap takes both riders down, in
+/// m/s.
+pub const SIDE_CRASH_SPEED: f32 = 28.0;
+/// Lateral gap under which side-by-side contact counts as heavy, in meters.
+pub const SIDE_CRASH_GAP: f32 = 0.6;
+/// Green-light countdown length: 3 seconds at 60 Hz.
+pub const COUNTDOWN_TICKS: u32 = 180;
+/// Slow vehicles sharing the road.
+pub const TRAFFIC_COUNT: usize = 6;
+/// Traffic collision half-length along the road, in meters.
+pub const CAR_HALF_LENGTH: f32 = 2.2;
+/// Traffic collision half-width across the road, in meters.
+pub const CAR_HALF_WIDTH: f32 = 1.0;
+
+/// A slow vehicle sharing the road: an obstacle, not a racer. Cruises its
+/// lane at a fixed speed, wrapping the track.
+#[derive(Clone, Copy, Debug)]
+pub struct TrafficCar {
+    /// Position and heading, shaped like a bike so the renderer projects it
+    /// the same way.
+    pub state: BikeState,
+    /// Cruise speed, in meters per second.
+    pub cruise: f32,
+}
+
+/// A static on-road hazard: a traffic cone. Hitting one hurts the speed,
+/// not the rider.
+#[derive(Clone, Copy, Debug)]
+pub struct Hazard {
+    /// Position along the road, in meters.
+    pub pos_x: f32,
+    /// Lateral offset across the road, in meters.
+    pub lateral: f32,
+}
 
 /// Lap index for a total distance covered: whole laps completed.
 ///
@@ -91,6 +127,12 @@ pub struct Race {
     total_laps: u32,
     /// True once the player has finished every lap.
     finished: bool,
+    /// Ticks left before the lights go green.
+    countdown_ticks: u32,
+    /// Slow traffic cruising the track.
+    traffic: Vec<TrafficCar>,
+    /// Static cone hazards on the road.
+    hazards: Vec<Hazard>,
 }
 
 /// Aux state per rider, mirroring the pool's slot order.
@@ -99,6 +141,10 @@ struct RiderAux {
     snapshot: BikeSnapshot,
     /// Rival preferred lane offset; unused for the player.
     target_lane: f32,
+    /// Straight-line top speed for this rider, in m/s: rivals vary.
+    top_speed: f32,
+    /// How eagerly this rival hunts the inside line; 1.0 is nominal.
+    aggression: f32,
 }
 
 impl Default for RiderAux {
@@ -106,6 +152,8 @@ impl Default for RiderAux {
         Self {
             snapshot: BikeSnapshot::at_rest(),
             target_lane: 0.0,
+            top_speed: MAX_SPEED,
+            aggression: 1.0,
         }
     }
 }
@@ -139,6 +187,48 @@ impl Race {
             let slot = rival + 1;
             handles[slot] = Some(pool.spawn(state).expect("fresh pool has room"));
             aux[slot].target_lane = lane;
+            // Rider variety: each rival gets a top speed and an aggression,
+            // so the pack spreads out instead of riding as one block.
+            aux[slot].top_speed = MAX_SPEED * rng.next_f32_in(0.78, 0.97);
+            aux[slot].aggression = rng.next_f32_in(0.6, 1.4);
+        }
+
+        // Traffic: spread around the lap, alternating lanes, cruising slow.
+        let mut traffic = Vec::with_capacity(TRAFFIC_COUNT);
+        for car in 0..TRAFFIC_COUNT {
+            let along = (car + 1) as f32 * config.track_length / (TRAFFIC_COUNT + 1) as f32;
+            let lane_sign = if car % 2 == 0 { 1.0 } else { -1.0 };
+            traffic.push(TrafficCar {
+                state: BikeState {
+                    pos_x: along,
+                    pos_y: lane_sign * (1.5 + rng.next_f32_in(0.0, 1.5)),
+                    speed: 0.0,
+                    heading: 0.0,
+                },
+                cruise: rng.next_f32_in(8.0, 15.0),
+            });
+        }
+
+        // Cone hazards: deterministic per seed, inside the road edges.
+        let half_width = config.geometry.road_width() * 0.5;
+        let mut hazards = Vec::new();
+        let mut hazard_slots = 0u64;
+        let mut along = HAZARD_SPACING;
+        while along < config.track_length - HAZARD_SPACING {
+            let mut roll = XorShift64::new(hazard_slots.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            if roll.next_f32_in(0.0, 1.0) < 0.4 {
+                let side = if roll.next_f32_in(0.0, 1.0) < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                hazards.push(Hazard {
+                    pos_x: along,
+                    lateral: side * roll.next_f32_in(0.8, half_width - 1.2),
+                });
+            }
+            hazard_slots += 1;
+            along += HAZARD_SPACING;
         }
 
         Self {
@@ -152,6 +242,9 @@ impl Race {
             track_length: config.track_length,
             total_laps: config.total_laps,
             finished: false,
+            countdown_ticks: COUNTDOWN_TICKS,
+            traffic,
+            hazards,
         }
     }
 
@@ -183,8 +276,15 @@ impl Race {
             intent.absorb(input);
         }
 
+        // Lights are red: everyone holds still while the clock runs down.
+        if self.countdown_ticks > 0 {
+            self.countdown_ticks -= 1;
+            return;
+        }
+
         let dt = TICK_DURATION_SECS as f32;
         let half_width = self.geometry.road_width() * 0.5;
+        let player_x = self.state(0).pos_x;
 
         // Player (slot 0) follows the drained intent; rivals follow the AI.
         for slot in 0..self.bike_count {
@@ -192,6 +292,18 @@ impl Race {
             let mut snapshot = self.aux[slot].snapshot;
             snapshot.speed = state.speed;
             snapshot.lateral = state.pos_y;
+
+            // Catch-up: rivals far behind get a mild boost, leaders ease off,
+            // so the pack stays in the race without teleporting.
+            let catch_up = if slot == 0 {
+                1.0
+            } else if state.pos_x < player_x - 30.0 {
+                1.10
+            } else if state.pos_x > player_x + 80.0 {
+                0.92
+            } else {
+                1.0
+            };
 
             let intent = if slot == 0 {
                 intent
@@ -201,12 +313,18 @@ impl Race {
                     snapshot.lateral,
                     state.pos_x,
                     self.aux[slot].target_lane,
+                    self.aux[slot].top_speed * catch_up,
                     &self.geometry,
                 )
             };
 
+            let curvature = self.geometry.curvature_at(state.pos_x);
             let off_road = snapshot.is_off_road(half_width);
-            let mut snapshot = bike::step_bike(snapshot, intent, off_road, dt);
+            let mut snapshot = bike::step_bike(snapshot, intent, off_road, curvature, dt);
+            if slot != 0 {
+                // Rivals never exceed their (possibly catch-up-adjusted) cap.
+                snapshot.speed = snapshot.speed.min(self.aux[slot].top_speed * catch_up);
+            }
             if bike::should_crash(&snapshot, half_width) {
                 bike::crash(&mut snapshot);
             }
@@ -226,9 +344,41 @@ impl Race {
         }
 
         self.resolve_collisions();
+        self.resolve_hazards();
+        self.advance_traffic(dt);
 
         if self.lap_index() >= self.total_laps {
             self.finished = true;
+        }
+    }
+
+    /// Move traffic one tick and wrap cars past the lap line.
+    fn advance_traffic(&mut self, dt: f32) {
+        for car in &mut self.traffic {
+            car.state.pos_x += car.cruise * dt;
+            if car.state.pos_x >= self.track_length {
+                car.state.pos_x -= self.track_length;
+            }
+            car.state.speed = car.cruise;
+        }
+    }
+
+    /// Cones knock speed down, not riders. One overlapping tick shaves a
+    /// little; plowing through a cone line costs real time.
+    fn resolve_hazards(&mut self) {
+        for slot in 0..self.bike_count {
+            if self.aux[slot].snapshot.control == Control::Crashed {
+                continue;
+            }
+            let state = self.state(slot);
+            for hazard_index in 0..self.hazards.len() {
+                let hazard = self.hazards[hazard_index];
+                if (state.pos_x - hazard.pos_x).abs() < 1.5
+                    && (state.pos_y - hazard.lateral).abs() < 0.9
+                {
+                    self.scrub_speed(slot, HAZARD_SCRUB);
+                }
+            }
         }
     }
 
@@ -243,8 +393,9 @@ impl Race {
         ticks
     }
 
-    /// Push overlapping bikes apart laterally and scrub their speed, using
-    /// the pure [`bikes_overlap`] and [`overlap_push`] helpers.
+    /// Push overlapping bikes apart laterally and scrub their speed; hard
+    /// contact puts riders down, using the pure [`bikes_overlap`] and
+    /// [`overlap_push`] helpers.
     fn resolve_collisions(&mut self) {
         for i in 0..self.bike_count {
             for j in (i + 1)..self.bike_count {
@@ -253,15 +404,70 @@ impl Race {
                     continue;
                 }
 
-                let (push_a, push_b) = overlap_push(b.pos_y - a.pos_y);
-                self.write_lateral(i, self.aux[i].snapshot.lateral + push_a);
-                self.write_lateral(j, self.aux[j].snapshot.lateral + push_b);
+                let dy = (b.pos_y - a.pos_y).abs();
+                // The rider behind is the rammer when speeds differ.
+                let (rear, _front) = if a.pos_x <= b.pos_x { (i, j) } else { (j, i) };
+                let closing =
+                    self.state(rear).speed - self.state(if rear == i { j } else { i }).speed;
 
-                // Speed penalty: both riders back off while overlapping.
-                self.scrub_speed(i, COLLISION_SCRUB);
-                self.scrub_speed(j, COLLISION_SCRUB);
+                if closing > CRASH_CLOSING_SPEED {
+                    // Rammed from behind at speed: the rammer goes down.
+                    self.crash_slot(rear);
+                    // The rammed rider barely notices.
+                    self.scrub_speed(if rear == i { j } else { i }, 0.97);
+                } else if dy < SIDE_CRASH_GAP
+                    && self.state(i).speed.min(self.state(j).speed) > SIDE_CRASH_SPEED
+                {
+                    // Heavy side-by-side lean at speed takes both down.
+                    self.crash_slot(i);
+                    self.crash_slot(j);
+                } else {
+                    let (push_a, push_b) = overlap_push(b.pos_y - a.pos_y);
+                    self.write_lateral(i, self.aux[i].snapshot.lateral + push_a);
+                    self.write_lateral(j, self.aux[j].snapshot.lateral + push_b);
+                    // Speed penalty: both riders back off while overlapping.
+                    self.scrub_speed(i, COLLISION_SCRUB);
+                    self.scrub_speed(j, COLLISION_SCRUB);
+                }
+            }
+
+            // Bikes versus traffic: cars are heavy and always win.
+            for car_index in 0..self.traffic.len() {
+                let car = self.traffic[car_index].state;
+                let bike_state = self.state(i);
+                if !hits_traffic(&bike_state, &car) {
+                    continue;
+                }
+                let closing = bike_state.speed - car.speed;
+                if closing > CRASH_CLOSING_SPEED {
+                    self.crash_slot(i);
+                } else {
+                    // Bounce off the back/side of the car, hard.
+                    let push = if bike_state.pos_y >= car.pos_y {
+                        0.6
+                    } else {
+                        -0.6
+                    };
+                    self.write_lateral(i, self.aux[i].snapshot.lateral + push);
+                    self.scrub_speed(i, 0.88);
+                }
             }
         }
+    }
+
+    /// Put one bike (spawn-order slot) into a crash.
+    fn crash_slot(&mut self, slot: usize) {
+        if self.aux[slot].snapshot.control == Control::Crashed {
+            return;
+        }
+        bike::crash(&mut self.aux[slot].snapshot);
+    }
+
+    /// Test seam: removes all traffic so handling tests steer without
+    /// running into cars.
+    #[cfg(test)]
+    pub(crate) fn clear_traffic(&mut self) {
+        self.traffic.clear();
     }
 
     fn write_lateral(&mut self, slot: usize, lateral: f32) {
@@ -325,6 +531,15 @@ impl Race {
         self.state(0).pos_y
     }
 
+    /// Seconds left on the player's crash timer, or 0 when upright.
+    pub fn player_crash_timer(&self) -> f32 {
+        if self.aux[0].snapshot.control == Control::Crashed {
+            self.aux[0].snapshot.crash_timer
+        } else {
+            0.0
+        }
+    }
+
     /// Live bike count, player included.
     pub fn bike_count(&self) -> usize {
         self.bike_count
@@ -340,7 +555,47 @@ impl Race {
     pub fn tick_index(&self) -> u64 {
         self.clock.tick_index()
     }
+
+    /// Seconds left on the green-light countdown, rounded up.
+    pub fn countdown_secs(&self) -> u32 {
+        self.countdown_ticks.div_ceil(60)
+    }
+
+    /// Whether the lights are still red.
+    pub fn is_counting_down(&self) -> bool {
+        self.countdown_ticks > 0
+    }
+
+    /// The player's race position: 1 plus the number of rivals ahead.
+    pub fn race_position(&self) -> usize {
+        let player_x = self.state(0).pos_x;
+        1 + (1..self.bike_count)
+            .filter(|&slot| self.state(slot).pos_x > player_x)
+            .count()
+    }
+
+    /// Traffic on the road, for rendering.
+    pub fn traffic_cars(&self) -> &[TrafficCar] {
+        &self.traffic
+    }
+
+    /// Static cone hazards on the road, for rendering.
+    pub fn hazards(&self) -> &[Hazard] {
+        &self.hazards
+    }
 }
+
+/// Whether a bike has run into a car: bikes are shorter and narrower than
+/// cars, so the combined envelope is wider than bike-vs-bike. Pure.
+pub fn hits_traffic(bike: &BikeState, car: &BikeState) -> bool {
+    (car.pos_x - bike.pos_x).abs() < BIKE_HALF_LENGTH + CAR_HALF_LENGTH
+        && (car.pos_y - bike.pos_y).abs() < BIKE_HALF_WIDTH + CAR_HALF_WIDTH
+}
+
+/// Distance between cone hazards along the road, in meters.
+pub const HAZARD_SPACING: f32 = 47.0;
+/// Fraction of speed lost per overlapping cone tick.
+pub const HAZARD_SCRUB: f32 = 0.93;
 
 #[cfg(test)]
 mod tests {
@@ -360,12 +615,70 @@ mod tests {
     }
 
     fn run(race: &mut Race, ticks: usize, per_tick: &[GameInput]) {
+        while race.is_counting_down() {
+            race.tick();
+        }
         for _ in 0..ticks {
             for input in per_tick {
                 race.push_input(*input);
             }
             race.tick();
         }
+    }
+
+    #[test]
+    fn countdown_holds_everyone_then_releases() {
+        let mut race = flat_race(2, 7);
+        assert!(race.is_counting_down());
+        assert_eq!(race.countdown_secs(), 3);
+        // Throttle held during the countdown does nothing.
+        race.push_input(GameInput::Accelerate);
+        race.tick();
+        assert_eq!(race.player_speed(), 0.0, "red lights hold the grid");
+        assert!(race.is_counting_down());
+        while race.is_counting_down() {
+            race.tick();
+        }
+        race.push_input(GameInput::Accelerate);
+        race.tick();
+        assert!(race.player_speed() > 0.0, "released");
+    }
+
+    #[test]
+    fn ramming_the_bike_ahead_at_speed_crashes_the_rammer() {
+        let mut race = flat_race(1, 42);
+        run(&mut race, 70, &[GameInput::Accelerate]);
+        // Stage the rival just ahead, stopped, in the player's line.
+        race.place_bike(1, race.player_distance() + 2.0, 0.0);
+        let player_speed = race.player_speed();
+        assert!(player_speed > 20.0);
+
+        race.tick();
+
+        assert_eq!(race.player_control(), Control::Crashed, "rammer down");
+    }
+
+    #[test]
+    fn running_into_traffic_at_speed_is_a_crash() {
+        let mut race = flat_race(0, 42);
+        run(&mut race, 1, &[]);
+        // Stage the player 30 m behind a car, in its lane, from a stop: full
+        // throttle reaches 40+ m/s before catching the car, way over the
+        // 12 m/s closing-speed crash threshold.
+        let car = race.traffic_cars()[0].state;
+        race.place_bike(0, car.pos_x - 30.0, car.pos_y);
+        run(&mut race, 200, &[GameInput::Accelerate]);
+        assert_eq!(race.player_control(), Control::Crashed, "traffic bites");
+    }
+
+    #[test]
+    fn race_position_counts_riders_ahead() {
+        let mut race = flat_race(2, 7);
+        assert_eq!(race.race_position(), 3, "rivals start ahead on the grid");
+        // Push the player just past both rivals.
+        let lead = race.bike_states().map(|s| s.pos_x).fold(0.0_f32, f32::max);
+        race.place_bike(0, lead + 5.0, 0.0);
+        assert_eq!(race.race_position(), 1);
     }
 
     #[test]
@@ -383,6 +696,13 @@ mod tests {
     #[test]
     fn input_ring_drains_exactly_once_per_tick() {
         let mut race = flat_race(0, 7);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Roll first: steering needs speed.
+        run(&mut race, 30, &[GameInput::Accelerate]);
+        let speed = race.player_speed();
+        assert!(speed >= bike::MIN_STEER_SPEED, "full steering authority");
         // Three steering pulses in one tick count once.
         for _ in 0..3 {
             race.push_input(GameInput::SteerRight);
@@ -400,11 +720,17 @@ mod tests {
     #[test]
     fn off_road_at_low_speed_slows_without_crashing() {
         let mut race = flat_race(0, 7);
-        run(&mut race, 30, &[GameInput::Accelerate]); // ~9 m/s: under the crash threshold
-                                                      // Coast while steering right until off the road. 6 m of road edge at
-                                                      // 3.5 m/s lateral takes ~103 ticks; 150 is safe margin.
+        race.clear_traffic();
+        // Throttle + steer right together: ~9 m/s forward (under the 30 m/s
+        // crash threshold) while full steering authority walks the bike off
+        // the road. 6 m of road edge at up to 5 m/s lateral takes ~80 ticks;
+        // 150 is safe margin.
         for _ in 0..150 {
-            run(&mut race, 1, &[GameInput::SteerRight]);
+            run(
+                &mut race,
+                1,
+                &[GameInput::Accelerate, GameInput::SteerRight],
+            );
         }
         let half_width = 6.0;
         assert!(race.player_lateral() > half_width, "driven off the road");
@@ -422,11 +748,11 @@ mod tests {
     #[test]
     fn off_road_at_high_speed_crashes_then_recovers() {
         let mut race = flat_race(0, 7);
+        race.clear_traffic();
         // 180 ticks of throttle exceeds the 30 m/s crash threshold.
         run(&mut race, 180, &[GameInput::Accelerate]);
-        assert!(race.player_speed() > bike::OFFROAD_CRASH_SPEED);
-        run(&mut race, 1, &[GameInput::SteerRight]);
         // Hold right until off-road.
+        race.clear_traffic();
         let mut steering = 0;
         while race.player_lateral() <= 6.0 {
             run(&mut race, 1, &[GameInput::SteerRight]);

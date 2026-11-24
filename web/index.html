@@ -48,6 +48,47 @@
       pointer-events: none;
       white-space: pre-line;
     }
+    /* Author display rules must not defeat the hidden attribute's UA
+       display:none — scope them to :not([hidden]) so overlays actually
+       disappear when hidden is set. */
+    #countdown:not([hidden]) {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      font: 700 84px ui-monospace, monospace;
+      color: #ffd75e;
+      text-shadow: 0 2px 12px #000;
+      pointer-events: none;
+    }
+    #finish:not([hidden]) {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      background: rgba(8, 8, 12, 0.72);
+      border-radius: 6px;
+    }
+    #finish h1 {
+      margin: 0 0 0.5rem;
+      font-size: 1.6rem;
+      color: #ffd75e;
+    }
+    #finish p {
+      margin: 0 0 1rem;
+      color: #c9cdd4;
+    }
+    #restart {
+      font: 600 1rem system-ui, sans-serif;
+      padding: 0.5rem 1.4rem;
+      border-radius: 6px;
+      border: 1px solid #4a4a56;
+      background: #26262e;
+      color: #f0f0f4;
+      cursor: pointer;
+    }
+    #restart:hover { background: #33333e; }
     #keys {
       margin-top: 0.75rem;
       font-size: 0.85rem;
@@ -63,6 +104,14 @@
       <div id="keys">Arrows / WASD to ride — Down / S to brake</div>
     </div></div>
     <div id="hud" hidden></div>
+    <div id="countdown" hidden></div>
+    <div id="finish" hidden>
+      <div>
+        <h1>Finish!</h1>
+        <p id="finish-text"></p>
+        <button id="restart" type="button">Race again</button>
+      </div>
+    </div>
   </div>
   <script type="module" src="loader.js"></script>
 </body>

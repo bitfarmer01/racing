@@ -9,6 +9,10 @@
 const overlay = document.getElementById('overlay');
 const status = document.getElementById('status');
 const hud = document.getElementById('hud');
+const countdownEl = document.getElementById('countdown');
+const finishEl = document.getElementById('finish');
+const finishText = document.getElementById('finish-text');
+const restartButton = document.getElementById('restart');
 const canvas = document.getElementById('game');
 
 function setStatus(text) {
@@ -103,11 +107,37 @@ async function boot() {
     if (key) { keys[key] = false; e.preventDefault(); }
   });
 
+  restartButton.addEventListener('click', () => {
+    game.restart();
+    finishEl.hidden = true;
+  });
+
+  const ORDINALS = ['1st', '2nd', '3rd', '4th', '5th', '6th'];
   const frame = () => {
     game.advance_frame(keys.accelerate, keys.brake, keys.steerLeft, keys.steerRight);
+
+    // HUD: position, speed, lap, distance.
+    const pos = game.race_position();
     hud.textContent =
-      `lap ${game.lap_index()}\n` +
-      `${Math.floor(game.player_distance())} m`;
+      `${ORDINALS[pos - 1] ?? pos + 'th'} of ${game.bike_count()}\n` +
+      `${game.speed_kmh()} km/h\n` +
+      `lap ${game.lap_index() + 1} — ${Math.floor(game.player_distance())} m`;
+
+    // Green-light countdown.
+    if (game.is_counting_down()) {
+      countdownEl.hidden = false;
+      countdownEl.textContent = String(game.countdown_secs());
+    } else {
+      countdownEl.hidden = true;
+    }
+
+    // Finish: show the result, race keeps rendering behind it.
+    if (game.is_finished()) {
+      finishText.textContent =
+        `You finished ${ORDINALS[pos - 1] ?? pos + 'th'} of ${game.bike_count()}.`;
+      finishEl.hidden = false;
+    }
+
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
