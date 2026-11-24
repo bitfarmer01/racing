@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gradient;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;

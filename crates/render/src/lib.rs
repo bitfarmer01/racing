@@ -13,6 +13,7 @@ pub mod batch;
 pub mod camera;
 pub mod gpu;
 pub mod instance;
+pub mod sampling;
 pub mod tier;
 
 pub use atlas::{uv_rect, uv_rect_inset, AtlasDims};

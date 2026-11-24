@@ -81,10 +81,15 @@ fn vs_main(
 @fragment
 fn fs_main(out: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(atlas_texture, atlas_sampler, out.uv) * out.tint;
-    if (color.a < 0.01) {
+    // HD look: a smooth alpha ramp shapes the edge coverage so sprite
+    // silhouettes blend softly at any scale — the pixel-art hard cut is
+    // retired. The ramp's upper edge mirrors `sampling::ALPHA_RAMP_HI`
+    // (const strings cannot share the value).
+    let coverage = smoothstep(0.0, 0.06, color.a);
+    if (coverage <= 0.0) {
         discard;
     }
-    return color;
+    return vec4<f32>(color.rgb, color.a * coverage);
 }
 "#;
 
@@ -301,12 +306,14 @@ impl GpuRenderer {
             .map_err(|_| RenderError::NoDevice)?;
 
         let (_, view) = upload_atlas(&device, &queue, atlas);
+        // HD direction: linear filtering — the atlas is high-resolution
+        // shaded art now, and nearest sampling would re-pixelate it under
+        // scale (reverses the pixel-art choice; policy in `sampling`).
+        let filter = crate::sampling::atlas_filter_mode();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("render.atlas.sampler"),
-            // Pixel art scaled up: nearest keeps texel edges crisp — linear
-            // smoothing washes the atlas into pale halos.
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: filter,
+            min_filter: filter,
             ..wgpu::SamplerDescriptor::default()
         });
 

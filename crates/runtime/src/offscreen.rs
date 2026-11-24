@@ -190,8 +190,8 @@ pub fn render_proof(scene: &ProofScene<'_>, out_path: &Path) -> Result<RenderedP
     let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("runtime.proof.sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
+        mag_filter: render::sampling::atlas_filter_mode(),
+        min_filter: render::sampling::atlas_filter_mode(),
         ..wgpu::SamplerDescriptor::default()
     });
 
