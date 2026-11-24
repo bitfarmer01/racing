@@ -1377,4 +1377,180 @@ mod tests {
             "road band contrast {road} is harsh; soften toward 0.08"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Wave 7c — world construction: distance-anchored horizon, zones,
+    // landmarks. Red-first per the spec's verification list.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_backdrop_changes_with_camera_distance_on_a_straight() {
+        // Same screen column, two camera distances on the opening straight:
+        // the world-anchored ridge must differ — the frozen-horizon
+        // regression. A screen-anchored sine is frozen here.
+        let layer = &BACKDROP_LAYERS[1];
+        assert_ne!(
+            backdrop_profile(0.0, 400.0, layer),
+            backdrop_profile(120.0, 400.0, layer),
+            "on a straight the horizon must change with camera distance"
+        );
+        // Not just one column: the whole ridge line scrolls as the bike
+        // travels, so most columns read a different height.
+        let changed = (0..VIEWPORT_WIDTH as u32)
+            .step_by(50)
+            .filter(|px| {
+                backdrop_profile(0.0, *px as f32, layer)
+                    != backdrop_profile(200.0, *px as f32, layer)
+            })
+            .count();
+        assert!(changed > 8, "the whole ridge must scroll: {changed} columns changed");
+    }
+
+    #[test]
+    fn zone_tints_reach_the_composed_frame() {
+        let mapping = mapping();
+        // The zone table gives different zones different tints to deliver.
+        assert_ne!(
+            ZoneLayout::for_track().sample(200.0).sky_tint,
+            ZoneLayout::for_track().sample(800.0).sky_tint,
+        );
+        // The composed sky carries the zone tint: a frame composed at the
+        // start line (coast) differs from one composed in the town. The
+        // ride out is deterministic — same inputs, same sim.
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let early = GameFrame::build(&race, &geometry, &mapping);
+        let mut in_town = false;
+        for _ in 0..4000 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            if race.player_distance() > 700.0 {
+                in_town = true;
+                break;
+            }
+        }
+        assert!(in_town, "the race reaches the town zone");
+        let late = GameFrame::build(&race, &geometry, &mapping);
+        let early_sky = road_quads(&early.road)
+            .filter(|q| is_full_width_band(q) && q[2].position[1] == 0.0)
+            .map(|q| q[2].color)
+            .next()
+            .expect("the sky composes as one quad");
+        let late_sky = road_quads(&late.road)
+            .filter(|q| is_full_width_band(q) && q[2].position[1] == 0.0)
+            .map(|q| q[2].color)
+            .next()
+            .expect("the sky composes as one quad");
+        assert_ne!(
+            early_sky, late_sky,
+            "the zone's sky tint must reach the composed frame"
+        );
+    }
+
+    #[test]
+    fn grass_shade_follows_the_zone_tint() {
+        // The per-strip grass shade must carry the zone's tint: the same
+        // alternating base bands read differently in coast and forest.
+        let coast = ZoneLayout::for_track().sample(200.0).grass_tint;
+        let forest = ZoneLayout::for_track().sample(1300.0).grass_tint;
+        assert_ne!(
+            grass_shade_for(GRASS_LIGHT, coast),
+            grass_shade_for(GRASS_LIGHT, forest),
+            "the zone tint must actually reach the grass shade"
+        );
+    }
+
+    #[test]
+    fn landmarks_and_markers_ride_the_sprite_pipeline() {
+        let geometry = track_geometry();
+        let mapping = mapping();
+
+        // Landmarks: at the start line the water tower (380 m) is already on
+        // the draw list — visible well before you reach it — while nothing
+        // beyond the visibility range is.
+        let mut draws = Vec::new();
+        push_landmarks(&geometry, &mapping, &mut draws, 0.0);
+        assert!(
+            draws
+                .iter()
+                .any(|d| d.uv == mapping.water_tower_uv && d.world_width > 8.0),
+            "the water tower is pushed as a large billboard sprite"
+        );
+        let mut from_tower = Vec::new();
+        push_landmarks(&geometry, &mapping, &mut from_tower, 380.0);
+        // From the tower's own distance the windmill (940 m) is listed; the
+        // tower itself is behind the camera and gone.
+        assert!(from_tower.iter().any(|d| d.uv == mapping.windmill_uv));
+        assert!(!from_tower.iter().any(|d| d.uv == mapping.water_tower_uv));
+
+        // Distance markers: every 500 m, both sides — pure function of the
+        // camera's distance window.
+        let mut marks = Vec::new();
+        push_distance_markers(&mapping, &mut marks, 100.0, 900.0);
+        let mark_distances: Vec<f32> = marks.iter().map(|d| d.distance).collect();
+        for expected in [500.0_f32] {
+            assert!(
+                mark_distances.iter().any(|d| (*d - expected).abs() < 1.0),
+                "a marker post sits at {expected} m: {mark_distances:?}"
+            );
+        }
+        // Same window, same markers — no per-frame state.
+        let mut marks_again = Vec::new();
+        push_distance_markers(&mapping, &mut marks_again, 100.0, 900.0);
+        assert_eq!(
+            marks.iter().map(|d| d.distance).collect::<Vec<f32>>(),
+            marks_again.iter().map(|d| d.distance).collect::<Vec<f32>>(),
+        );
+    }
+
+    #[test]
+    fn scenery_mix_follows_the_zone_of_its_distance() {
+        let geometry = track_geometry();
+        let mapping = mapping();
+        // The coast grows palms; the town grows buildings. Same slot grid,
+        // different mixes — mile 800 must not look like mile 200.
+        let mut coast = Vec::new();
+        push_scenery(&geometry, &mapping, &mut coast, 200.0);
+        let mut town = Vec::new();
+        push_scenery(&geometry, &mapping, &mut town, 800.0);
+        assert!(coast.iter().any(|d| d.uv == mapping.palm_uv), "palms on the coast");
+        assert!(
+            town.iter().any(|d| d.uv == mapping.building_uv),
+            "buildings in the town"
+        );
+        assert!(
+            !town.iter().any(|d| d.uv == mapping.palm_uv),
+            "no palms in the town — the mix actually switched"
+        );
+        // Same window twice, same dressing — the determinism pattern.
+        let mut town_again = Vec::new();
+        push_scenery(&geometry, &mapping, &mut town_again, 800.0);
+        assert_eq!(town.len(), town_again.len(), "dressing is a pure function of distance");
+    }
+
+    #[test]
+    fn two_composes_of_one_state_build_identical_frames() {
+        // The world construction adds zone sampling to compose(); it must
+        // stay stateless: composing the same race twice gives the same
+        // batch, instance for instance.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let mut a = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut b = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut road_a = RoadMesh::default();
+        let mut road_b = RoadMesh::default();
+        compose(&race, &geometry, &mapping, &mut a, &mut road_a);
+        compose(&race, &geometry, &mapping, &mut b, &mut road_b);
+        assert_eq!(a.instances(), b.instances());
+        assert_eq!(road_a.vertices, road_b.vertices);
+    }
 }

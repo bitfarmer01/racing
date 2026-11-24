@@ -1049,6 +1049,23 @@ mod tests {
     }
 
     #[test]
+    fn world_construction_frames_exist_in_the_hd_set() {
+        let frames = placeholder_frames();
+        let names: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
+        // Zone dressing: palm (coast), building and fence (town), rock
+        // (ridge), power pole (dense zones), 500 m marker post.
+        for name in [
+            "palm", "building", "fence", "pole", "marker", "rock",
+        ] {
+            assert!(names.contains(&name), "{name} missing — zones need their own dressing");
+        }
+        // Landmarks: the large "you are here" anchors.
+        for name in ["water_tower", "windmill", "billboard"] {
+            assert!(names.contains(&name), "{name} missing — landmarks ride the atlas");
+        }
+    }
+
+    #[test]
     fn atlas_regeneration_is_deterministic() {
         let first = pack_placeholder_atlas().expect("placeholder atlas packs");
         let second = pack_placeholder_atlas().expect("placeholder atlas packs");

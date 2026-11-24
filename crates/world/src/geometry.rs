@@ -244,4 +244,106 @@ mod tests {
         assert_eq!(g.curvature_at(250.0), 0.01);
         assert!((g.elevation_at(400.0) - 8.0).abs() < 1e-6);
     }
+
+    // -----------------------------------------------------------------------
+    // Wave 7c — world construction: zones, landmarks, dressing mixes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zone_boundaries_switch_dressing_and_tint_at_the_specd_distances() {
+        let zones = ZoneLayout::for_track();
+        // Well inside each zone the sample is exactly that zone's own data.
+        assert_eq!(zones.sample(200.0).name, "coast");
+        assert_eq!(zones.sample(800.0).name, "town");
+        assert_eq!(zones.sample(1300.0).name, "forest");
+        assert_eq!(zones.sample(1800.0).name, "ridge");
+        // Each zone reads as its own place: dressing and tint differ.
+        assert_ne!(zones.sample(200.0).dressing, zones.sample(800.0).dressing);
+        assert_ne!(
+            zones.sample(200.0).grass_tint,
+            zones.sample(800.0).grass_tint
+        );
+        assert_ne!(
+            zones.sample(1300.0).dressing,
+            zones.sample(1800.0).dressing
+        );
+        // And each boundary flips the mix across the spec'd distance.
+        assert_ne!(zones.sample(500.0).dressing, zones.sample(560.0).dressing);
+        assert_ne!(
+            zones.sample(1060.0).dressing,
+            zones.sample(1120.0).dressing
+        );
+        assert_ne!(
+            zones.sample(1580.0).dressing,
+            zones.sample(1640.0).dressing
+        );
+    }
+
+    #[test]
+    fn zones_wrap_per_lap_and_sample_deterministically() {
+        let zones = ZoneLayout::for_track();
+        // Same distance, same sample — pure function, no per-frame state.
+        assert_eq!(zones.sample(200.0), zones.sample(200.0));
+        // One lap later the same place returns: 3 laps pass the same zones.
+        assert_eq!(zones.sample(200.0), zones.sample(2_200.0));
+        assert_eq!(zones.sample(200.0), zones.sample(4_200.0));
+        // The camera trails up to ~5 m behind the line; negative distance
+        // wraps to the lap's last zone instead of panicking.
+        assert_eq!(zones.sample(-4.0).name, "ridge");
+    }
+
+    #[test]
+    fn zone_transitions_blend_instead_of_popping() {
+        let zones = ZoneLayout::for_track();
+        // Walking across the coast→town boundary, the grass tint moves in
+        // small steps — a hard switch would read as a pop.
+        let mut prev = zones.sample(460.0).grass_tint;
+        for d in [480.0, 500.0, 520.0, 540.0, 560.0, 580.0, 600.0] {
+            let cur = zones.sample(d).grass_tint;
+            let step = prev
+                .iter()
+                .zip(cur.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                step <= 0.08,
+                "grass tint jumps by {step} at {d} m — the boundary pops instead of blending"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn landmark_positions_are_stable_for_a_seed() {
+        let a = course_landmarks();
+        let b = course_landmarks();
+        assert_eq!(a, b, "landmarks are pure data: same course, same places");
+        // Two or three large anchors per lap, at fixed distances inside it.
+        assert!(
+            (2..=3).contains(&a.len()),
+            "the spec asks for two or three landmarks per lap, got {}",
+            a.len()
+        );
+        for lm in a {
+            assert!((0.0..2_000.0).contains(&lm.distance));
+        }
+    }
+
+    #[test]
+    fn pick_dressing_walks_the_mix_in_order() {
+        let mix = DressingMix {
+            palm: 0.5,
+            tree: 0.25,
+            building: 0.0,
+            rock: 0.0,
+            bush: 0.125,
+            sign: 0.125,
+            skip: 0.0,
+        };
+        assert_eq!(pick_dressing(mix, 0.10), DressingKind::Palm);
+        assert_eq!(pick_dressing(mix, 0.60), DressingKind::Tree);
+        assert_eq!(pick_dressing(mix, 0.80), DressingKind::Bush);
+        assert_eq!(pick_dressing(mix, 0.95), DressingKind::Sign);
+        assert_eq!(pick_dressing(mix, 0.999), DressingKind::Skip);
+    }
 }
