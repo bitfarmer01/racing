@@ -52,14 +52,26 @@ const RUMBLE_SEGMENT: f32 = 2.0;
 /// Lane-line white.
 const LANE_LINE: [f32; 4] = [0.90, 0.90, 0.88, 1.0];
 /// Width of a lane line, in meters — wide enough to read at speed (B7).
-const LANE_LINE_WIDTH: f32 = 0.4;
+const LANE_LINE_WIDTH: f32 = 0.25;
 /// Painted length of one lane dash, in meters — an 8 m cycle with a 3 m
 /// dash gives a clear broken line (B7).
-const LANE_DASH_LENGTH: f32 = 3.0;
+const LANE_DASH_LENGTH: f32 = 2.0;
 /// Lateral offsets of the lane lines dividing the road into three lanes.
 const LANE_LINES: [f32; 2] = [-2.0, 2.0];
 /// Sky above the horizon.
 const SKY: [f32; 4] = [0.55, 0.73, 0.92, 1.0];
+
+/// The sky is four stacked bands — deep zenith blue fading down to the haze
+/// — instead of one flat fill; three extra quads, no per-frame cost.
+const SKY_GRADIENT: [[f32; 4]; 3] = [
+    [0.42, 0.62, 0.88, 1.0],
+    [0.48, 0.67, 0.90, 1.0],
+    [0.52, 0.70, 0.91, 1.0],
+];
+
+/// Rival size spread per pack slot: same rider class, slight build
+/// differences so the field doesn't read as clones.
+const RIVAL_SCALES: [f32; 3] = [1.0, 0.92, 1.06];
 /// Height of the haze band painted above the horizon, in pixels, so the sky
 /// and the fading road meet without a hard line (B2).
 const SKY_HAZE_BAND_PX: f32 = 24.0;
@@ -82,6 +94,8 @@ const SCENERY_SPACING: f32 = 22.0;
 /// Scenery sizes in world units: bushes and signs scaled up so they identify
 /// at speed; nothing dropped (D6).
 const TREE_SIZE: (f32, f32) = (4.0, 7.0);
+const BROADLEAF_SIZE: (f32, f32) = (5.5, 6.5);
+const TALL_PINE_SIZE: (f32, f32) = (2.8, 8.5);
 const BUSH_SIZE: (f32, f32) = (3.0, 2.0);
 const SIGN_SIZE: (f32, f32) = (2.4, 3.2);
 /// Traffic-cone hazard size, scaled up to stay identifiable on the road (D6).
@@ -106,6 +120,9 @@ const CAMERA_LEAN_MAX: f32 = 1.5;
 const SPEED_WIDENING: f32 = 0.25;
 /// Camera shake amplitude while crashed, in world units.
 const CRASH_SHAKE: f32 = 0.35;
+/// Camera shake while on the shoulder rumble strip — the warning the
+/// rider feels before running off the road at speed is a crash.
+const RUMBLE_SHAKE: f32 = 0.09;
 
 /// One road-mesh vertex: screen-space position plus a flat color. The type
 /// lives in the `render` crate (the shared GPU path draws it); re-exported
@@ -220,9 +237,14 @@ pub struct AtlasMapping {
     ride: [f32; 4],
     brake: [f32; 4],
     crash: [f32; 4],
+    /// The rivals' liveries, one per pack slot cycling `(slot - 1) % 3`.
     rival: [f32; 4],
+    rival2: [f32; 4],
+    rival3: [f32; 4],
     shadow: [f32; 4],
     tree: [f32; 4],
+    tree2: [f32; 4],
+    tree3: [f32; 4],
     bush: [f32; 4],
     sign: [f32; 4],
     car: [f32; 4],
@@ -248,8 +270,12 @@ impl AtlasMapping {
             brake: uv("bike_brake"),
             crash: uv("bike_crash"),
             rival: uv("bike_rival"),
+            rival2: uv("bike_rival2"),
+            rival3: uv("bike_rival3"),
             shadow: uv("shadow"),
             tree: uv("tree"),
+            tree2: uv("tree2"),
+            tree3: uv("tree3"),
             bush: uv("bush"),
             sign: uv("sign"),
             car: uv("car"),
@@ -272,14 +298,23 @@ impl AtlasMapping {
     }
 
     /// UV rects for the world's dressing: scenery and traffic.
-    pub fn tree_uv(&self) -> [f32; 4] {
-        self.tree
+    pub fn tree_variant_uv(&self, slot: usize) -> [f32; 4] {
+        match slot % 3 {
+            0 => self.tree,
+            1 => self.tree2,
+            _ => self.tree3,
+        }
     }
 
-    /// The rivals' rear-view riding frame — a distinct livery from the
-    /// player's (C3).
-    pub fn rival_uv(&self) -> [f32; 4] {
-        self.rival
+    /// The rivals' rear-view riding frames — distinct liveries indexed by
+    /// pack slot (`slot - 1`), so the pack never shows two identical bikes
+    /// side by side (C3).
+    pub fn rival_uv(&self, slot: usize) -> [f32; 4] {
+        match (slot - 1) % 3 {
+            0 => self.rival,
+            1 => self.rival2,
+            _ => self.rival3,
+        }
     }
 
     /// The soft ground shadow ellipse (D3).
@@ -313,7 +348,10 @@ pub fn track_geometry() -> RoadGeometry {
             world::CurveSegment {
                 start: 200.0,
                 length: 700.0,
-                curvature: -0.004,
+                // Opening bend: winnable flat out under the corner-force
+                // balance — 4.75 m/s of push against 5.0 of steer at top
+                // speed, a fight but a survivable one.
+                curvature: -0.003,
             },
             world::CurveSegment {
                 start: 1200.0,
@@ -434,12 +472,14 @@ pub fn advance_game_frame(
 
 /// One drawable sprite collected before painter's-order sorting: everything
 /// on the road — bikes, cars, cones, scenery — projects the same way.
+/// `roll` is the screen-space bank in radians; only riders ever lean.
 struct DrawItem {
     distance: f32,
     lateral: f32,
     world_width: f32,
     world_height: f32,
     uv: [f32; 4],
+    roll: f32,
 }
 
 /// Blends `a` toward `b` by `t` in [0, 1], per channel. Pure.
@@ -482,7 +522,7 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         wavelength_px: 110.0,
         phase: 4.4,
         shift_per_m: 0.10,
-        haze: 0.72,
+        haze: 0.55,
     },
     BackdropLayer {
         base_px: 9.0,
@@ -490,7 +530,7 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         wavelength_px: 150.0,
         phase: 2.1,
         shift_per_m: 0.20,
-        haze: 0.50,
+        haze: 0.38,
     },
     BackdropLayer {
         base_px: 4.0,
@@ -498,12 +538,13 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         wavelength_px: 210.0,
         phase: 0.8,
         shift_per_m: 0.35,
-        haze: 0.25,
+        haze: 0.15,
     },
 ];
 
-/// Backdrop silhouette column width, in pixels.
-const BACKDROP_COLUMN_PX: f32 = 32.0;
+/// Backdrop silhouette column width, in pixels. Narrow enough that a
+/// 32 px-wide column never reads as a stepped bar on the ridge line.
+const BACKDROP_COLUMN_PX: f32 = 12.0;
 
 /// How much road bend feeds the backdrop shift: the centreline's lateral
 /// drift over this window ahead of the camera. A window bounds the shift on
@@ -520,8 +561,9 @@ fn hill_height(px: f32, layer: &BackdropLayer) -> f32 {
 }
 
 /// Paints the layered hill silhouettes between the sky and the horizon
-/// (B3): one flat-color column quad per 32 px of screen, their tops traced
-/// by [`hill_height`], shifted sideways by the road's bend ahead.
+/// (B3): one flat-color column quad per [`BACKDROP_COLUMN_PX`] pixels of
+/// screen, their tops traced by [`hill_height`], shifted sideways by the
+/// road's bend ahead.
 fn push_backdrop(
     geometry: &RoadGeometry,
     camera: &world::Camera,
@@ -666,11 +708,14 @@ fn compose(
     let player_control = race.player_control();
 
     // Camera feel: lean into the corner (shifted toward the inside of the
-    // bend), widen the view with speed, and shake while the rider slides.
+    // bend — the same inside the riders bank toward), widen the view with
+    // speed, and shake while the rider slides.
     // The shake jitter is deterministic per tick — no clock, no host RNG.
     let mut jitter = sim::rng::XorShift64::new(race.tick_index() | 1);
     let shake = if player_control == Control::Crashed {
         CRASH_SHAKE * (race.player_crash_timer() / game::bike::CRASH_DURATION_SECS)
+    } else if race.player_on_rumble() {
+        RUMBLE_SHAKE
     } else {
         0.0
     };
@@ -696,7 +741,22 @@ fn compose(
     // parallax backdrop, then the banded grass and the road over it.
     let horizon = projector.horizon_y();
     road.vertices.clear();
-    road.push_screen_rect(0.0, 0.0, VIEWPORT_WIDTH, horizon, SKY);
+
+    batch.clear();
+    // Sky above the horizon: a deep-blue-to-haze gradient in four stacked
+    // bands, so the empty flat fill gains depth for the cost of three extra
+    // quads (B1).
+    let sky_bands = [
+        (0.0, SKY_GRADIENT[0]),
+        (horizon * 0.3, SKY_GRADIENT[1]),
+        (horizon * 0.6, SKY_GRADIENT[2]),
+        (horizon * 0.85, SKY),
+    ];
+    for (band, next) in sky_bands.iter().zip(sky_bands.iter().skip(1)) {
+        let (y0, color) = *band;
+        road.push_screen_rect(0.0, y0, VIEWPORT_WIDTH, next.0, color);
+    }
+    road.push_screen_rect(0.0, horizon * 0.85, VIEWPORT_WIDTH, horizon, SKY);
     road.push_screen_rect(
         0.0,
         horizon - SKY_HAZE_BAND_PX,
@@ -784,27 +844,38 @@ fn compose(
             race.bike_control(slot)
         };
         // The player's rear view carries the control-state frames; rivals
-        // ride their own livery, down to the shared crash pose (C3).
+        // ride their own livery per pack slot, down to the shared crash
+        // pose (C3), with a slight per-slot size spread so the pack is a
+        // line of distinct riders, not clones.
+        let rival_scale = if slot == 0 {
+            1.0
+        } else {
+            RIVAL_SCALES[(slot - 1) % RIVAL_SCALES.len()]
+        };
         let uv = if slot == 0 {
             mapping.frame_uv(control)
         } else if control == Control::Crashed {
             mapping.frame_uv(Control::Crashed)
         } else {
-            mapping.rival_uv()
+            mapping.rival_uv(slot)
         };
         draws.push(DrawItem {
             distance: state.pos_x + SHADOW_DEPTH_BIAS,
             lateral: state.pos_y,
-            world_width: BIKE_SHADOW.0,
-            world_height: BIKE_SHADOW.1,
+            world_width: BIKE_SHADOW.0 * rival_scale,
+            world_height: BIKE_SHADOW.1 * rival_scale,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: state.pos_x,
             lateral: state.pos_y,
-            world_width: BIKE_WORLD_WIDTH,
-            world_height: BIKE_WORLD_HEIGHT,
+            world_width: BIKE_WORLD_WIDTH * rival_scale,
+            world_height: BIKE_WORLD_HEIGHT * rival_scale,
             uv,
+            // The rider's bank: the sim carries the lean, the instance
+            // transform rolls the quad about its ground contact.
+            roll: race.bike_lean(slot),
         });
     }
     for car in race.traffic_cars() {
@@ -814,6 +885,7 @@ fn compose(
             world_width: CAR_SHADOW.0,
             world_height: CAR_SHADOW.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: car.state.pos_x,
@@ -821,6 +893,7 @@ fn compose(
             world_width: 2.0,
             world_height: 1.5,
             uv: mapping.car_uv(),
+            roll: 0.0,
         });
     }
     for hazard in race.hazards() {
@@ -830,6 +903,7 @@ fn compose(
             world_width: CONE_SHADOW.0,
             world_height: CONE_SHADOW.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: hazard.pos_x,
@@ -837,6 +911,7 @@ fn compose(
             world_width: CONE_SIZE.0,
             world_height: CONE_SIZE.1,
             uv: mapping.cone_uv(),
+            roll: 0.0,
         });
     }
     push_scenery(geometry, mapping, &mut draws, camera.distance);
@@ -856,6 +931,7 @@ fn compose(
                 lateral: item.lateral,
                 world_width: item.world_width,
                 world_height: item.world_height,
+                roll: item.roll,
             },
             style,
         );
@@ -882,7 +958,13 @@ fn push_scenery(
         let mut roll = sim::rng::XorShift64::new(slot.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let kind = roll.next_f32_in(0.0, 1.0);
         let (uv, (width, height), shadow) = if kind < 0.55 {
-            (mapping.tree_uv(), TREE_SIZE, TREE_SHADOW)
+            // Trees come in three silhouettes (pine, broadleaf, tall pine),
+            // cycled by slot, so the verge is a treeline, not a stamp.
+            match slot % 3 {
+                0 => (mapping.tree_variant_uv(0), TREE_SIZE, TREE_SHADOW),
+                1 => (mapping.tree_variant_uv(1), BROADLEAF_SIZE, TREE_SHADOW),
+                _ => (mapping.tree_variant_uv(2), TALL_PINE_SIZE, (4.0, 1.2)),
+            }
         } else if kind < 0.8 {
             (mapping.bush_uv(), BUSH_SIZE, BUSH_SHADOW)
         } else if kind < 0.92 {
@@ -899,6 +981,7 @@ fn push_scenery(
             world_width: shadow.0,
             world_height: shadow.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance,
@@ -906,6 +989,7 @@ fn push_scenery(
             world_width: width,
             world_height: height,
             uv,
+            roll: 0.0,
         });
         // A quarter of slots also get a small bush on the opposite verge,
         // so neither side of the road ever reads empty (D4).
@@ -917,6 +1001,7 @@ fn push_scenery(
                 world_width: BUSH_SHADOW.0,
                 world_height: BUSH_SHADOW.1,
                 uv: shadow_uv,
+                roll: 0.0,
             });
             draws.push(DrawItem {
                 distance,
@@ -924,7 +1009,124 @@ fn push_scenery(
                 world_width: BUSH_SIZE.0,
                 world_height: BUSH_SIZE.1,
                 uv: mapping.bush_uv(),
+                roll: 0.0,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack_placeholder_atlas;
+
+    /// A mapping over the packed placeholder atlas, shared by these tests.
+    fn mapping() -> AtlasMapping {
+        let packed = pack_placeholder_atlas().expect("placeholder atlas packs");
+        AtlasMapping::from_packed(&packed)
+    }
+
+    /// Releases the grid, rolls the player up to speed, then banks left for
+    /// a few ticks.
+    fn banked_left_race() -> (Race, RoadGeometry) {
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        for _ in 0..3 {
+            race.push_input(GameInput::SteerLeft);
+            race.tick();
+        }
+        (race, geometry)
+    }
+
+    #[test]
+    fn a_banked_rider_renders_a_rolled_sprite() {
+        let mapping = mapping();
+        let (race, geometry) = banked_left_race();
+        assert!(race.player_lean() < -0.1, "the rider is banked left");
+
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+        let rolls: Vec<f32> = frame
+            .batch
+            .instances()
+            .iter()
+            .map(|instance| instance.rotation)
+            .collect();
+        assert!(
+            rolls.iter().any(|r| *r < -0.05),
+            "at least the player's sprite is rolled left: {rolls:?}"
+        );
+        // Shadows, cones, cars, and scenery never roll: every roll in the
+        // batch is a rider's bank, within the state machine's cap.
+        assert!(rolls.iter().all(|r| r.abs() <= game::bike::LEAN_MAX + 1e-3));
+    }
+
+    #[test]
+    fn an_upright_pack_renders_no_rolled_sprites() {
+        let mapping = mapping();
+        let (race, geometry) = demo_race();
+        // Still on the grid: everyone upright.
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+        assert!(frame
+            .batch
+            .instances()
+            .iter()
+            .all(|instance| instance.rotation == 0.0));
+    }
+
+    #[test]
+    fn a_reused_batch_refills_per_frame_instead_of_piling_up() {
+        // Regression: compose() reuses pre-owned batch and road buffers on
+        // the steady-state path. A batch never cleared fills once, then
+        // every later sprite push is rejected — the screen freezes on the
+        // first frames' sprites while the road keeps animating.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        let mut batch = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut road = RoadMesh::default();
+
+        advance_game_frame(
+            &mut race,
+            &geometry,
+            &mapping,
+            &[GameInput::Accelerate],
+            &mut batch,
+            &mut road,
+        );
+        let first_len = batch.len();
+        assert!(first_len > 0, "a frame draws sprites");
+
+        // Ten more frames on the same buffers: the player is accelerating
+        // down the road, so every frame's sprite set is a different one.
+        for _ in 0..10 {
+            advance_game_frame(
+                &mut race,
+                &geometry,
+                &mapping,
+                &[GameInput::Accelerate],
+                &mut batch,
+                &mut road,
+            );
+        }
+        assert_eq!(
+            batch.len(),
+            first_len,
+            "each frame refills the batch; it must never grow"
+        );
+
+        // And the sprites are current, not a pile of stale first frames:
+        // composing the same race into a fresh batch must agree with the
+        // reused one, instance for instance.
+        let mut fresh = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        compose(&race, &geometry, &mapping, &mut fresh, &mut road);
+        let reused_positions: Vec<[f32; 2]> =
+            batch.instances().iter().map(|i| i.position).collect();
+        let fresh_positions: Vec<[f32; 2]> = fresh.instances().iter().map(|i| i.position).collect();
+        assert_eq!(reused_positions, fresh_positions, "no stale sprites");
     }
 }

@@ -82,6 +82,28 @@ const RIVAL_PALETTE: BikePalette = BikePalette {
     helmet: [70, 72, 80, 255],
 };
 
+/// Second rival livery: yellow fairing, black leathers.
+const RIVAL_PALETTE_2: BikePalette = BikePalette {
+    body: [222, 176, 30, 255],
+    body_dark: [160, 122, 16, 255],
+    suit: [44, 44, 50, 255],
+    suit_dark: [28, 28, 34, 255],
+    helmet: [230, 230, 226, 255],
+};
+
+/// Third rival livery: green fairing, cream leathers.
+const RIVAL_PALETTE_3: BikePalette = BikePalette {
+    body: [40, 148, 82, 255],
+    body_dark: [22, 102, 54, 255],
+    suit: [222, 214, 190, 255],
+    suit_dark: [180, 172, 150, 255],
+    helmet: [50, 50, 56, 255],
+};
+
+/// Rival liveries, indexed by `(slot - 1) % 3` so the pack never shows two
+/// identical bikes side by side.
+const RIVAL_PALETTES: [&BikePalette; 3] = [&RIVAL_PALETTE, &RIVAL_PALETTE_2, &RIVAL_PALETTE_3];
+
 /// Fill an inclusive pixel rectangle, clipping to the image.
 fn fill_rect(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
     for y in y0.max(0)..=y1.min(img.height() as i32 - 1) {
@@ -192,8 +214,12 @@ pub fn placeholder_frames() -> Vec<(String, RgbaImage)> {
         ("bike_ride".to_owned(), riding_frame(&PLAYER_PALETTE)),
         ("bike_brake".to_owned(), braking_frame(&PLAYER_PALETTE)),
         ("bike_crash".to_owned(), crash_frame(&PLAYER_PALETTE)),
-        ("bike_rival".to_owned(), riding_frame(&RIVAL_PALETTE)),
+        ("bike_rival".to_owned(), riding_frame(RIVAL_PALETTES[0])),
+        ("bike_rival2".to_owned(), riding_frame(RIVAL_PALETTES[1])),
+        ("bike_rival3".to_owned(), riding_frame(RIVAL_PALETTES[2])),
         ("tree".to_owned(), tree_frame()),
+        ("tree2".to_owned(), broadleaf_frame()),
+        ("tree3".to_owned(), tall_pine_frame()),
         ("bush".to_owned(), bush_frame()),
         ("sign".to_owned(), sign_frame()),
         ("car".to_owned(), car_frame()),
@@ -231,6 +257,33 @@ fn tree_frame() -> RgbaImage {
     fill_rect(&mut img, 7, 6, 16, 18, LEAF);
     fill_rect(&mut img, 7, 6, 10, 18, LEAF_DARK);
     fill_rect(&mut img, 10, 0, 13, 6, LEAF);
+    img
+}
+
+/// A broadleaf: short trunk under a wide round canopy. 28x34.
+fn broadleaf_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(28, 34, |_, _| CLEAR.into());
+    fill_rect(&mut img, 12, 24, 15, 33, TRUNK);
+    // A big round crown: layered discs, shade on the lower left.
+    fill_disc(&mut img, 14, 13, 12, LEAF);
+    fill_disc(&mut img, 9, 16, 6, LEAF_DARK);
+    fill_disc(&mut img, 19, 9, 6, LEAF);
+    fill_disc(&mut img, 11, 8, 5, LEAF);
+    fill_disc(&mut img, 16, 14, 5, LEAF_DARK);
+    img
+}
+
+/// A tall slim pine: narrow spire, three stacked skirts. 16x48.
+fn tall_pine_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(16, 48, |_, _| CLEAR.into());
+    fill_rect(&mut img, 7, 40, 9, 47, TRUNK);
+    fill_rect(&mut img, 3, 32, 12, 40, LEAF);
+    fill_rect(&mut img, 3, 36, 7, 40, LEAF_DARK);
+    fill_rect(&mut img, 4, 22, 11, 32, LEAF);
+    fill_rect(&mut img, 4, 27, 7, 32, LEAF_DARK);
+    fill_rect(&mut img, 5, 12, 10, 22, LEAF);
+    fill_rect(&mut img, 5, 17, 8, 22, LEAF_DARK);
+    fill_rect(&mut img, 6, 2, 9, 12, LEAF);
     img
 }
 
