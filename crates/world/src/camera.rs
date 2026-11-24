@@ -15,6 +15,11 @@ impl Viewport {
     pub fn center_y(&self) -> f32 {
         self.height * 0.5
     }
+
+    /// Screen y of the viewport at a fraction of the height from the top.
+    pub fn y_at_frac(&self, frac: f32) -> f32 {
+        self.height * frac
+    }
 }
 
 /// Viewer state for the projection. The camera sits at `distance` along the
@@ -32,5 +37,10 @@ pub struct Camera {
     /// Focal length in pixels: the pixels-per-world-unit scale at one world
     /// unit of depth.
     pub focal: f32,
+    /// Where the vanishing point sits on screen, in pixels from the top.
+    /// Mid-screen is the default (`viewport.center_y()`); a smaller value
+    /// pitches the view up, lifting the horizon and pushing the road into
+    /// the lower part of the screen.
+    pub horizon_y_px: f32,
     pub viewport: Viewport,
 }

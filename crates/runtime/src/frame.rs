@@ -17,10 +17,16 @@ use world::{RoadGeometry, RoadStrip, Viewport};
 pub const VIEWPORT_WIDTH: f32 = 800.0;
 /// Proof/viewport height in pixels.
 pub const VIEWPORT_HEIGHT: f32 = 450.0;
-/// Camera height above the road surface, in world units.
-pub const CAMERA_HEIGHT: f32 = 1.3;
-/// How far behind the player the camera rides, in meters.
-pub const CAMERA_TRAIL: f32 = 6.0;
+/// Camera height above the road surface, in world units. High enough that
+/// the player sprite sits low in frame with road visible ahead (C1).
+pub const CAMERA_HEIGHT: f32 = 1.9;
+/// How far behind the player the camera rides, in meters. Chosen with
+/// CAMERA_HEIGHT so the player bike's base lands in the lower third of the
+/// screen at a readable ~28% of viewport height (C1/C2).
+pub const CAMERA_TRAIL: f32 = 4.0;
+/// Where the vanishing point sits, as a fraction of the viewport height from
+/// the top (C2).
+pub const HORIZON_FRAC: f32 = 0.4;
 /// Focal length in pixels: pixels-per-world-unit at one unit of depth.
 pub const FOCAL: f32 = 300.0;
 /// Road strip depth step, in meters.
@@ -32,32 +38,70 @@ pub const BIKE_WORLD_WIDTH: f32 = 1.0;
 /// Bike sprite height in world units.
 pub const BIKE_WORLD_HEIGHT: f32 = 1.7;
 
-/// Asphalt light shade.
-const ROAD_LIGHT: [f32; 4] = [0.30, 0.30, 0.32, 1.0];
+/// Asphalt light shade. The light/dark pair differs by ~40% so the strip
+/// rhythm survives small screens and motion (B5).
+const ROAD_LIGHT: [f32; 4] = [0.36, 0.36, 0.38, 1.0];
 /// Asphalt dark shade — the alternation reads as forward motion.
-const ROAD_DARK: [f32; 4] = [0.25, 0.25, 0.27, 1.0];
+const ROAD_DARK: [f32; 4] = [0.21, 0.21, 0.23, 1.0];
 /// Rumble-strip red and white, alternating along the road edges.
 const RUMBLE_RED: [f32; 4] = [0.72, 0.13, 0.10, 1.0];
 const RUMBLE_WHITE: [f32; 4] = [0.93, 0.93, 0.91, 1.0];
+/// Length of one rumble alternation, in world meters: ~2 m so the pattern
+/// reads as stripes, not blocks, near the camera (B6).
+const RUMBLE_SEGMENT: f32 = 2.0;
 /// Lane-line white.
 const LANE_LINE: [f32; 4] = [0.90, 0.90, 0.88, 1.0];
-/// Sky above the horizon.
-const SKY: [f32; 4] = [0.55, 0.73, 0.92, 1.0];
-/// Grass below the horizon.
-const GRASS: [f32; 4] = [0.30, 0.52, 0.26, 1.0];
-/// Distance haze: strips fade into this with depth, grounding the horizon.
-const HAZE: [f32; 4] = [0.72, 0.80, 0.88, 1.0];
-/// Width of each rumble strip, in meters.
-const RUMBLE_WIDTH: f32 = 1.1;
-/// Width of a lane line, in meters.
-const LANE_LINE_WIDTH: f32 = 0.25;
+/// Width of a lane line, in meters — wide enough to read at speed (B7).
+const LANE_LINE_WIDTH: f32 = 0.4;
+/// Painted length of one lane dash, in meters — an 8 m cycle with a 3 m
+/// dash gives a clear broken line (B7).
+const LANE_DASH_LENGTH: f32 = 3.0;
 /// Lateral offsets of the lane lines dividing the road into three lanes.
 const LANE_LINES: [f32; 2] = [-2.0, 2.0];
+/// Sky above the horizon.
+const SKY: [f32; 4] = [0.55, 0.73, 0.92, 1.0];
+/// Height of the haze band painted above the horizon, in pixels, so the sky
+/// and the fading road meet without a hard line (B2).
+const SKY_HAZE_BAND_PX: f32 = 24.0;
+/// Grass light band (B4).
+const GRASS_LIGHT: [f32; 4] = [0.33, 0.56, 0.27, 1.0];
+/// Grass dark band — the alternation makes off-road motion read (B4).
+const GRASS_DARK: [f32; 4] = [0.27, 0.47, 0.22, 1.0];
+/// How far grass fades toward the haze at the draw distance. Kept just
+/// under 1.0 so a whisper of green survives to the horizon — the far road
+/// must not read as a detached white patch on white (B2).
+const GRASS_FOG: f32 = 0.9;
+/// Distance haze: strips fade into this with depth, grounding the horizon.
+const HAZE: [f32; 4] = [0.72, 0.80, 0.88, 1.0];
+/// Muted blue-green of the backdrop ridge silhouettes (B3).
+const BACKDROP: [f32; 4] = [0.40, 0.50, 0.45, 1.0];
+/// Width of each rumble strip, in meters.
+const RUMBLE_WIDTH: f32 = 1.1;
 /// Spacing between roadside scenery slots, in meters.
 const SCENERY_SPACING: f32 = 22.0;
+/// Scenery sizes in world units: bushes and signs scaled up so they identify
+/// at speed; nothing dropped (D6).
+const TREE_SIZE: (f32, f32) = (4.0, 7.0);
+const BUSH_SIZE: (f32, f32) = (3.0, 2.0);
+const SIGN_SIZE: (f32, f32) = (2.4, 3.2);
+/// Traffic-cone hazard size, scaled up to stay identifiable on the road (D6).
+const CONE_SIZE: (f32, f32) = (1.0, 1.3);
+/// Ground-shadow sizes in world units, under scenery and vehicles (D3).
+const TREE_SHADOW: (f32, f32) = (5.0, 1.6);
+const BUSH_SHADOW: (f32, f32) = (2.4, 0.7);
+const SIGN_SHADOW: (f32, f32) = (1.4, 0.5);
+const BIKE_SHADOW: (f32, f32) = (1.8, 0.6);
+const CAR_SHADOW: (f32, f32) = (2.8, 1.0);
+const CONE_SHADOW: (f32, f32) = (0.9, 0.35);
+/// How much farther a shadow sprite sits than its object, in meters: just
+/// enough that painter's order (far to near) paints the shadow first.
+const SHADOW_DEPTH_BIAS: f32 = 0.05;
 /// How hard the camera leans into a corner: lateral meters per
-/// (curvature x speed).
-const CAMERA_LEAN: f32 = 4.0;
+/// (curvature x speed). Damped from 4.0 — the old value swung the road so
+/// far off-centre in corners that the view read as lopsided (B8).
+const CAMERA_LEAN: f32 = 2.0;
+/// Hard cap on the camera's lateral lean, in meters (B8).
+const CAMERA_LEAN_MAX: f32 = 1.5;
 /// How much the view widens at full speed: focal shrinks by this fraction.
 const SPEED_WIDENING: f32 = 0.25;
 /// Camera shake amplitude while crashed, in world units.
@@ -176,6 +220,8 @@ pub struct AtlasMapping {
     ride: [f32; 4],
     brake: [f32; 4],
     crash: [f32; 4],
+    rival: [f32; 4],
+    shadow: [f32; 4],
     tree: [f32; 4],
     bush: [f32; 4],
     sign: [f32; 4],
@@ -201,6 +247,8 @@ impl AtlasMapping {
             ride: uv("bike_ride"),
             brake: uv("bike_brake"),
             crash: uv("bike_crash"),
+            rival: uv("bike_rival"),
+            shadow: uv("shadow"),
             tree: uv("tree"),
             bush: uv("bush"),
             sign: uv("sign"),
@@ -226,6 +274,17 @@ impl AtlasMapping {
     /// UV rects for the world's dressing: scenery and traffic.
     pub fn tree_uv(&self) -> [f32; 4] {
         self.tree
+    }
+
+    /// The rivals' rear-view riding frame — a distinct livery from the
+    /// player's (C3).
+    pub fn rival_uv(&self) -> [f32; 4] {
+        self.rival
+    }
+
+    /// The soft ground shadow ellipse (D3).
+    pub fn shadow_uv(&self) -> [f32; 4] {
+        self.shadow
     }
 
     pub fn bush_uv(&self) -> [f32; 4] {
@@ -394,6 +453,204 @@ fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     ]
 }
 
+/// Depth fog for a distance from the camera, in [0, 1]: quadratic, so the
+/// near field stays crisp and the last stretch melts into the haze. Pure.
+fn fog_at(depth: f32) -> f32 {
+    (depth / ROAD_DRAW_DISTANCE).powi(2)
+}
+
+/// One parallax layer of the distant backdrop (B3): a base height, an
+/// amplitude, and how strongly the road's bend over the next stretch shifts
+/// it sideways (far layers shift less — cheap depth parallax).
+struct BackdropLayer {
+    base_px: f32,
+    amp_px: f32,
+    wavelength_px: f32,
+    phase: f32,
+    /// Lateral pixels of shift per meter of road bend.
+    shift_per_m: f32,
+    /// How far this layer's color is blended into the haze: farther layers
+    /// sit closer to the sky.
+    haze: f32,
+}
+
+/// Far to near: the haze-heaviest ridge first, painter's order.
+const BACKDROP_LAYERS: [BackdropLayer; 3] = [
+    BackdropLayer {
+        base_px: 14.0,
+        amp_px: 6.0,
+        wavelength_px: 110.0,
+        phase: 4.4,
+        shift_per_m: 0.10,
+        haze: 0.72,
+    },
+    BackdropLayer {
+        base_px: 9.0,
+        amp_px: 9.0,
+        wavelength_px: 150.0,
+        phase: 2.1,
+        shift_per_m: 0.20,
+        haze: 0.50,
+    },
+    BackdropLayer {
+        base_px: 4.0,
+        amp_px: 12.0,
+        wavelength_px: 210.0,
+        phase: 0.8,
+        shift_per_m: 0.35,
+        haze: 0.25,
+    },
+];
+
+/// Backdrop silhouette column width, in pixels.
+const BACKDROP_COLUMN_PX: f32 = 32.0;
+
+/// How much road bend feeds the backdrop shift: the centreline's lateral
+/// drift over this window ahead of the camera. A window bounds the shift on
+/// straight runs and long curves alike.
+const BACKDROP_BEND_AHEAD: f32 = 150.0;
+
+/// Silhouette height for one backdrop layer at screen x, in [0, 1]: two
+/// incommensurate sines so the ridge line never visibly repeats. Pure.
+fn hill_height(px: f32, layer: &BackdropLayer) -> f32 {
+    let k = std::f32::consts::TAU / layer.wavelength_px;
+    let a = (px * k + layer.phase).sin();
+    let b = (px * k * 2.7 + layer.phase * 1.6).sin();
+    (0.5 + 0.5 * (0.65 * a + 0.35 * b)).clamp(0.0, 1.0)
+}
+
+/// Paints the layered hill silhouettes between the sky and the horizon
+/// (B3): one flat-color column quad per 32 px of screen, their tops traced
+/// by [`hill_height`], shifted sideways by the road's bend ahead.
+fn push_backdrop(
+    geometry: &RoadGeometry,
+    camera: &world::Camera,
+    road: &mut RoadMesh,
+    horizon: f32,
+) {
+    let bend = geometry.center_offset(camera.distance + BACKDROP_BEND_AHEAD)
+        - geometry.center_offset(camera.distance);
+    for layer in &BACKDROP_LAYERS {
+        let shift = -bend * layer.shift_per_m;
+        let color = lerp_color(BACKDROP, HAZE, layer.haze);
+        let mut x = 0.0;
+        while x < VIEWPORT_WIDTH {
+            let x1 = (x + BACKDROP_COLUMN_PX).min(VIEWPORT_WIDTH);
+            let top = horizon - layer.base_px - layer.amp_px * hill_height(x + shift, layer);
+            // One pixel past the horizon: the grass bands below cover the
+            // seam, so no hairline gap opens between ridge and ground.
+            road.push_screen_rect(x, top, x1, horizon + 1.0, color);
+            x = x1;
+        }
+    }
+}
+
+/// Paints one world-anchored rumble alternation: red/white sub-quads on
+/// both road edges over [`d_near`, `d_far`] (B6). Edges are projected per
+/// segment so the pattern tiles without cracks and fades with depth (B2).
+fn push_rumble(
+    projector: &world::Projector<'_>,
+    camera_distance: f32,
+    range_near: f32,
+    range_far: f32,
+    half_width: f32,
+    road: &mut RoadMesh,
+) {
+    let mut cursor = range_near.max(camera_distance + world::NEAR_PLANE);
+    let mut segment = (cursor / RUMBLE_SEGMENT).floor() as i64;
+    while cursor < range_far {
+        let boundary = (segment as f32 + 1.0) * RUMBLE_SEGMENT;
+        let end = boundary.min(range_far);
+        let color = if segment.rem_euclid(2) == 0 {
+            RUMBLE_RED
+        } else {
+            RUMBLE_WHITE
+        };
+        let fog = fog_at(cursor - camera_distance);
+        for side in [-1.0, 1.0] {
+            if let (Some(n), Some(f)) = (
+                projector.project(cursor, side * half_width),
+                projector.project(end, side * half_width),
+            ) {
+                let inner_near = n.screen_x;
+                let inner_far = f.screen_x;
+                // The outer edge projects at the rumble's outer lateral.
+                let (Some(n_out), Some(f_out)) = (
+                    projector.project(cursor, side * (half_width + RUMBLE_WIDTH)),
+                    projector.project(end, side * (half_width + RUMBLE_WIDTH)),
+                ) else {
+                    continue;
+                };
+                road.push_quad(
+                    QuadEdge {
+                        lx: n_out.screen_x,
+                        rx: inner_near,
+                        y: n.screen_y,
+                    },
+                    QuadEdge {
+                        lx: f_out.screen_x,
+                        rx: inner_far,
+                        y: f.screen_y,
+                    },
+                    lerp_color(color, HAZE, fog),
+                );
+            }
+        }
+        cursor = end;
+        segment += 1;
+    }
+}
+
+/// Paints the broken centre line over one strip's distance range (B7):
+/// dashes are world-anchored on the same 8 m grid, 3 m painted of every
+/// cycle, and clipped to the strip so a dash never crosses a later road
+/// quad and gets overdrawn.
+fn push_lane_dashes(
+    projector: &world::Projector<'_>,
+    camera_distance: f32,
+    range_near: f32,
+    range_far: f32,
+    road: &mut RoadMesh,
+) {
+    let near_floor = camera_distance + world::NEAR_PLANE;
+    let first_slot = (range_near / ROAD_STEP).floor() as i64;
+    let last_slot = ((range_far - 0.001) / ROAD_STEP).floor() as i64;
+    for slot in first_slot..=last_slot {
+        let dash_start = (slot as f32 * ROAD_STEP).max(near_floor);
+        let dash_end = (slot as f32 * ROAD_STEP + LANE_DASH_LENGTH).min(range_far);
+        if dash_start >= dash_end {
+            continue;
+        }
+        let fog = fog_at(dash_start - camera_distance);
+        for lane in LANE_LINES {
+            if let (Some(n), Some(f)) = (
+                projector.project(dash_start, lane),
+                projector.project(dash_end, lane),
+            ) {
+                // A dash whose near edge is below the screen would sweep in
+                // from off-screen; skip it like the clamped strips.
+                if n.screen_y > VIEWPORT_HEIGHT {
+                    continue;
+                }
+                let half_px = |scale: f32| LANE_LINE_WIDTH * scale * 0.5;
+                road.push_quad(
+                    QuadEdge {
+                        lx: n.screen_x - half_px(n.scale),
+                        rx: n.screen_x + half_px(n.scale),
+                        y: n.screen_y,
+                    },
+                    QuadEdge {
+                        lx: f.screen_x - half_px(f.scale),
+                        rx: f.screen_x + half_px(f.scale),
+                        y: f.screen_y,
+                    },
+                    lerp_color(LANE_LINE, HAZE, fog),
+                );
+            }
+        }
+    }
+}
+
 /// Builds camera-following drawable state from the live race, filling the
 /// batch and road mesh.
 fn compose(
@@ -422,8 +679,11 @@ fn compose(
     let camera = world::Camera {
         distance: player_distance - CAMERA_TRAIL,
         height: CAMERA_HEIGHT + shake_height,
-        lateral: (-player_curvature * player_speed * CAMERA_LEAN).clamp(-3.0, 3.0) + shake_lateral,
+        lateral: (-player_curvature * player_speed * CAMERA_LEAN)
+            .clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
+            + shake_lateral,
         focal: FOCAL * (1.0 - SPEED_WIDENING * (player_speed / game::bike::MAX_SPEED)),
+        horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
         viewport: Viewport {
             width: VIEWPORT_WIDTH,
             height: VIEWPORT_HEIGHT,
@@ -432,14 +692,24 @@ fn compose(
     let projector = world::Projector::new(geometry, camera);
     let half_width = geometry.road_width() * 0.5;
 
-    // Sky above the horizon, grass below, then the road over the grass.
+    // Sky above the horizon, a haze band where sky meets distance, the
+    // parallax backdrop, then the banded grass and the road over it.
     let horizon = projector.horizon_y();
     road.vertices.clear();
     road.push_screen_rect(0.0, 0.0, VIEWPORT_WIDTH, horizon, SKY);
-    road.push_screen_rect(0.0, horizon, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, GRASS);
+    road.push_screen_rect(
+        0.0,
+        horizon - SKY_HAZE_BAND_PX,
+        VIEWPORT_WIDTH,
+        horizon,
+        lerp_color(SKY, HAZE, 0.7),
+    );
+    push_backdrop(geometry, &camera, road, horizon);
 
-    // Road: near-to-far trapezoid strips, alternating shades, fading into
-    // the haze with depth so the horizon reads as distance.
+    // Road: near-to-far trapezoid strips, alternating shades, with grass
+    // bands behind every strip so the whole ground plane fades with depth
+    // (B2), not just the asphalt.
+    let mut last_far_y = VIEWPORT_HEIGHT;
     for (strip_index, unclamped) in projector
         .road_strips(ROAD_STEP, camera.distance + ROAD_DRAW_DISTANCE)
         .enumerate()
@@ -449,8 +719,25 @@ fn compose(
         let Some(strip) = clamp_strip_to_viewport(unclamped) else {
             continue;
         };
+        last_far_y = last_far_y.min(strip.far_y);
         let depth = (strip_index + 1) as f32 * ROAD_STEP;
-        let fog = (depth / ROAD_DRAW_DISTANCE).powi(2);
+        let fog = fog_at(depth);
+
+        // Grass band for this strip's depth range, full width (B4).
+        let grass_shade = if strip_index.is_multiple_of(2) {
+            GRASS_LIGHT
+        } else {
+            GRASS_DARK
+        };
+        road.push_screen_rect(
+            0.0,
+            strip.far_y,
+            VIEWPORT_WIDTH,
+            strip.near_y,
+            lerp_color(grass_shade, HAZE, fog * GRASS_FOG),
+        );
+
+        // Asphalt: alternating shades fading into the haze with depth.
         let shade = if strip_index.is_multiple_of(2) {
             ROAD_LIGHT
         } else {
@@ -458,84 +745,76 @@ fn compose(
         };
         road.push_strip(strip, lerp_color(shade, HAZE, fog));
 
-        // Rumble strips: red/white quads hugging both road edges.
-        let rumble = if strip_index.is_multiple_of(2) {
-            RUMBLE_RED
-        } else {
-            RUMBLE_WHITE
-        };
-        for side in [-1.0, 1.0] {
-            road.push_quad(
-                QuadEdge {
-                    lx: strip.near_x + side * strip.near_half_width,
-                    rx: strip.near_x
-                        + side
-                            * (strip.near_half_width
-                                + RUMBLE_WIDTH * strip.near_half_width / half_width),
-                    y: strip.near_y,
-                },
-                QuadEdge {
-                    lx: strip.far_x + side * strip.far_half_width,
-                    rx: strip.far_x
-                        + side
-                            * (strip.far_half_width
-                                + RUMBLE_WIDTH * strip.far_half_width / half_width),
-                    y: strip.far_y,
-                },
-                rumble,
-            );
-        }
-
-        // Lane lines: dashed white, half the strips painted.
-        if strip_index.is_multiple_of(2) {
-            let near_d = camera.distance + strip_index as f32 * ROAD_STEP + 1.0;
-            let far_d = near_d + ROAD_STEP;
-            for lane in LANE_LINES {
-                if let (Some(n), Some(f)) = (
-                    projector.project(near_d, lane),
-                    projector.project(far_d, lane),
-                ) {
-                    // A dash whose near edge is below the screen would sweep
-                    // in from off-screen; skip it like the clamped strips.
-                    if n.screen_y > VIEWPORT_HEIGHT {
-                        continue;
-                    }
-                    road.push_quad(
-                        QuadEdge {
-                            lx: n.screen_x - LANE_LINE_WIDTH * n.scale * 0.5,
-                            rx: n.screen_x + LANE_LINE_WIDTH * n.scale * 0.5,
-                            y: n.screen_y,
-                        },
-                        QuadEdge {
-                            lx: f.screen_x - LANE_LINE_WIDTH * f.scale * 0.5,
-                            rx: f.screen_x + LANE_LINE_WIDTH * f.scale * 0.5,
-                            y: f.screen_y,
-                        },
-                        LANE_LINE,
-                    );
-                }
-            }
-        }
+        // Rumble strips and lane dashes are anchored to the world's own
+        // 8 m grid, so their pattern sits still on the road instead of
+        // crawling with the camera.
+        let range_near = camera.distance + (strip_index as f32 * ROAD_STEP);
+        let range_far = range_near + ROAD_STEP;
+        push_rumble(
+            &projector,
+            camera.distance,
+            range_near,
+            range_far,
+            half_width,
+            road,
+        );
+        push_lane_dashes(&projector, camera.distance, range_near, range_far, road);
     }
 
+    // The sliver between the last strip and the horizon: fully hazed grass,
+    // matching what the bands fade into (B2).
+    road.push_screen_rect(
+        0.0,
+        horizon,
+        VIEWPORT_WIDTH,
+        last_far_y,
+        lerp_color(GRASS_LIGHT, HAZE, GRASS_FOG),
+    );
+
     // Collect every drawable: bikes, traffic cars, cone hazards, and the
-    // deterministic roadside scenery, then paint far to near.
+    // deterministic roadside scenery, then paint far to near. Each item's
+    // ground shadow is a separate sprite a hair farther away, so painter's
+    // order drops it onto the road just before the object (D3).
     let mut draws: Vec<DrawItem> = Vec::new();
+    let shadow_uv = mapping.shadow_uv();
     for (slot, state) in race.bike_states().enumerate() {
         let control = if slot == 0 {
             player_control
         } else {
-            Control::Accelerate
+            race.bike_control(slot)
         };
+        // The player's rear view carries the control-state frames; rivals
+        // ride their own livery, down to the shared crash pose (C3).
+        let uv = if slot == 0 {
+            mapping.frame_uv(control)
+        } else if control == Control::Crashed {
+            mapping.frame_uv(Control::Crashed)
+        } else {
+            mapping.rival_uv()
+        };
+        draws.push(DrawItem {
+            distance: state.pos_x + SHADOW_DEPTH_BIAS,
+            lateral: state.pos_y,
+            world_width: BIKE_SHADOW.0,
+            world_height: BIKE_SHADOW.1,
+            uv: shadow_uv,
+        });
         draws.push(DrawItem {
             distance: state.pos_x,
             lateral: state.pos_y,
             world_width: BIKE_WORLD_WIDTH,
             world_height: BIKE_WORLD_HEIGHT,
-            uv: mapping.frame_uv(control),
+            uv,
         });
     }
     for car in race.traffic_cars() {
+        draws.push(DrawItem {
+            distance: car.state.pos_x + SHADOW_DEPTH_BIAS,
+            lateral: car.state.pos_y,
+            world_width: CAR_SHADOW.0,
+            world_height: CAR_SHADOW.1,
+            uv: shadow_uv,
+        });
         draws.push(DrawItem {
             distance: car.state.pos_x,
             lateral: car.state.pos_y,
@@ -546,10 +825,17 @@ fn compose(
     }
     for hazard in race.hazards() {
         draws.push(DrawItem {
+            distance: hazard.pos_x + SHADOW_DEPTH_BIAS,
+            lateral: hazard.lateral,
+            world_width: CONE_SHADOW.0,
+            world_height: CONE_SHADOW.1,
+            uv: shadow_uv,
+        });
+        draws.push(DrawItem {
             distance: hazard.pos_x,
             lateral: hazard.lateral,
-            world_width: 0.5,
-            world_height: 0.7,
+            world_width: CONE_SIZE.0,
+            world_height: CONE_SIZE.1,
             uv: mapping.cone_uv(),
         });
     }
@@ -577,8 +863,10 @@ fn compose(
 }
 
 /// Deterministic roadside scenery: every [`SCENERY_SPACING`] meters there is
-/// a slot whose seeded roll picks a tree, bush, or sign at a randomized side
-/// and offset. Same distance, same dressing — no per-frame state.
+/// a slot whose seeded roll picks a tree, bush, or sign. Sides alternate by
+/// slot — guaranteed balance across the road, however the seeded rolls fall
+/// — with an occasional opposite-side understory bush (D4). Same distance,
+/// same dressing — no per-frame state.
 fn push_scenery(
     geometry: &RoadGeometry,
     mapping: &AtlasMapping,
@@ -586,27 +874,32 @@ fn push_scenery(
     camera_distance: f32,
 ) {
     let half_width = geometry.road_width() * 0.5;
+    let shadow_uv = mapping.shadow_uv();
     let first = ((camera_distance + 2.0) / SCENERY_SPACING).floor() as u64;
     let last = ((camera_distance + ROAD_DRAW_DISTANCE) / SCENERY_SPACING).ceil() as u64;
     for slot in first..=last {
         let distance = slot as f32 * SCENERY_SPACING;
         let mut roll = sim::rng::XorShift64::new(slot.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let kind = roll.next_f32_in(0.0, 1.0);
-        let (uv, width, height) = if kind < 0.55 {
-            (mapping.tree_uv(), 4.0, 7.0)
+        let (uv, (width, height), shadow) = if kind < 0.55 {
+            (mapping.tree_uv(), TREE_SIZE, TREE_SHADOW)
         } else if kind < 0.8 {
-            (mapping.bush_uv(), 2.2, 1.4)
+            (mapping.bush_uv(), BUSH_SIZE, BUSH_SHADOW)
         } else if kind < 0.92 {
-            (mapping.sign_uv(), 1.6, 2.2)
+            (mapping.sign_uv(), SIGN_SIZE, SIGN_SHADOW)
         } else {
             continue;
         };
-        let side = if roll.next_f32_in(0.0, 1.0) < 0.5 {
-            1.0
-        } else {
-            -1.0
-        };
+        // Alternate sides by slot parity: even slots right, odd slots left.
+        let side = if slot % 2 == 0 { 1.0 } else { -1.0 };
         let lateral = side * (half_width + 1.5 + roll.next_f32_in(0.0, 9.0));
+        draws.push(DrawItem {
+            distance: distance + SHADOW_DEPTH_BIAS,
+            lateral,
+            world_width: shadow.0,
+            world_height: shadow.1,
+            uv: shadow_uv,
+        });
         draws.push(DrawItem {
             distance,
             lateral,
@@ -614,5 +907,24 @@ fn push_scenery(
             world_height: height,
             uv,
         });
+        // A quarter of slots also get a small bush on the opposite verge,
+        // so neither side of the road ever reads empty (D4).
+        if roll.next_f32_in(0.0, 1.0) < 0.25 {
+            let opposite = -side * (half_width + 1.5 + roll.next_f32_in(0.0, 9.0));
+            draws.push(DrawItem {
+                distance: distance + SHADOW_DEPTH_BIAS,
+                lateral: opposite,
+                world_width: BUSH_SHADOW.0,
+                world_height: BUSH_SHADOW.1,
+                uv: shadow_uv,
+            });
+            draws.push(DrawItem {
+                distance,
+                lateral: opposite,
+                world_width: BUSH_SIZE.0,
+                world_height: BUSH_SIZE.1,
+                uv: mapping.bush_uv(),
+            });
+        }
     }
 }

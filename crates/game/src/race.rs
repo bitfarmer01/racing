@@ -26,8 +26,10 @@ pub const BIKE_HALF_LENGTH: f32 = 1.1;
 pub const BIKE_HALF_WIDTH: f32 = 0.5;
 /// Fraction of speed each overlapping bike loses per overlapping tick.
 pub const COLLISION_SCRUB: f32 = 0.985;
-/// Longitudinal gap between rivals on the starting grid, in meters.
-pub const GRID_SPACING: f32 = 6.0;
+/// Longitudinal gap between rivals on the starting grid, in meters. Wide
+/// enough that rivals start strung out down the road instead of bunched at
+/// one depth (C4).
+pub const GRID_SPACING: f32 = 14.0;
 /// Half the lateral span of lanes the grid spreads across, in meters.
 pub const GRID_HALF_SPAN: f32 = 3.0;
 /// Closing speed above which running into the bike ahead is a crash, in m/s.
@@ -519,6 +521,11 @@ impl Race {
     /// The player's current control state.
     pub fn player_control(&self) -> Control {
         self.aux[0].snapshot.control
+    }
+
+    /// Control state of one bike (spawn-order slot), for rendering.
+    pub fn bike_control(&self, slot: usize) -> Control {
+        self.aux[slot].snapshot.control
     }
 
     /// The player's speed, in meters per second.
