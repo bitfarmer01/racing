@@ -110,9 +110,14 @@ const CONE_SHADOW: (f32, f32) = (0.9, 0.35);
 /// How much farther a shadow sprite sits than its object, in meters: just
 /// enough that painter's order (far to near) paints the shadow first.
 const SHADOW_DEPTH_BIAS: f32 = 0.05;
-/// How hard the camera leans into a corner: lateral meters per
-/// (curvature x speed). Damped from 4.0 — the old value swung the road so
-/// far off-centre in corners that the view read as lopsided (B8).
+/// How hard the camera leans with the player's heading: lateral meters per
+/// radian of bike heading. The primary term — the camera leans with where
+/// the rider is pointing first, so it never leans against the player.
+const CAMERA_HEADING_LEAN: f32 = 4.0;
+/// How hard the camera leans into a road bend, second to the player's
+/// heading: lateral meters per (curvature x speed). Damped from 4.0 — the
+/// old value swung the road so far off-centre in corners that the view
+/// read as lopsided (B8).
 const CAMERA_LEAN: f32 = 2.0;
 /// Hard cap on the camera's lateral lean, in meters (B8).
 const CAMERA_LEAN_MAX: f32 = 1.5;
@@ -693,6 +698,37 @@ fn push_lane_dashes(
     }
 }
 
+/// The camera over the player: distance trailing the bike, leaning with
+/// the player's heading first and the road bend second — the view never
+/// leans against the rider — widening with speed, and carrying the tick's
+/// shake offsets. Pure: the shake terms arrive precomputed so the caller
+/// keeps the one deterministic RNG.
+fn player_camera(
+    race: &Race,
+    geometry: &RoadGeometry,
+    shake_lateral: f32,
+    shake_height: f32,
+) -> world::Camera {
+    let player_speed = race.player_speed();
+    let player_distance = race.player_distance();
+    let player_curvature = geometry.curvature_at(player_distance);
+    let player_heading = race.player_heading();
+    world::Camera {
+        distance: player_distance - CAMERA_TRAIL,
+        height: CAMERA_HEIGHT + shake_height,
+        lateral: (player_heading * CAMERA_HEADING_LEAN
+            - player_curvature * player_speed * CAMERA_LEAN)
+            .clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
+            + shake_lateral,
+        focal: FOCAL * (1.0 - SPEED_WIDENING * (player_speed / game::bike::MAX_SPEED)),
+        horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
+        viewport: Viewport {
+            width: VIEWPORT_WIDTH,
+            height: VIEWPORT_HEIGHT,
+        },
+    }
+}
+
 /// Builds camera-following drawable state from the live race, filling the
 /// batch and road mesh.
 fn compose(
@@ -702,14 +738,11 @@ fn compose(
     batch: &mut SpriteBatch,
     road: &mut RoadMesh,
 ) {
-    let player_speed = race.player_speed();
-    let player_distance = race.player_distance();
-    let player_curvature = geometry.curvature_at(player_distance);
     let player_control = race.player_control();
 
-    // Camera feel: lean into the corner (shifted toward the inside of the
-    // bend — the same inside the riders bank toward), widen the view with
-    // speed, and shake while the rider slides.
+    // Camera feel: lean with the player's steering and the road bend (in
+    // that order — the view never leans against the rider), widen the view
+    // with speed, and shake while the rider slides.
     // The shake jitter is deterministic per tick — no clock, no host RNG.
     let mut jitter = sim::rng::XorShift64::new(race.tick_index() | 1);
     let shake = if player_control == Control::Crashed {
@@ -721,19 +754,7 @@ fn compose(
     };
     let shake_lateral = (jitter.next_f32_in(-1.0, 1.0)) * shake;
     let shake_height = (jitter.next_f32_in(-1.0, 1.0)) * shake * 0.6;
-    let camera = world::Camera {
-        distance: player_distance - CAMERA_TRAIL,
-        height: CAMERA_HEIGHT + shake_height,
-        lateral: (-player_curvature * player_speed * CAMERA_LEAN)
-            .clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
-            + shake_lateral,
-        focal: FOCAL * (1.0 - SPEED_WIDENING * (player_speed / game::bike::MAX_SPEED)),
-        horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
-        viewport: Viewport {
-            width: VIEWPORT_WIDTH,
-            height: VIEWPORT_HEIGHT,
-        },
-    };
+    let camera = player_camera(race, geometry, shake_lateral, shake_height);
     let projector = world::Projector::new(geometry, camera);
     let half_width = geometry.road_width() * 0.5;
 
@@ -1077,6 +1098,31 @@ mod tests {
             .instances()
             .iter()
             .all(|instance| instance.rotation == 0.0));
+    }
+
+    #[test]
+    fn camera_lean_follows_player_heading_change() {
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Roll up to speed on the opening straight, before the first bend:
+        // same distance, same speed in both runs, so the only difference is
+        // the player's held steering.
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let neutral = player_camera(&race, &geometry, 0.0, 0.0);
+        for _ in 0..6 {
+            race.push_input(GameInput::SteerRight);
+            race.tick();
+        }
+        let steering = player_camera(&race, &geometry, 0.0, 0.0);
+        assert!(
+            steering.lateral > neutral.lateral,
+            "camera leans with the player's right-hand steer, not against it"
+        );
     }
 
     #[test]
