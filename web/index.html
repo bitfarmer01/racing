@@ -14,9 +14,24 @@
       color: #d8d8de;
       font-family: system-ui, sans-serif;
     }
-    /* Full-window stage; the loader sizes the canvas backing store from
-       window size x devicePixelRatio (capped) — the CSS here stays fluid. */
-    #stage { position: fixed; inset: 0; }
+    /* Letterbox (playtest finding): runtime composes every frame in a fixed
+       800x450 16:9 space (runtime::VIEWPORT_WIDTH/HEIGHT — another worker's
+       crate; the ratio is mirrored here on purpose). The frame keeps that
+       aspect: wide or tall windows letterbox with black bars instead of
+       stretching the scene non-uniformly. All overlays are scoped to the
+       frame, so HUD chrome tracks the picture, not the window. */
+    #stage {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: #000;
+    }
+    #frame {
+      position: relative;
+      width: min(100vw, calc(100vh * 16 / 9));
+      aspect-ratio: 16 / 9;
+    }
     canvas {
       display: block;
       width: 100%;
@@ -119,6 +134,18 @@
       text-align: center;
       background: rgba(8, 8, 12, 0.72);
     }
+    /* Shell-side pause (Escape): the sim stops ticking, the picture holds. */
+    #paused:not([hidden]) {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      font: 700 44px ui-monospace, monospace;
+      color: #ffd75e;
+      text-shadow: 0 2px 12px #000;
+      background: rgba(8, 8, 12, 0.55);
+      pointer-events: none;
+    }
     #finish h1 {
       margin: 0 0 0.5rem;
       font-size: 1.6rem;
@@ -143,14 +170,50 @@
       font-size: 0.85rem;
       color: #84848e;
     }
+    /* Focus prompt (iframe focus capture): shown after boot whenever the
+       frame has never been engaged (click/keydown/focus). The overlay is
+       pointer-events:none — the first click passes through to the stage, so
+       one click focuses the frame AND counts as engagement, and the overlay
+       can never swallow a keypress. */
+    #focus-overlay:not([hidden]) {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      pointer-events: none;
+    }
+    #focus-title {
+      font: 700 34px system-ui, sans-serif;
+      letter-spacing: 0.12em;
+      color: #ffd75e;
+      text-shadow: 0 2px 12px #000;
+    }
+    #focus-keys {
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: #d5dae2;
+      text-shadow: 0 1px 6px #000;
+    }
+    /* Control affordance line under the HUD strip (visible while riding). */
+    #hud-keys:not([hidden]) {
+      position: absolute;
+      top: 88px;
+      left: 12px;
+      font: 12px/1.4 ui-monospace, monospace;
+      color: rgba(245, 247, 250, 0.8);
+      text-shadow: 0 1px 4px #000;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <div id="stage">
+    <div id="frame">
     <canvas id="game"></canvas>
     <div id="overlay"><div>
       <div id="status">Loading…</div>
-      <div id="keys">Arrows / WASD to ride — Down / S to brake</div>
+      <div id="keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
     </div></div>
     <div id="hud" hidden>
       <div id="hud-speed"><span id="speed-value">0</span><span class="unit">km/h</span></div>
@@ -160,14 +223,21 @@
         <div id="lap-bar"><div id="lap-fill"></div></div>
       </div>
     </div>
+    <div id="focus-overlay" hidden><div>
+      <div id="focus-title">CLICK TO RIDE</div>
+      <div id="focus-keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
+    </div></div>
+    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
     <div id="rider-state" hidden></div>
     <div id="countdown" hidden></div>
+    <div id="paused" hidden>PAUSED — Esc to resume</div>
     <div id="finish" hidden>
       <div>
         <h1>Finish!</h1>
         <p id="finish-text"></p>
         <button id="restart" type="button">Race again</button>
       </div>
+    </div>
     </div>
   </div>
   <script type="module" src="loader.js"></script>
