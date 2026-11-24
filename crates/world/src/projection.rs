@@ -57,9 +57,9 @@ impl<'a> Projector<'a> {
     }
 
     /// The vanishing line: the y the road converges toward at infinite
-    /// distance.
+    /// distance. The camera's `horizon_y_px` sets where this sits on screen.
     pub fn horizon_y(&self) -> f32 {
-        self.camera.viewport.center_y()
+        self.camera.horizon_y_px
     }
 
     /// Projects a point `lateral` units off the road centreline at `distance`
@@ -166,6 +166,7 @@ mod tests {
             height: 1.2,
             lateral: 0.0,
             focal: 300.0,
+            horizon_y_px: VIEWPORT.center_y(),
             viewport: VIEWPORT,
         }
     }
