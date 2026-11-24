@@ -434,12 +434,14 @@ pub fn advance_game_frame(
 
 /// One drawable sprite collected before painter's-order sorting: everything
 /// on the road — bikes, cars, cones, scenery — projects the same way.
+/// `roll` is the screen-space bank in radians; only riders ever lean.
 struct DrawItem {
     distance: f32,
     lateral: f32,
     world_width: f32,
     world_height: f32,
     uv: [f32; 4],
+    roll: f32,
 }
 
 /// Blends `a` toward `b` by `t` in [0, 1], per channel. Pure.
@@ -666,7 +668,8 @@ fn compose(
     let player_control = race.player_control();
 
     // Camera feel: lean into the corner (shifted toward the inside of the
-    // bend), widen the view with speed, and shake while the rider slides.
+    // bend — the same inside the riders bank toward), widen the view with
+    // speed, and shake while the rider slides.
     // The shake jitter is deterministic per tick — no clock, no host RNG.
     let mut jitter = sim::rng::XorShift64::new(race.tick_index() | 1);
     let shake = if player_control == Control::Crashed {
@@ -696,6 +699,8 @@ fn compose(
     // parallax backdrop, then the banded grass and the road over it.
     let horizon = projector.horizon_y();
     road.vertices.clear();
+
+    batch.clear();
     road.push_screen_rect(0.0, 0.0, VIEWPORT_WIDTH, horizon, SKY);
     road.push_screen_rect(
         0.0,
@@ -798,6 +803,7 @@ fn compose(
             world_width: BIKE_SHADOW.0,
             world_height: BIKE_SHADOW.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: state.pos_x,
@@ -805,6 +811,9 @@ fn compose(
             world_width: BIKE_WORLD_WIDTH,
             world_height: BIKE_WORLD_HEIGHT,
             uv,
+            // The rider's bank: the sim carries the lean, the instance
+            // transform rolls the quad about its ground contact.
+            roll: race.bike_lean(slot),
         });
     }
     for car in race.traffic_cars() {
@@ -814,6 +823,7 @@ fn compose(
             world_width: CAR_SHADOW.0,
             world_height: CAR_SHADOW.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: car.state.pos_x,
@@ -821,6 +831,7 @@ fn compose(
             world_width: 2.0,
             world_height: 1.5,
             uv: mapping.car_uv(),
+            roll: 0.0,
         });
     }
     for hazard in race.hazards() {
@@ -830,6 +841,7 @@ fn compose(
             world_width: CONE_SHADOW.0,
             world_height: CONE_SHADOW.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance: hazard.pos_x,
@@ -837,6 +849,7 @@ fn compose(
             world_width: CONE_SIZE.0,
             world_height: CONE_SIZE.1,
             uv: mapping.cone_uv(),
+            roll: 0.0,
         });
     }
     push_scenery(geometry, mapping, &mut draws, camera.distance);
@@ -856,6 +869,7 @@ fn compose(
                 lateral: item.lateral,
                 world_width: item.world_width,
                 world_height: item.world_height,
+                roll: item.roll,
             },
             style,
         );
@@ -899,6 +913,7 @@ fn push_scenery(
             world_width: shadow.0,
             world_height: shadow.1,
             uv: shadow_uv,
+            roll: 0.0,
         });
         draws.push(DrawItem {
             distance,
@@ -906,6 +921,7 @@ fn push_scenery(
             world_width: width,
             world_height: height,
             uv,
+            roll: 0.0,
         });
         // A quarter of slots also get a small bush on the opposite verge,
         // so neither side of the road ever reads empty (D4).
@@ -917,6 +933,7 @@ fn push_scenery(
                 world_width: BUSH_SHADOW.0,
                 world_height: BUSH_SHADOW.1,
                 uv: shadow_uv,
+                roll: 0.0,
             });
             draws.push(DrawItem {
                 distance,
@@ -924,7 +941,124 @@ fn push_scenery(
                 world_width: BUSH_SIZE.0,
                 world_height: BUSH_SIZE.1,
                 uv: mapping.bush_uv(),
+                roll: 0.0,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack_placeholder_atlas;
+
+    /// A mapping over the packed placeholder atlas, shared by these tests.
+    fn mapping() -> AtlasMapping {
+        let packed = pack_placeholder_atlas().expect("placeholder atlas packs");
+        AtlasMapping::from_packed(&packed)
+    }
+
+    /// Releases the grid, rolls the player up to speed, then banks left for
+    /// a few ticks.
+    fn banked_left_race() -> (Race, RoadGeometry) {
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        for _ in 0..30 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        for _ in 0..3 {
+            race.push_input(GameInput::SteerLeft);
+            race.tick();
+        }
+        (race, geometry)
+    }
+
+    #[test]
+    fn a_banked_rider_renders_a_rolled_sprite() {
+        let mapping = mapping();
+        let (race, geometry) = banked_left_race();
+        assert!(race.player_lean() < -0.1, "the rider is banked left");
+
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+        let rolls: Vec<f32> = frame
+            .batch
+            .instances()
+            .iter()
+            .map(|instance| instance.rotation)
+            .collect();
+        assert!(
+            rolls.iter().any(|r| *r < -0.05),
+            "at least the player's sprite is rolled left: {rolls:?}"
+        );
+        // Shadows, cones, cars, and scenery never roll: every roll in the
+        // batch is a rider's bank, within the state machine's cap.
+        assert!(rolls.iter().all(|r| r.abs() <= game::bike::LEAN_MAX + 1e-3));
+    }
+
+    #[test]
+    fn an_upright_pack_renders_no_rolled_sprites() {
+        let mapping = mapping();
+        let (race, geometry) = demo_race();
+        // Still on the grid: everyone upright.
+        let frame = GameFrame::build(&race, &geometry, &mapping);
+        assert!(frame
+            .batch
+            .instances()
+            .iter()
+            .all(|instance| instance.rotation == 0.0));
+    }
+
+    #[test]
+    fn a_reused_batch_refills_per_frame_instead_of_piling_up() {
+        // Regression: compose() reuses pre-owned batch and road buffers on
+        // the steady-state path. A batch never cleared fills once, then
+        // every later sprite push is rejected — the screen freezes on the
+        // first frames' sprites while the road keeps animating.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        let mut batch = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut road = RoadMesh::default();
+
+        advance_game_frame(
+            &mut race,
+            &geometry,
+            &mapping,
+            &[GameInput::Accelerate],
+            &mut batch,
+            &mut road,
+        );
+        let first_len = batch.len();
+        assert!(first_len > 0, "a frame draws sprites");
+
+        // Ten more frames on the same buffers: the player is accelerating
+        // down the road, so every frame's sprite set is a different one.
+        for _ in 0..10 {
+            advance_game_frame(
+                &mut race,
+                &geometry,
+                &mapping,
+                &[GameInput::Accelerate],
+                &mut batch,
+                &mut road,
+            );
+        }
+        assert_eq!(
+            batch.len(),
+            first_len,
+            "each frame refills the batch; it must never grow"
+        );
+
+        // And the sprites are current, not a pile of stale first frames:
+        // composing the same race into a fresh batch must agree with the
+        // reused one, instance for instance.
+        let mut fresh = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        compose(&race, &geometry, &mapping, &mut fresh, &mut road);
+        let reused_positions: Vec<[f32; 2]> =
+            batch.instances().iter().map(|i| i.position).collect();
+        let fresh_positions: Vec<[f32; 2]> = fresh.instances().iter().map(|i| i.position).collect();
+        assert_eq!(reused_positions, fresh_positions, "no stale sprites");
     }
 }
