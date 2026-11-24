@@ -57,6 +57,14 @@ const CAR_BODY: [u8; 4] = [210, 212, 218, 255];
 const CAR_GLASS: [u8; 4] = [40, 46, 58, 255];
 /// Traffic-car taillight red.
 const CAR_TAIL: [u8; 4] = [200, 40, 30, 255];
+/// Palm trunk tan.
+const PALM_TRUNK: [u8; 4] = [122, 88, 52, 255];
+/// Building facade stone, lit and shaded.
+const STONE_LIT: [u8; 4] = [206, 198, 182, 255];
+const STONE_DARK: [u8; 4] = [148, 138, 124, 255];
+/// Fence/pole timber.
+const TIMBER_LIT: [u8; 4] = [166, 128, 76, 255];
+const TIMBER_DARK: [u8; 4] = [104, 74, 42, 255];
 
 /// The color scheme of one bike's rear-view sprite: fairing, leathers, and
 /// helmet. The player and the rivals share one drawing routine but never a
@@ -699,6 +707,17 @@ pub fn placeholder_frames() -> Vec<(String, RgbaImage)> {
         ("car".to_owned(), car_frame()),
         ("cone".to_owned(), cone_frame()),
         ("shadow".to_owned(), shadow_frame()),
+        // Wave 7c world construction: zone dressing...
+        ("palm".to_owned(), palm_frame()),
+        ("building".to_owned(), building_frame()),
+        ("fence".to_owned(), fence_frame()),
+        ("pole".to_owned(), pole_frame()),
+        ("marker".to_owned(), marker_frame()),
+        ("rock".to_owned(), rock_frame()),
+        // ...and the large per-lap landmarks.
+        ("water_tower".to_owned(), water_tower_frame()),
+        ("windmill".to_owned(), windmill_frame()),
+        ("billboard".to_owned(), billboard_frame()),
     ]
 }
 
@@ -939,6 +958,387 @@ fn cone_frame() -> RgbaImage {
     img
 }
 
+// ---------------------------------------------------------------------------
+// Wave 7c — world construction frames: zone dressing and landmarks. Same
+// grammar as the rest of the HD set — every surface shades smoothly.
+// ---------------------------------------------------------------------------
+
+/// A coastal palm: curved trunk, radiating frond clusters, coconuts. 96x160.
+fn palm_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(96, 160, |_, _| CLEAR.into());
+    // Curved trunk: gradient segments leaning as they climb.
+    for i in 0..8 {
+        let y = 150.0 - i as f32 * 14.0;
+        let x = 40.0 + i as f32 * 1.4;
+        fill_rect_gradient(
+            &mut img,
+            x,
+            y,
+            x + 9.0,
+            y + 15.0,
+            PALM_TRUNK,
+            [70, 48, 26, 255],
+        );
+    }
+    // Fronds: shaded leaf discs fanning from the crown.
+    let (cx, cy) = (58.0_f32, 36.0_f32);
+    for (dx, dy, r) in [
+        (-26.0, 8.0, 17.0),
+        (26.0, 8.0, 17.0),
+        (-18.0, -8.0, 15.0),
+        (18.0, -8.0, 15.0),
+        (0.0, -14.0, 16.0),
+        (0.0, 12.0, 14.0),
+    ] {
+        fill_disc_shaded(&mut img, cx + dx, cy + dy, r, LEAF, lighten(LEAF, 0.35));
+    }
+    // Coconuts at the crown.
+    fill_disc_shaded(
+        &mut img,
+        cx - 6.0,
+        cy + 6.0,
+        5.0,
+        PALM_TRUNK,
+        lighten(PALM_TRUNK, 0.3),
+    );
+    fill_disc_shaded(
+        &mut img,
+        cx + 6.0,
+        cy + 6.0,
+        5.0,
+        PALM_TRUNK,
+        lighten(PALM_TRUNK, 0.3),
+    );
+    img
+}
+
+/// A town block: gradient facade, shaded window grid, roof cap, door. 128x160.
+fn building_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(128, 160, |_, _| CLEAR.into());
+    // Facade: stacked gradient courses — one 138-row ramp quantizes into
+    // flat rows; courses keep the stone shading moving.
+    for i in 0..7 {
+        let y0 = 20.0 + i as f32 * 20.0;
+        fill_rect_gradient(&mut img, 8.0, y0, 120.0, y0 + 21.0, STONE_LIT, STONE_DARK);
+    }
+    // Roof cap.
+    fill_rect_gradient(
+        &mut img,
+        4.0,
+        12.0,
+        124.0,
+        26.0,
+        [120, 62, 48, 255],
+        [88, 42, 32, 255],
+    );
+    // Window grid: glass shading from a sky reflection into the room.
+    for row in 0..3 {
+        for col in 0..4 {
+            let x = 18.0 + col as f32 * 26.0;
+            let y = 34.0 + row as f32 * 30.0;
+            fill_round_rect_soft(&mut img, x, y, x + 16.0, y + 20.0, 2.0, [52, 58, 70, 255]);
+            fill_rect_gradient(
+                &mut img,
+                x,
+                y,
+                x + 16.0,
+                y + 20.0,
+                [120, 132, 150, 255],
+                [52, 58, 70, 255],
+            );
+        }
+    }
+    // Door.
+    fill_rect_gradient(
+        &mut img,
+        54.0,
+        124.0,
+        74.0,
+        158.0,
+        [96, 64, 40, 255],
+        [64, 40, 24, 255],
+    );
+    img
+}
+
+/// A fence run: two shaded rails over posts. 128x48.
+fn fence_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(128, 48, |_, _| CLEAR.into());
+    for i in 0..5 {
+        let x = 8.0 + i as f32 * 28.0;
+        fill_rect_gradient(&mut img, x, 8.0, x + 7.0, 46.0, TIMBER_LIT, TIMBER_DARK);
+    }
+    fill_rect_gradient(
+        &mut img,
+        0.0,
+        14.0,
+        128.0,
+        22.0,
+        lighten(TIMBER_LIT, 0.1),
+        TIMBER_DARK,
+    );
+    fill_rect_gradient(
+        &mut img,
+        0.0,
+        30.0,
+        128.0,
+        38.0,
+        lighten(TIMBER_LIT, 0.1),
+        TIMBER_DARK,
+    );
+    img
+}
+
+/// A power pole: shaded mast, crossarm, insulators. 48x192.
+fn pole_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(48, 192, |_, _| CLEAR.into());
+    // Mast: stacked gradient segments — a single 184-row ramp quantizes
+    // into flat rows; segments keep the shade moving.
+    for i in 0..8 {
+        let y0 = 6.0 + i as f32 * 23.0;
+        fill_rect_gradient(&mut img, 20.0, y0, 28.0, y0 + 24.0, TIMBER_LIT, TIMBER_DARK);
+    }
+    fill_rect_gradient(
+        &mut img,
+        6.0,
+        22.0,
+        42.0,
+        30.0,
+        lighten(TIMBER_LIT, 0.1),
+        [88, 64, 36, 255],
+    );
+    fill_disc_shaded(
+        &mut img,
+        12.0,
+        20.0,
+        4.0,
+        [40, 44, 52, 255],
+        [90, 96, 108, 255],
+    );
+    fill_disc_shaded(
+        &mut img,
+        36.0,
+        20.0,
+        4.0,
+        [40, 44, 52, 255],
+        [90, 96, 108, 255],
+    );
+    img
+}
+
+/// A 500 m distance-marker post: white post with a shaded marker cap. 40x72.
+fn marker_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(40, 72, |_, _| CLEAR.into());
+    // Cap band.
+    fill_rect_gradient(
+        &mut img,
+        14.0,
+        10.0,
+        26.0,
+        26.0,
+        [40, 84, 168, 255],
+        [24, 52, 110, 255],
+    );
+    // Post shaft: two ramps — one 44-row ramp quantizes into flat rows.
+    fill_rect_gradient(
+        &mut img,
+        14.0,
+        26.0,
+        26.0,
+        48.0,
+        [238, 238, 234, 255],
+        [212, 212, 206, 255],
+    );
+    fill_rect_gradient(
+        &mut img,
+        14.0,
+        48.0,
+        26.0,
+        70.0,
+        [212, 212, 206, 255],
+        [188, 188, 182, 255],
+    );
+    img
+}
+
+/// A ridge boulder: two shaded grey masses. 80x56.
+fn rock_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(80, 56, |_, _| CLEAR.into());
+    fill_disc_shaded(
+        &mut img,
+        30.0,
+        34.0,
+        22.0,
+        [138, 132, 124, 255],
+        [188, 184, 176, 255],
+    );
+    fill_disc_shaded(
+        &mut img,
+        56.0,
+        38.0,
+        18.0,
+        [120, 114, 106, 255],
+        [170, 164, 156, 255],
+    );
+    img
+}
+
+/// A water tower: splayed legs, shaded tank, cone roof. 128x192.
+fn water_tower_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(128, 192, |_, _| CLEAR.into());
+    // Legs: an outer pair and an inner pair.
+    fill_rect_gradient(
+        &mut img,
+        34.0,
+        60.0,
+        42.0,
+        190.0,
+        METAL,
+        [110, 112, 120, 255],
+    );
+    fill_rect_gradient(
+        &mut img,
+        86.0,
+        60.0,
+        94.0,
+        190.0,
+        METAL,
+        [110, 112, 120, 255],
+    );
+    fill_rect_gradient(
+        &mut img,
+        52.0,
+        70.0,
+        58.0,
+        190.0,
+        [150, 152, 160, 255],
+        [104, 106, 114, 255],
+    );
+    fill_rect_gradient(
+        &mut img,
+        70.0,
+        70.0,
+        76.0,
+        190.0,
+        [150, 152, 160, 255],
+        [104, 106, 114, 255],
+    );
+    // Tank: a shaded barrel.
+    fill_round_rect_soft(&mut img, 36.0, 52.0, 92.0, 96.0, 12.0, [188, 168, 138, 255]);
+    fill_rect_gradient(
+        &mut img,
+        36.0,
+        60.0,
+        92.0,
+        96.0,
+        [204, 186, 152, 255],
+        [150, 130, 100, 255],
+    );
+    // Cone roof: stacked shrinking bands, shading as they climb.
+    let mut w = 60.0_f32;
+    let mut y = 52.0_f32;
+    while w > 8.0 {
+        fill_rect_gradient(
+            &mut img,
+            64.0 - w / 2.0,
+            y,
+            64.0 + w / 2.0,
+            y + 5.0,
+            [140, 90, 60, 255],
+            [104, 62, 40, 255],
+        );
+        w -= 7.0;
+        y -= 5.0;
+    }
+    img
+}
+
+/// A windmill: tapered stone tower and four blades shading to their tips.
+/// 128x224.
+fn windmill_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(128, 224, |_, _| CLEAR.into());
+    // Tapered tower: narrowing gradient bands.
+    for i in 0..10 {
+        let t = i as f32 / 10.0;
+        let half = 30.0 - t * 18.0;
+        let y = 214.0 - i as f32 * 16.0;
+        fill_rect_gradient(
+            &mut img,
+            64.0 - half,
+            y,
+            64.0 + half,
+            y + 17.0,
+            [176, 168, 156, 255],
+            [128, 120, 110, 255],
+        );
+    }
+    // Hub.
+    fill_disc_shaded(&mut img, 64.0, 58.0, 9.0, METAL, lighten(METAL, 0.4));
+    // Four blades: gradient segments lightening near the hub, darkening to
+    // the tip — no flat squares anywhere.
+    for (dx, dy) in [(-1.0_f32, -0.5_f32), (1.0, 0.5), (-0.4, 1.0), (0.4, -1.0)] {
+        for t in 0..26 {
+            let x = 64.0 + dx * t as f32 * 3.4;
+            let y = 58.0 + dy * t as f32 * 3.4;
+            let shade = lerp([222, 218, 210, 255], [150, 146, 138, 255], t as f32 / 26.0);
+            fill_rect_gradient(
+                &mut img,
+                x - 3.0,
+                y - 3.0,
+                x + 3.0,
+                y + 3.0,
+                lighten(shade, 0.2),
+                shade,
+            );
+        }
+    }
+    img
+}
+
+/// A billboard cluster: two shaded boards on shared posts. 128x96.
+fn billboard_frame() -> RgbaImage {
+    let mut img = RgbaImage::from_fn(128, 96, |_, _| CLEAR.into());
+    fill_rect_gradient(
+        &mut img,
+        30.0,
+        40.0,
+        38.0,
+        94.0,
+        METAL,
+        [110, 112, 120, 255],
+    );
+    fill_rect_gradient(
+        &mut img,
+        90.0,
+        40.0,
+        98.0,
+        94.0,
+        METAL,
+        [110, 112, 120, 255],
+    );
+    fill_round_rect_soft(&mut img, 8.0, 8.0, 60.0, 44.0, 3.0, SIGN_YELLOW);
+    fill_rect_gradient(
+        &mut img,
+        8.0,
+        12.0,
+        60.0,
+        44.0,
+        [240, 196, 48, 255],
+        [196, 150, 24, 255],
+    );
+    fill_round_rect_soft(&mut img, 68.0, 8.0, 120.0, 44.0, 3.0, [196, 38, 46, 255]);
+    fill_rect_gradient(
+        &mut img,
+        68.0,
+        12.0,
+        120.0,
+        44.0,
+        [214, 60, 60, 255],
+        [150, 24, 28, 255],
+    );
+    img
+}
+
 /// Packs the placeholder frames into a deterministic atlas through the
 /// `assets` crate — the same packer authored art will go through.
 pub fn pack_placeholder_atlas() -> Result<assets::PackedAtlas, assets::PackError> {
@@ -1054,14 +1454,18 @@ mod tests {
         let names: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
         // Zone dressing: palm (coast), building and fence (town), rock
         // (ridge), power pole (dense zones), 500 m marker post.
-        for name in [
-            "palm", "building", "fence", "pole", "marker", "rock",
-        ] {
-            assert!(names.contains(&name), "{name} missing — zones need their own dressing");
+        for name in ["palm", "building", "fence", "pole", "marker", "rock"] {
+            assert!(
+                names.contains(&name),
+                "{name} missing — zones need their own dressing"
+            );
         }
         // Landmarks: the large "you are here" anchors.
         for name in ["water_tower", "windmill", "billboard"] {
-            assert!(names.contains(&name), "{name} missing — landmarks ride the atlas");
+            assert!(
+                names.contains(&name),
+                "{name} missing — landmarks ride the atlas"
+            );
         }
     }
 

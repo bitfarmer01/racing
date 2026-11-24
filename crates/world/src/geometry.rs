@@ -123,6 +123,311 @@ impl RoadGeometry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 7c — world construction: the course's zone table and landmarks. All
+// data: same course, same world, no per-frame state anywhere.
+// ---------------------------------------------------------------------------
+
+/// How one zone's seeded roadside roll is spent. Weights sum to 1.0; the
+/// renderer maps each kind to its sprite. Pure data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DressingMix {
+    pub palm: f32,
+    pub tree: f32,
+    pub building: f32,
+    pub rock: f32,
+    pub bush: f32,
+    pub sign: f32,
+    pub skip: f32,
+}
+
+/// One roadside dressing kind. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DressingKind {
+    Palm,
+    Tree,
+    Building,
+    Rock,
+    Bush,
+    Sign,
+    Skip,
+}
+
+/// Resolves a zone's mix against one seeded roll in [0, 1]: kinds are walked
+/// in declaration order, each claiming its weight's share of the roll. Pure.
+pub fn pick_dressing(mix: DressingMix, roll: f32) -> DressingKind {
+    let mut cursor = 0.0;
+    for (kind, weight) in [
+        (DressingKind::Palm, mix.palm),
+        (DressingKind::Tree, mix.tree),
+        (DressingKind::Building, mix.building),
+        (DressingKind::Rock, mix.rock),
+        (DressingKind::Bush, mix.bush),
+        (DressingKind::Sign, mix.sign),
+        (DressingKind::Skip, mix.skip),
+    ] {
+        cursor += weight;
+        if roll < cursor {
+            return kind;
+        }
+    }
+    DressingKind::Skip
+}
+
+/// One named stretch of the course: its own dressing mix, grass/sky tint,
+/// and backdrop profile, so mile 100 does not look like mile 5900. `start`
+/// is the per-lap distance where the zone begins; zones tile the lap
+/// contiguously. Pure data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zone {
+    pub name: &'static str,
+    pub start: f32,
+    pub length: f32,
+    /// The zone's grass shade; the renderer pulls its alternating bands
+    /// toward this color.
+    pub grass_tint: [f32; 4],
+    /// The zone's sky shade; the renderer pulls the sky gradient toward it.
+    pub sky_tint: [f32; 4],
+    /// Scale on the backdrop ridge amplitude — coasts run low and open,
+    /// ridges tower.
+    pub backdrop_amp: f32,
+    pub dressing: DressingMix,
+    /// Whether the verge runs a continuous fence line (dense zones).
+    pub fences: bool,
+    /// Whether power poles line the road (dense zones).
+    pub poles: bool,
+}
+
+/// What the renderer consumes for one course distance: the zone's look,
+/// blended across boundary windows so neighbouring zones hand over smoothly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneSample {
+    pub name: &'static str,
+    pub grass_tint: [f32; 4],
+    pub sky_tint: [f32; 4],
+    pub backdrop_amp: f32,
+    pub dressing: DressingMix,
+    pub fences: bool,
+    pub poles: bool,
+}
+
+/// The zone table for a course: zones tile the lap and wrap per lap — three
+/// laps pass the same zones; uniformity along the road is the defect.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneLayout {
+    pub lap_length: f32,
+    /// Meters over which a boundary blends into the next zone.
+    blend: f32,
+    zones: &'static [Zone],
+}
+
+impl ZoneLayout {
+    /// The wave-7 demo course: a coast run out of the grid, a town, a
+    /// forest climb, and a ridge run back to the line — one 2 000 m lap.
+    pub const FOR_TRACK: Self = Self {
+        lap_length: 2_000.0,
+        blend: 80.0,
+        zones: &[
+            Zone {
+                name: "coast",
+                start: 0.0,
+                length: 520.0,
+                grass_tint: [0.44, 0.55, 0.28, 1.0],
+                sky_tint: [0.60, 0.80, 0.95, 1.0],
+                backdrop_amp: 0.7,
+                dressing: DressingMix {
+                    palm: 0.62,
+                    tree: 0.08,
+                    building: 0.0,
+                    rock: 0.0,
+                    bush: 0.18,
+                    sign: 0.04,
+                    skip: 0.08,
+                },
+                fences: false,
+                poles: false,
+            },
+            Zone {
+                name: "town",
+                start: 520.0,
+                length: 560.0,
+                grass_tint: [0.34, 0.48, 0.25, 1.0],
+                sky_tint: [0.68, 0.70, 0.74, 1.0],
+                backdrop_amp: 0.9,
+                dressing: DressingMix {
+                    palm: 0.0,
+                    tree: 0.06,
+                    building: 0.34,
+                    rock: 0.0,
+                    bush: 0.10,
+                    sign: 0.30,
+                    skip: 0.20,
+                },
+                fences: true,
+                poles: true,
+            },
+            Zone {
+                name: "forest",
+                start: 1080.0,
+                length: 520.0,
+                grass_tint: [0.20, 0.40, 0.20, 1.0],
+                sky_tint: [0.48, 0.64, 0.84, 1.0],
+                backdrop_amp: 1.1,
+                dressing: DressingMix {
+                    palm: 0.0,
+                    tree: 0.74,
+                    building: 0.0,
+                    rock: 0.04,
+                    bush: 0.14,
+                    sign: 0.02,
+                    skip: 0.06,
+                },
+                fences: false,
+                poles: false,
+            },
+            Zone {
+                name: "ridge",
+                start: 1600.0,
+                length: 400.0,
+                grass_tint: [0.46, 0.48, 0.32, 1.0],
+                sky_tint: [0.72, 0.80, 0.90, 1.0],
+                backdrop_amp: 1.6,
+                dressing: DressingMix {
+                    palm: 0.0,
+                    tree: 0.10,
+                    building: 0.0,
+                    rock: 0.46,
+                    bush: 0.16,
+                    sign: 0.08,
+                    skip: 0.20,
+                },
+                fences: false,
+                poles: false,
+            },
+        ],
+    };
+
+    /// The demo course's zone table.
+    pub const fn for_track() -> Self {
+        Self::FOR_TRACK
+    }
+
+    /// The zone holding `distance`, wrapping per lap (negative distances —
+    /// the camera trailing behind the line — wrap to the lap's last zone).
+    fn zone_index(&self, distance: f32) -> usize {
+        let d = distance.rem_euclid(self.lap_length);
+        let mut index = self.zones.len() - 1;
+        for (i, zone) in self.zones.iter().enumerate() {
+            if d < zone.start + zone.length {
+                index = i;
+                break;
+            }
+        }
+        index
+    }
+
+    /// The zone look at `course distance`, blended across boundary windows
+    /// so neighbouring zones hand over smoothly. Pure — same distance, same
+    /// sample, always.
+    pub fn sample(&self, distance: f32) -> ZoneSample {
+        let n = self.zones.len();
+        let i = self.zone_index(distance);
+        let zone = &self.zones[i];
+        let d = distance.rem_euclid(self.lap_length);
+        let into = d - zone.start;
+        if self.blend > 0.0 && into < self.blend {
+            // Inside the blend window: hand over from the previous zone
+            // (across the lap wrap, the last zone hands to the first).
+            let prev = &self.zones[(i + n - 1) % n];
+            let t = (into / self.blend).clamp(0.0, 1.0);
+            return ZoneSample {
+                name: zone.name,
+                grass_tint: lerp_rgb(prev.grass_tint, zone.grass_tint, t),
+                sky_tint: lerp_rgb(prev.sky_tint, zone.sky_tint, t),
+                backdrop_amp: lerp_scalar(prev.backdrop_amp, zone.backdrop_amp, t),
+                dressing: lerp_mix(prev.dressing, zone.dressing, t),
+                fences: zone.fences,
+                poles: zone.poles,
+            };
+        }
+        ZoneSample {
+            name: zone.name,
+            grass_tint: zone.grass_tint,
+            sky_tint: zone.sky_tint,
+            backdrop_amp: zone.backdrop_amp,
+            dressing: zone.dressing,
+            fences: zone.fences,
+            poles: zone.poles,
+        }
+    }
+}
+
+/// Per-channel lerp of an RGBA shade, `t` in [0, 1]. Pure.
+fn lerp_rgb(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let mut out = [0.0_f32; 4];
+    for c in 0..4 {
+        out[c] = a[c] + (b[c] - a[c]) * t;
+    }
+    out
+}
+
+fn lerp_scalar(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn lerp_mix(a: DressingMix, b: DressingMix, t: f32) -> DressingMix {
+    DressingMix {
+        palm: lerp_scalar(a.palm, b.palm, t),
+        tree: lerp_scalar(a.tree, b.tree, t),
+        building: lerp_scalar(a.building, b.building, t),
+        rock: lerp_scalar(a.rock, b.rock, t),
+        bush: lerp_scalar(a.bush, b.bush, t),
+        sign: lerp_scalar(a.sign, b.sign, t),
+        skip: lerp_scalar(a.skip, b.skip, t),
+    }
+}
+
+/// Which large one-off structure a landmark is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandmarkKind {
+    WaterTower,
+    Windmill,
+    Billboards,
+}
+
+/// A large "you are here" anchor beside the road: fixed distance per lap,
+/// fixed side, visible well before you reach it. Pure data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landmark {
+    pub kind: LandmarkKind,
+    /// Per-lap distance where the landmark stands.
+    pub distance: f32,
+    /// Signed meters from the road centreline (the demo road is 12 m wide).
+    pub lateral: f32,
+}
+
+/// The demo course's landmarks: a water tower coming out of the coast, a
+/// windmill past the town, and a billboard cluster at the forest's edge.
+pub fn course_landmarks() -> &'static [Landmark; 3] {
+    &[
+        Landmark {
+            kind: LandmarkKind::WaterTower,
+            distance: 380.0,
+            lateral: -16.0,
+        },
+        Landmark {
+            kind: LandmarkKind::Windmill,
+            distance: 940.0,
+            lateral: 20.0,
+        },
+        Landmark {
+            kind: LandmarkKind::Billboards,
+            distance: 1540.0,
+            lateral: -15.0,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,20 +568,11 @@ mod tests {
             zones.sample(200.0).grass_tint,
             zones.sample(800.0).grass_tint
         );
-        assert_ne!(
-            zones.sample(1300.0).dressing,
-            zones.sample(1800.0).dressing
-        );
+        assert_ne!(zones.sample(1300.0).dressing, zones.sample(1800.0).dressing);
         // And each boundary flips the mix across the spec'd distance.
         assert_ne!(zones.sample(500.0).dressing, zones.sample(560.0).dressing);
-        assert_ne!(
-            zones.sample(1060.0).dressing,
-            zones.sample(1120.0).dressing
-        );
-        assert_ne!(
-            zones.sample(1580.0).dressing,
-            zones.sample(1640.0).dressing
-        );
+        assert_ne!(zones.sample(1060.0).dressing, zones.sample(1120.0).dressing);
+        assert_ne!(zones.sample(1580.0).dressing, zones.sample(1640.0).dressing);
     }
 
     #[test]
@@ -343,7 +639,19 @@ mod tests {
         assert_eq!(pick_dressing(mix, 0.10), DressingKind::Palm);
         assert_eq!(pick_dressing(mix, 0.60), DressingKind::Tree);
         assert_eq!(pick_dressing(mix, 0.80), DressingKind::Bush);
-        assert_eq!(pick_dressing(mix, 0.95), DressingKind::Sign);
-        assert_eq!(pick_dressing(mix, 0.999), DressingKind::Skip);
+        assert_eq!(pick_dressing(mix, 0.90), DressingKind::Sign);
+        // This mix allots no skip weight, so the whole tail is signs.
+        assert_eq!(pick_dressing(mix, 0.999), DressingKind::Sign);
+        // With skip weight, the tail skips.
+        let skippy = DressingMix {
+            palm: 0.9,
+            tree: 0.0,
+            building: 0.0,
+            rock: 0.0,
+            bush: 0.0,
+            sign: 0.0,
+            skip: 0.1,
+        };
+        assert_eq!(pick_dressing(skippy, 0.95), DressingKind::Skip);
     }
 }
