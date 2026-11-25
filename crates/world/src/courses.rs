@@ -486,8 +486,8 @@ mod tests {
             "distinct courses must not share the demo's lap length"
         );
         assert_ne!(
-            sampled_sequence(&a.layout, &EXPECTED[0].3),
-            sampled_sequence(&b.layout, &EXPECTED[1].3),
+            sampled_sequence(&a.layout, EXPECTED[0].3),
+            sampled_sequence(&b.layout, EXPECTED[1].3),
             "distinct ids must resolve to distinct zone sequences"
         );
     }
