@@ -312,6 +312,18 @@ impl ZoneLayout {
         Self::FOR_TRACK
     }
 
+    /// Builds a layout from a course's own zone table — the data-facing
+    /// constructor the wave-8 course catalog consumes (`crates/world/src/
+    /// courses.rs`). `zones` must tile the lap contiguously from 0; the
+    /// course-catalog tests pin that contract.
+    pub const fn from_zones(lap_length: f32, blend: f32, zones: &'static [Zone]) -> Self {
+        Self {
+            lap_length,
+            blend,
+            zones,
+        }
+    }
+
     /// The zone holding `distance`, wrapping per lap (negative distances —
     /// the camera trailing behind the line — wrap to the lap's last zone).
     fn zone_index(&self, distance: f32) -> usize {

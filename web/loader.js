@@ -1,7 +1,7 @@
 // Loader: picks the wasm bundle matching the browser's GPU backend, boots it,
 // and drives the frame loop.
 import { badgeForState } from './badge.js';
-import { DEMO_ZONES, buildZoneMarkers, highlightZone } from './zones.js';
+import { COURSES, buildZoneMarkers, highlightZone } from './zones.js';
 import { RaceTimer, formatTime } from './race-timer.js';
 import { RaceAudio } from './audio.js';
 //
@@ -26,6 +26,7 @@ import { RaceAudio } from './audio.js';
 
 const overlay = document.getElementById('overlay');
 const status = document.getElementById('status');
+const trackSelect = document.getElementById('track-select');
 const hud = document.getElementById('hud');
 const speedValue = document.getElementById('speed-value');
 const hudPos = document.getElementById('hud-pos');
@@ -134,6 +135,12 @@ async function boot() {
   const lowEnd = detectLowEndDevice();
   const hasWebGpu = await detectWebGpu();
 
+  // Boot-time track selection (wave 8): the overlay's control carries the
+  // catalog slug; the wasm boundary resolves it and boots that course. Read
+  // once here — no mid-race switching (spec: locked decision), and the
+  // restart path re-boots the same course wasm-side.
+  const courseId = trackSelect.value;
+
   let glue;
   if (hasWebGpu) {
     setStatus('Loading WebGPU build…');
@@ -152,7 +159,7 @@ async function boot() {
   setStatus('Booting…');
   let game;
   try {
-    game = await glue.BrowserGame.boot(canvas, lowEnd);
+    game = await glue.BrowserGame.boot(canvas, lowEnd, courseId);
   } catch (bootError) {
     if (!hasWebGpu) throw bootError;
     // The WebGPU adapter probed fine but bring-up failed (context loss,
@@ -160,7 +167,7 @@ async function boot() {
     console.warn('WebGPU boot failed, falling back to WebGL2:', bootError);
     setStatus('Falling back to WebGL2 build…');
     glue = await importBundle('pkg-webgl2');
-    game = await glue.BrowserGame.boot(canvas, lowEnd);
+    game = await glue.BrowserGame.boot(canvas, lowEnd, courseId);
   }
 
   console.info(`racing: booted the ${glue.backend_name()} build`);
@@ -173,10 +180,13 @@ async function boot() {
   // from the lap counter the HUD already reads.
   const timer = new RaceTimer();
 
-  // Zone ticks + labels on the lap bar. DEMO_ZONES is presentation config
-  // duplicated from crates/world/src/geometry.rs (ZoneLayout::FOR_TRACK) —
-  // that file is the demo course's source of truth; the course is fixed.
-  const zoneMarkers = buildZoneMarkers(DEMO_ZONES, game.lap_length());
+  // Zone ticks + labels on the lap bar, from the selected course's own
+  // presentation table (zones.js COURSES mirrors crates/world's catalog).
+  // An unknown value cannot reach here — the wasm boot already failed it —
+  // but guard anyway rather than render a markerless bar.
+  const selectedCourse =
+    COURSES.find((course) => course.id === courseId) ?? COURSES[0];
+  const zoneMarkers = buildZoneMarkers(selectedCourse.zones, game.lap_length());
   lapBar.appendChild(zoneMarkers);
 
   const keys = {
@@ -369,7 +379,7 @@ async function boot() {
     );
     const progressPct = `${(Math.min(game.lap_progress(), 1) * 100).toFixed(1)}%`;
     if (lapFill.style.width !== progressPct) lapFill.style.width = progressPct;
-    highlightZone(zoneMarkers, DEMO_ZONES, game.player_distance());
+    highlightZone(zoneMarkers, selectedCourse.zones, game.player_distance());
 
     // Combat stamina: amber bar while fighting, red once it runs low.
     const stamina = Math.min(Math.max(game.player_stamina(), 0), 1);
