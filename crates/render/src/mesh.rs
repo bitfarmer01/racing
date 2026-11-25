@@ -95,6 +95,25 @@ impl Mat {
     }
 }
 
+/// One cross-section of a [`MeshBuilder::loft`].
+#[derive(Debug, Clone, Copy)]
+pub struct Section {
+    pub c: Vec3,
+    pub w: f32,
+    pub h: f32,
+    pub square: f32,
+}
+
+impl Section {
+    pub const fn new(c: Vec3, w: f32, h: f32, square: f32) -> Self {
+        Self { c, w, h, square }
+    }
+
+    pub const fn round(c: Vec3, r: f32) -> Self {
+        Self::new(c, r, r, 2.0)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MeshBuilder {
     pub vertices: Vec<Vertex>,
@@ -325,6 +344,93 @@ impl MeshBuilder {
                 self.quad_idx(a, a + w, a + w + 1, a + 1);
             }
         }
+    }
+
+    /// Smooth body through a run of cross-sections: each is a centre, a
+    /// half width along `side`, a half height, and a squareness (2 = round,
+    /// higher = boxier). Rings sit across the run's direction; normals come
+    /// from the surface itself, so tapers and bends shade smoothly. Ends are
+    /// capped.
+    pub fn loft(&mut self, sections: &[Section], side: Vec3, seg: u32, m: &Mat) {
+        let n = sections.len();
+        if n < 2 {
+            return;
+        }
+        let side = side.normalize();
+        let ring = |k: usize| -> Vec<Vec3> {
+            let a = sections[k.saturating_sub(1)].c;
+            let b = sections[(k + 1).min(n - 1)].c;
+            let t = (b - a).normalize_or_zero();
+            let right = (side - t * side.dot(t)).normalize_or_zero();
+            let up = t.cross(right).normalize_or_zero();
+            let s = sections[k];
+            (0..seg)
+                .map(|i| {
+                    let th = i as f32 / seg as f32 * std::f32::consts::TAU;
+                    let (sn, cs) = th.sin_cos();
+                    let e = 2.0 / s.square.max(1.0);
+                    let x = cs.signum() * cs.abs().powf(e) * s.w;
+                    let y = sn.signum() * sn.abs().powf(e) * s.h;
+                    s.c + right * x + up * y
+                })
+                .collect()
+        };
+        let grid: Vec<Vec<Vec3>> = (0..n).map(ring).collect();
+        let seg_u = seg as usize;
+        let start = self.vertices.len() as u32;
+        for k in 0..n {
+            for i in 0..=seg_u {
+                let ii = i % seg_u;
+                let du = grid[k][(ii + 1) % seg_u] - grid[k][(ii + seg_u - 1) % seg_u];
+                let dv = grid[(k + 1).min(n - 1)][ii] - grid[k.saturating_sub(1)][ii];
+                let mut nrm = dv.cross(du).normalize_or_zero();
+                // Point the normal away from the section centre.
+                if nrm.dot(grid[k][ii] - sections[k].c) < 0.0 {
+                    nrm = -nrm;
+                }
+                let uv = Vec2::new(i as f32 / seg as f32, k as f32 / (n - 1) as f32);
+                self.vertex(grid[k][ii], nrm, uv, m);
+            }
+        }
+        let w = seg + 1;
+        for k in 0..(n as u32 - 1) {
+            for i in 0..seg {
+                let a = start + k * w + i;
+                self.quad_idx(a, a + 1, a + w + 1, a + w);
+            }
+        }
+        for (k, out) in [(0usize, -1.0f32), (n - 1, 1.0)] {
+            let a = sections[k.saturating_sub(1)].c;
+            let b = sections[(k + 1).min(n - 1)].c;
+            let t = (b - a).normalize_or_zero() * out;
+            let centre = self.vertex(sections[k].c, t, Vec2::splat(0.5), m);
+            let first = self.vertices.len() as u32;
+            for p in &grid[k] {
+                self.vertex(*p, t, Vec2::ZERO, m);
+            }
+            for i in 0..seg {
+                self.tri(centre, first + i, first + (i + 1) % seg);
+            }
+        }
+    }
+
+    /// Round limb from `a` to `b`, radius `ra` to `rb`, with a ball joint at
+    /// each end so bent limbs stay closed.
+    pub fn limb(&mut self, a: Vec3, b: Vec3, ra: f32, rb: f32, m: &Mat) {
+        let d = (b - a).normalize_or_zero();
+        let side = if d.x.abs() > 0.8 { Vec3::Z } else { Vec3::X };
+        self.loft(
+            &[
+                Section::round(a, ra),
+                Section::round(a.lerp(b, 0.5), (ra + rb) * 0.5 * 1.04),
+                Section::round(b, rb),
+            ],
+            side,
+            8,
+            m,
+        );
+        self.sphere(a, Vec3::splat(ra), 4, 8, m);
+        self.sphere(b, Vec3::splat(rb), 4, 8, m);
     }
 
     pub fn append(&mut self, other: &MeshBuilder) {

@@ -66,6 +66,21 @@ pub struct BikeDraw {
     /// Thrown-rider offset in bike space, and tumble angle.
     pub rider_offset: Vec3,
     pub rider_spin: f32,
+    /// Rider hanging off the inside, -1 (left) .. 1 (right).
+    pub hang: f32,
+    /// 0..1 rider folded down behind the screen.
+    pub tuck: f32,
+    /// Fork and shock compression in metres.
+    pub susp_front: f32,
+    pub susp_rear: f32,
+    /// Kick, -1 (left leg) .. 1 (right leg).
+    pub kick: f32,
+    /// 0..1 guard up.
+    pub block: f32,
+    /// Height of the ground under the bike (for its contact shadow).
+    pub ground_y: f32,
+    /// 0..1 contact-shadow strength: 1 on the road, fading as it leaves it.
+    pub contact: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +137,18 @@ struct Globals {
     sand: [f32; 4],
     params: [f32; 4],
     params2: [f32; 4],
+    /// Per bike: ground contact x, y, z and heading.
+    contacts: [[f32; 4]; MAX_CONTACTS],
+    /// Contact-shadow strength per bike, four to a vec4.
+    contact_w: [[f32; 4]; MAX_CONTACTS / 4],
 }
+
+/// Contact shadows are drawn this far from the camera (m); keep in step
+/// with `CONTACT_RANGE` in common.wgsl.
+const CONTACT_RANGE: f32 = 70.0;
+
+/// Bikes that get a contact shadow on the ground.
+const MAX_CONTACTS: usize = 8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -153,6 +179,8 @@ struct BikeInstance {
     paint2: [f32; 4],
     anim: [f32; 4],
     rider: [f32; 4],
+    pose: [f32; 4],
+    act: [f32; 4],
 }
 
 #[repr(C)]
@@ -382,9 +410,10 @@ fn pipeline(device: &wgpu::Device, d: PipeDesc) -> wgpu::RenderPipeline {
 
 const PROP_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![5 => Float32x4, 6 => Float32x4];
-const BIKE_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+const BIKE_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
     5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4,
     9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 12 => Float32x4,
+    13 => Float32x4, 14 => Float32x4,
 ];
 const PARTICLE_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
@@ -1013,6 +1042,21 @@ impl Renderer {
         };
         let cam = input.camera.pos;
         let texel = 1.0 / self.settings.shadow_size as f32;
+        let mut contacts = [[0.0; 4]; MAX_CONTACTS];
+        let mut contact_w = [[0.0; 4]; MAX_CONTACTS / 4];
+        // Only bikes near the camera cast one (the patch is a few pixels
+        // past that), packed first so the shader stops at the first gap.
+        let near = input.bikes.iter().filter(|b| {
+            let w = b.contact * (1.0 - b.ghost);
+            w > 0.0
+                && b.model.w_axis.truncate().distance_squared(cam) < CONTACT_RANGE * CONTACT_RANGE
+        });
+        for (i, b) in near.take(MAX_CONTACTS).enumerate() {
+            let p = b.model.w_axis;
+            let f = -b.model.z_axis;
+            contacts[i] = [p.x, b.ground_y, p.z, f.z.atan2(f.x)];
+            contact_w[i / 4][i % 4] = b.contact * (1.0 - b.ghost);
+        }
         Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -1035,6 +1079,8 @@ impl Renderer {
                 w.half_width + RUNOFF + 1.2 - 2.4,
             ],
             params2: [w.half_width, 1.0, texel, w.length - 120.0],
+            contacts,
+            contact_w,
         }
     }
 
@@ -1055,8 +1101,10 @@ impl Renderer {
             c.x + SHADOW_HALF,
             c.y - SHADOW_HALF,
             c.y + SHADOW_HALF,
-            -c.z - 400.0,
-            -c.z + 250.0,
+            // A tight depth range keeps the depth bias small in metres, so
+            // tyres and feet still cast a shadow where they meet the road.
+            -c.z - 180.0,
+            -c.z + 120.0,
         );
         proj * view
     }
@@ -1157,6 +1205,8 @@ impl Renderer {
                     b.rider_offset.z,
                     b.rider_spin,
                 ],
+                pose: [b.hang, b.tuck, b.susp_front, b.susp_rear],
+                act: [b.kick, b.block, 0.0, 0.0],
             })
             .collect();
         self.bike_buf

@@ -93,10 +93,12 @@ export class Game {
      * @param {boolean} analog_steer
      * @param {boolean} boost
      * @param {boolean} attack
+     * @param {boolean} kick
+     * @param {boolean} block
      * @returns {Float32Array}
      */
-    frame(dt, throttle, brake, steer, analog_steer, boost, attack) {
-        const ret = wasm.game_frame(this.__wbg_ptr, dt, throttle, brake, steer, analog_steer, boost, attack);
+    frame(dt, throttle, brake, steer, analog_steer, boost, attack, kick, block) {
+        const ret = wasm.game_frame(this.__wbg_ptr, dt, throttle, brake, steer, analog_steer, boost, attack, kick, block);
         var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
         return v1;
@@ -182,13 +184,24 @@ export class Game {
         }
     }
     /**
-     * Starts a race the player drives, on `slug`.
+     * Starts a race the player drives, on `slug`, at `difficulty`
+     * (`easy`, `normal` or `hard`; anything else is normal).
      * @param {string} slug
+     * @param {string} difficulty
      */
-    start_race(slug) {
-        const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        wasm.game_start_race(this.__wbg_ptr, ptr0, len0);
+    start_race(slug, difficulty) {
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(difficulty, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        wasm.game_start_race(this.__wbg_ptr, ptr0, len0, ptr1, len1);
     }
     /**
      * Draw calls, triangles and visible props in the last frame.

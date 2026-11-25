@@ -5,7 +5,7 @@
 import { RaceAudio } from './audio.js';
 import {
   HUD, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
-  ResolutionGovernor,
+  ResolutionGovernor, DIFFICULTIES, pickDifficulty,
 } from './hud.js';
 import { applyStyle, canvasPalette, direct, prefersReducedMotion } from './design.js';
 
@@ -21,7 +21,7 @@ function replaceCanvas() {
 const ui = {
   boot: $('boot'), bootStatus: $('boot-status'), menu: $('menu'), tracks: $('tracks'), start: $('start'),
   hud: $('hud'), pos: $('h-pos'), suf: $('h-suf'), of: $('h-of'), lap: $('h-lap'), time: $('h-time'), best: $('h-best'),
-  bal: $('h-bal'), speed: $('h-speed'), gear: $('h-gear'), boost: $('h-boost'), boostLbl: $('h-boostlbl'), draft: $('draft'),
+  bal: $('h-bal'), guard: $('h-guard'), strike: $('h-strike'), levels: $('levels'), speed: $('h-speed'), gear: $('h-gear'), boost: $('h-boost'), boostLbl: $('h-boostlbl'), draft: $('draft'),
   count: $('count'), banner: $('banner'), toast: $('toast'), hint: $('hint'), flash: $('flash'),
   tach: $('tach'), minimap: $('minimap'),
   pause: $('pause'), pauseSub: $('pause-sub'), resume: $('resume'), restart: $('restart'), quit: $('quit'),
@@ -98,16 +98,21 @@ async function boot() {
 // --------------------------------------------------------------- input ----
 
 const keys = new Set();
+// Punch and kick fire once per press; guard is held.
 let attackLatch = false;
+let kickLatch = false;
 const KEYMAP = {
   throttle: ['KeyW', 'ArrowUp'],
   brake: ['KeyS', 'ArrowDown'],
   left: ['KeyA', 'ArrowLeft'],
   right: ['KeyD', 'ArrowRight'],
   boost: ['ShiftLeft', 'ShiftRight', 'Space'],
+  guard: ['KeyQ', 'KeyL'],
 };
+const PUNCH_KEYS = ['KeyX', 'KeyJ'];
+const KICK_KEYS = ['KeyZ', 'KeyK'];
 const held = (k) => KEYMAP[k].some((c) => keys.has(c));
-const GAME_KEYS = new Set([...Object.values(KEYMAP).flat(), 'KeyX', 'KeyC']);
+const GAME_KEYS = new Set([...Object.values(KEYMAP).flat(), ...PUNCH_KEYS, ...KICK_KEYS, 'KeyC']);
 
 function readInput() {
   let throttle = held('throttle') ? 1 : 0;
@@ -116,7 +121,10 @@ function readInput() {
   let analog = false;
   let boost = held('boost');
   let attack = attackLatch;
+  let kick = kickLatch;
+  let block = held('guard');
   attackLatch = false;
+  kickLatch = false;
   const pad = navigator.getGamepads ? [...navigator.getGamepads()].find((p) => p && p.connected) : null;
   if (pad) {
     const b = (i) => pad.buttons[i] || { pressed: false, value: 0 };
@@ -127,12 +135,15 @@ function readInput() {
     }
     throttle = Math.max(throttle, b(7).value, b(0).pressed ? 1 : 0);
     brake = Math.max(brake, b(6).value);
-    boost = boost || b(5).pressed || b(4).pressed;
-    attack = attack || padEdge(pad, 2) || padEdge(pad, 1);
+    boost = boost || b(5).pressed;
+    // X punches, B kicks, left bumper holds the guard.
+    attack = attack || padEdge(pad, 2);
+    kick = kick || padEdge(pad, 1);
+    block = block || b(4).pressed;
     if (padEdge(pad, 3)) cycleCamera();
     if (padEdge(pad, 9)) onEscape();
   }
-  return { throttle, brake, steer, analog, boost, attack };
+  return { throttle, brake, steer, analog, boost, attack, kick, block };
 }
 
 const padPrev = new Map();
@@ -149,6 +160,7 @@ let game = null;
 let wasm = null;
 let tracks = [];
 let selected = 0;
+let difficulty = pickDifficulty(localStorage.getItem('difficulty'));
 let mode = 'menu'; // menu | race | paused | results
 let outline = null;
 let mapper = null;
@@ -182,6 +194,25 @@ function renderTrackList() {
     b.addEventListener('dblclick', startRace);
     ui.tracks.appendChild(b);
   });
+}
+
+function renderLevels() {
+  ui.levels.innerHTML = '';
+  for (const d of DIFFICULTIES) {
+    const b = document.createElement('button');
+    b.className = 'level' + (d.slug === difficulty ? ' sel' : '');
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', String(d.slug === difficulty));
+    b.innerHTML = '<b></b><small></small>';
+    b.querySelector('b').textContent = d.name;
+    b.querySelector('small').textContent = d.blurb;
+    b.addEventListener('click', () => {
+      difficulty = d.slug;
+      localStorage.setItem('difficulty', difficulty);
+      renderLevels();
+    });
+    ui.levels.appendChild(b);
+  }
 }
 
 function selectTrack(i) {
@@ -222,7 +253,7 @@ function startRace() {
   ui.hint.style.opacity = '1';
   setTimeout(() => (ui.hint.style.opacity = '0'), 9000);
   ui.toast.innerHTML = '';
-  game.start_race(tracks[selected].slug);
+  game.start_race(tracks[selected].slug, difficulty);
   loadMap();
   canvasEl.focus();
 }
@@ -349,6 +380,8 @@ function updateHud(h) {
   const bal = Math.max(0, Math.min(1, h[HUD.BALANCE] / 100));
   ui.bal.style.width = `${Math.round(bal * 100)}%`;
   ui.bal.classList.toggle('low', bal < 0.35);
+  ui.guard.classList.toggle('on', h[HUD.GUARD] > 0.5);
+  ui.strike.classList.toggle('on', h[HUD.STRIKE_READY] > 0);
   drawTach(h[HUD.RPM], h[HUD.BOOSTING] > 0);
 
   const cd = h[HUD.COUNTDOWN];
@@ -434,6 +467,9 @@ function handleCues(cues, h) {
 
 let last = performance.now();
 let lastScale = 1;
+const IDLE_INPUT = Object.freeze({
+  throttle: 0, brake: 0, steer: 0, analog: false, boost: false, attack: false, kick: false, block: false,
+});
 
 function frame(now) {
   const dtMs = now - last;
@@ -448,9 +484,11 @@ function frame(now) {
   }
 
   const playing = mode === 'race';
-  const input = playing ? readInput() : { throttle: 0, brake: 0, steer: 0, analog: false, boost: false, attack: false };
+  const input = playing ? readInput() : IDLE_INPUT;
   if (!playing && navigator.getGamepads) pollMenuPad();
-  const cues = decodeCues(game.frame(dt, input.throttle, input.brake, input.steer, input.analog, input.boost, input.attack));
+  const cues = decodeCues(
+    game.frame(dt, input.throttle, input.brake, input.steer, input.analog, input.boost, input.attack, input.kick, input.block),
+  );
 
   if (mode === 'race' || mode === 'paused' || mode === 'results') {
     const h = game.hud();
@@ -498,7 +536,12 @@ window.addEventListener('keydown', (e) => {
       onEscape();
       break;
     case 'KeyX':
+    case 'KeyJ':
       attackLatch = true;
+      break;
+    case 'KeyZ':
+    case 'KeyK':
+      kickLatch = true;
       break;
     case 'KeyC':
       cycleCamera();
@@ -561,6 +604,7 @@ window.addEventListener('pointerdown', () => audio.unlock(), { once: false });
       applyEffects();
     });
     renderTrackList();
+    renderLevels();
     if (localStorage.getItem('muted')) {
       audio.setMuted(true);
       ui.mute.textContent = '🔇';

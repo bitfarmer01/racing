@@ -5,12 +5,26 @@ export const HUD = Object.freeze({
   POSITION: 0, RACERS: 1, LAP: 2, LAPS: 3, LAP_TIME: 4, LAST_LAP: 5, BEST_LAP: 6,
   RACE_TIME: 7, SPEED: 8, GEAR: 9, RPM: 10, BOOST: 11, BOOSTING: 12, COUNTDOWN: 13,
   WRONG_WAY: 14, CRASHED: 15, FINISHED: 16, BALANCE: 17, PROGRESS: 18, DRAFTING: 19, PAUSED: 20,
+  GUARD: 21, STRIKE_READY: 22,
 });
 
 // Cue codes from Game.frame() (crates/web/src/lib.rs, pack_cues).
 export const CUE = Object.freeze({
   BEEP: 1, GO: 2, WALL: 3, CONTACT: 4, HIT_LANDED: 5, GOT_HIT: 6, CRASH: 7, LAP: 8, FINISHED: 9, OVERTAKE: 10,
+  GUARDED: 11, PARRIED: 12, WAS_PARRIED: 13, KNOCKOFF: 14, LAUNCH: 15,
 });
+
+// Difficulty levels (crates/game/src/difficulty.rs) for the menu.
+export const DIFFICULTIES = Object.freeze([
+  { slug: 'easy', name: 'Easy', blurb: 'Rivals wait for you and hit softer' },
+  { slug: 'normal', name: 'Normal', blurb: 'A fair fight at full race pace' },
+  { slug: 'hard', name: 'Hard', blurb: 'Quicker, braver rivals who block and parry' },
+]);
+
+// A stored slug if it names a level, otherwise 'normal'.
+export function pickDifficulty(stored) {
+  return DIFFICULTIES.some((d) => d.slug === stored) ? stored : 'normal';
+}
 
 export const REDLINE_RPM = 12500;
 export const MAX_RPM = 14000;

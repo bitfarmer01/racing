@@ -27,6 +27,10 @@ struct Globals {
     params: vec4<f32>,
     // x half width, y wind, z shadow texel size, w lamp skip end (s)
     params2: vec4<f32>,
+    // Per bike: ground contact xyz and heading.
+    contacts: array<vec4<f32>, 8>,
+    // Contact-shadow strength per bike, four to a vec4.
+    contact_w: array<vec4<f32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -158,4 +162,38 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32, metal: f32, 
     let env_dim = mix(1.0, 0.25, rough);
     col = col + env * fe * env_dim * ao * mix(0.6, 1.0, shadow);
     return col;
+}
+
+// Soft dark patch where each bike meets the ground: a long ellipse under
+// the bike and a tight spot under each tyre. Returns 0 (none) .. 1.
+// Bikes are packed first, so the loop ends at the first empty slot, and
+// nothing past CONTACT_RANGE (renderer.rs) has one.
+const CONTACT_RANGE: f32 = 72.0;
+
+fn contact_shadow(wp: vec3<f32>) -> f32 {
+    var occ = 0.0;
+    let to_cam = wp - g.cam_pos.xyz;
+    if (dot(to_cam, to_cam) > CONTACT_RANGE * CONTACT_RANGE) {
+        return 0.0;
+    }
+    for (var i = 0; i < 8; i = i + 1) {
+        let w = g.contact_w[i / 4][i % 4];
+        if (w <= 0.0) {
+            break;
+        }
+        let c = g.contacts[i];
+        let d = wp - c.xyz;
+        if (abs(d.y) > 0.6 || dot(d.xz, d.xz) > 4.0) {
+            continue;
+        }
+        let f = vec2<f32>(cos(c.w), sin(c.w));
+        let along = dot(d.xz, f);
+        let across = d.x * -f.y + d.z * f.x;
+        let body = exp(-(along * along) / 0.7 - (across * across) / 0.06);
+        let fa = along - 0.72;
+        let ra = along + 0.70;
+        let tyres = exp(-(fa * fa * 0.6 + across * across) / 0.01) + exp(-(ra * ra * 0.6 + across * across) / 0.012);
+        occ = max(occ, clamp(body * 0.7 + tyres, 0.0, 1.0) * w * (1.0 - abs(d.y) / 0.6));
+    }
+    return occ;
 }

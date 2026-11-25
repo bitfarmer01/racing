@@ -35,6 +35,11 @@ pub const WHEEL_RADIUS: f32 = 0.32;
 /// Boost meter drain per second while boosting.
 pub const BOOST_DRAIN: f32 = 0.30;
 pub const BOOST_REFILL: f32 = 0.035;
+/// Static suspension sag and travel, metres.
+pub const SUSP_SAG: f32 = 0.03;
+pub const SUSP_TRAVEL: f32 = 0.11;
+/// Top-speed gain when fully tucked.
+pub const TUCK_GAIN: f32 = 0.025;
 pub const GEAR_TOPS: [f32; 6] = [14.0, 24.0, 34.0, 45.0, 57.0, BOOST_TOP_SPEED];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -46,7 +51,13 @@ pub struct Controls {
     /// -1 (left) .. 1 (right)
     pub steer: f32,
     pub boost: bool,
+    /// Punch towards the nearest bike alongside.
     pub attack: bool,
+    /// Kick: slower, longer reach, hits harder.
+    pub kick: bool,
+    /// Guard up: soaks most of a hit; raised just before one lands, it
+    /// parries. The rider sits up, so the bike pulls a little less.
+    pub block: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +131,13 @@ pub struct Bike {
     pub rider_offset: Vec3,
     pub rider_vel: Vec3,
     pub rider_spin: f32,
+    /// Fork and shock compression (m) and their rates.
+    pub susp: [f32; 2],
+    pub susp_vel: [f32; 2],
+    /// 0..1 rider folded behind the screen: flat out in a straight line.
+    pub tuck: f32,
+    /// Seconds of wheelspin left from a botched start.
+    pub wheelspin: f32,
 }
 
 impl Bike {
@@ -154,6 +172,10 @@ impl Bike {
             rider_offset: Vec3::ZERO,
             rider_vel: Vec3::ZERO,
             rider_spin: 0.0,
+            susp: [SUSP_SAG; 2],
+            susp_vel: [0.0; 2],
+            tuck: 0.0,
+            wheelspin: 0.0,
         }
     }
 
@@ -225,6 +247,7 @@ impl Bike {
 
         let fwd = self.fwd();
         let right = self.right();
+        let v_long_before = self.vel.dot(fwd);
         let mut v_long = self.vel.dot(fwd);
         let mut v_lat = self.vel.dot(right);
         let speed = self.vel.length();
@@ -251,8 +274,12 @@ impl Bike {
             TOP_SPEED
         } else {
             OFFROAD_TOP_SPEED
-        } * self.tuning.top_speed;
-        let traction = if self.on_ground { 1.0 } else { 0.0 };
+        } * self.tuning.top_speed
+            * (1.0 + TUCK_GAIN * self.tuck);
+        // A botched start spins the rear tyre: drive goes up in smoke.
+        self.wheelspin = (self.wheelspin - dt).max(0.0);
+        let spin_loss = if self.wheelspin > 0.0 { 0.3 } else { 1.0 };
+        let traction = if self.on_ground { spin_loss } else { 0.0 };
         let mut a = 0.0;
         if v_long < top {
             let frac = (v_long.max(0.0) / top).min(1.0);
@@ -373,6 +400,7 @@ impl Bike {
         let cap = horiz * 0.1 + 0.5;
         let ground_vy = ((ground - prev_ground) / dt).clamp(-cap - 30.0, cap);
         let gap = self.pos.y - ground;
+        let vy_before = self.vy;
         let pull = if gap < 0.8 { GRAVITY * 2.5 } else { GRAVITY };
         self.vy -= pull * dt;
         self.pos.y += self.vy * dt;
@@ -404,6 +432,56 @@ impl Bike {
         self.lean += (lean_target - self.lean) * (1.0 - (-9.0 * dt).exp());
         self.wheel_angle = (self.wheel_angle + v_long / WHEEL_RADIUS * dt) % std::f32::consts::TAU;
         self.update_engine(v_long);
+
+        // Tuck in a straight line flat out; sit up to brake, turn or fight.
+        let flat_out = self.on_ground
+            && self.brake < 0.05
+            && self.throttle > 0.9
+            && self.steer.abs() < 0.25
+            && v_long > 30.0;
+        let tuck_target = if flat_out || self.boosting { 1.0 } else { 0.0 };
+        self.tuck += (tuck_target - self.tuck) * (1.0 - (-4.0 * dt).exp());
+
+        let a_long = (v_long - v_long_before) / dt;
+        let a_vert = if self.on_ground {
+            (self.vy - vy_before) / dt
+        } else {
+            0.0
+        };
+        self.update_suspension(a_long, a_vert, on_road, fx.landed, dt);
+    }
+
+    /// Fork and shock as two springs: braking dives the front, drive squats
+    /// the rear, crests and dips load both, landings bottom them out.
+    fn update_suspension(&mut self, a_long: f32, a_vert: f32, on_road: bool, landed: f32, dt: f32) {
+        let heave = if self.on_ground {
+            (a_vert * 0.0025).clamp(-0.025, 0.05)
+        } else {
+            -SUSP_SAG
+        };
+        let pitch = (a_long * 0.0022).clamp(-0.05, 0.035);
+        // Grass is bumpy.
+        let rough = if on_road || !self.on_ground {
+            0.0
+        } else {
+            (self.track_pos.s * 9.1).sin() * 0.012 + (self.track_pos.s * 23.7).sin() * 0.006
+        };
+        let target = [
+            SUSP_SAG + heave - pitch + rough,
+            SUSP_SAG + heave + pitch * 0.8 - rough,
+        ];
+        for ((x, v), t) in self.susp.iter_mut().zip(&mut self.susp_vel).zip(target) {
+            if landed > 0.0 {
+                *v += landed * 0.06;
+            }
+            let acc = 260.0 * (t - *x) - 22.0 * *v;
+            *v += acc * dt;
+            *x += *v * dt;
+            if *x < 0.0 || *x > SUSP_TRAVEL {
+                *x = x.clamp(0.0, SUSP_TRAVEL);
+                *v *= -0.2;
+            }
+        }
     }
 
     fn update_engine(&mut self, v_long: f32) {
@@ -500,6 +578,10 @@ impl Bike {
         self.rider_vel = Vec3::ZERO;
         self.rider_spin = 0.0;
         self.slip = 0.0;
+        self.susp = [SUSP_SAG; 2];
+        self.susp_vel = [0.0; 2];
+        self.tuck = 0.0;
+        self.wheelspin = 0.0;
         self.relocate(track);
     }
 
@@ -622,5 +704,38 @@ mod tests {
         assert!(b.is_riding());
         assert!(b.ghost > 0.0);
         assert!(b.track_pos.lateral.abs() < track.half_width);
+    }
+
+    #[test]
+    fn suspension_dives_under_braking_and_tucks_flat_out() {
+        let track = Track::build(catalog()[0]);
+        let mut b = straight_test(&track);
+        b.vel = b.fwd() * 40.0;
+        let flat = Controls {
+            throttle: 1.0,
+            ..Controls::default()
+        };
+        for _ in 0..(1.2 / DT) as usize {
+            b.step(&track, &flat, DT);
+        }
+        assert!(
+            b.tuck > 0.8,
+            "tucked at {:.0} m/s: {}",
+            b.forward_speed(),
+            b.tuck
+        );
+        let settled = b.susp[0];
+        let brake = Controls {
+            brake: 1.0,
+            ..Controls::default()
+        };
+        let mut deepest: f32 = 0.0;
+        for _ in 0..(0.4 / DT) as usize {
+            b.step(&track, &brake, DT);
+            deepest = deepest.max(b.susp[0]);
+        }
+        assert!(deepest > settled + 0.02, "fork {settled} -> {deepest}");
+        assert!(b.tuck < 0.5, "sat up to brake");
+        assert!(b.susp.iter().all(|x| (0.0..=SUSP_TRAVEL).contains(x)));
     }
 }

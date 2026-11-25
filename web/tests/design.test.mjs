@@ -27,7 +27,7 @@ test('canvasPalette falls back to the shared palette', () => {
 });
 
 const hud = () => {
-  const h = new Array(22).fill(0);
+  const h = new Array(23).fill(0);
   h[HUD.POSITION] = 3;
   h[HUD.LAPS] = 3;
   h[HUD.BEST_LAP] = 61.25;
@@ -61,4 +61,15 @@ test('harder wall hits flash harder, capped', () => {
   assert.ok(hard > soft);
   assert.ok(hard <= 0.8);
   assert.ok(direct({ code: CUE.FINISHED, a: 1, b: 0 }, hud()).finished);
+});
+
+test('combat cues get their words', () => {
+  assert.deepEqual(direct({ code: CUE.HIT_LANDED, a: 1, b: 0 }, hud()).toast, ['Kick!', 'best']);
+  assert.deepEqual(direct({ code: CUE.HIT_LANDED, a: 0, b: 0 }, hud()).toast, ['Hit!', 'best']);
+  assert.deepEqual(direct({ code: CUE.PARRIED, a: 0, b: 0 }, hud()).toast, ['Parry!', 'best']);
+  assert.deepEqual(direct({ code: CUE.WAS_PARRIED, a: 0, b: 0 }, hud()).toast, ['Parried', 'bad']);
+  assert.deepEqual(direct({ code: CUE.GUARDED, a: 0, b: 0 }, hud()).toast, ['Blocked', '']);
+  assert.match(direct({ code: CUE.KNOCKOFF, a: 0, b: 0 }, hud()).toast[0], /full boost/);
+  assert.deepEqual(direct({ code: CUE.LAUNCH, a: 1, b: 0 }, hud()).toast, ['Perfect start', 'best']);
+  assert.deepEqual(direct({ code: CUE.LAUNCH, a: 0, b: 0 }, hud()).toast, ['Wheelspin', 'bad']);
 });

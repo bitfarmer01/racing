@@ -151,6 +151,55 @@ fn render(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
     render_impact(r, s, view, 0.0);
 }
 
+/// Low close-up from the player's side, to check how the bike sits on the road.
+/// Three-quarter view from ahead of the player, low, for the bike close-up.
+fn render_front(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
+    let bikes = s.bike_draws();
+    let particles = s.particles();
+    let mut input = s.frame_input(&bikes, &particles);
+    let b = &s.race.bikes[0];
+    let f = glam::Vec3::new(b.heading.cos(), 0.0, b.heading.sin());
+    let side = glam::Vec3::new(-f.z, 0.0, f.x);
+    let at = b.pos + glam::Vec3::Y * 0.7;
+    input.camera.pos = at + f * 3.0 + side * 1.9 + glam::Vec3::Y * 0.35;
+    input.camera.target = at;
+    input.camera.up = glam::Vec3::Y;
+    input.camera.fov_y = 0.7;
+    r.render(view, &input);
+}
+
+fn render_side(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
+    render_side_posed(r, s, view, 0.0, 0.0);
+}
+
+/// Side view with the player's rider forced into a kick (-1 left .. 1
+/// right) and/or guard (0..1), to show the combat poses.
+fn render_side_posed(
+    r: &mut Renderer,
+    s: &Session,
+    view: &wgpu::TextureView,
+    kick: f32,
+    block: f32,
+) {
+    let mut bikes = s.bike_draws();
+    if kick != 0.0 || block != 0.0 {
+        bikes[0].kick = kick;
+        bikes[0].block = block;
+        bikes[0].tuck = 0.0;
+    }
+    let particles = s.particles();
+    let mut input = s.frame_input(&bikes, &particles);
+    let b = &s.race.bikes[0];
+    let f = glam::Vec3::new(b.heading.cos(), 0.0, b.heading.sin());
+    let side = glam::Vec3::new(-f.z, 0.0, f.x);
+    let at = b.pos + glam::Vec3::Y * 0.6;
+    input.camera.pos = at + side * 3.2 + f * 1.4 + glam::Vec3::Y * 0.15;
+    input.camera.target = at;
+    input.camera.up = glam::Vec3::Y;
+    input.camera.fov_y = 0.75;
+    r.render(view, &input);
+}
+
 /// Renders with an impact frame forced on (1) or left to the session (0).
 fn render_impact(r: &mut Renderer, s: &Session, view: &wgpu::TextureView, impact: f32) {
     let bikes = s.bike_draws();
@@ -247,6 +296,15 @@ fn main() {
         advance(&mut s, 14.0);
         render(&mut r, &s, &off.view);
         off.save(&gpu, &out.join(format!("{}-2-chase.png", def.slug)));
+        render_side(&mut r, &s, &off.view);
+        off.save(&gpu, &out.join(format!("{}-5-side.png", def.slug)));
+        render_front(&mut r, &s, &off.view);
+        off.save(&gpu, &out.join(format!("{}-6-front.png", def.slug)));
+        // The camera sits on the bike's right, so kick to the right.
+        render_side_posed(&mut r, &s, &off.view, 1.0, 0.0);
+        off.save(&gpu, &out.join(format!("{}-7-kick.png", def.slug)));
+        render_side_posed(&mut r, &s, &off.view, 0.0, 1.0);
+        off.save(&gpu, &out.join(format!("{}-8-guard.png", def.slug)));
         render_impact(&mut r, &s, &off.view, 1.0);
         off.save(&gpu, &out.join(format!("{}-4-impact.png", def.slug)));
         advance(&mut s, 9.0);

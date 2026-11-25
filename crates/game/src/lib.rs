@@ -8,6 +8,7 @@
 
 pub mod ai;
 pub mod bike;
+pub mod difficulty;
 pub mod noise;
 pub mod race;
 pub mod scenery;

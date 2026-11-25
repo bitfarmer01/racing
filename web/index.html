@@ -80,6 +80,14 @@
     .bal { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.1); margin-top: 10px; overflow: hidden; }
     .bal i { display: block; height: 100%; width: 100%; background: var(--good); transition: width 0.15s, background 0.15s; }
     .bal i.low { background: var(--hot); }
+    .fight { display: flex; gap: 6px; margin-top: 8px; font-size: 10px; font-weight: 800; letter-spacing: 0.12em; }
+    .fight span { padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); transition: color 0.12s, border-color 0.12s, background 0.12s; }
+    .fight span.on { color: var(--paper); border-color: var(--accent); background: rgba(var(--accent-rgb), 0.22); }
+    .levels { display: flex; gap: 8px; margin-top: 14px; width: min(440px, 90vw); }
+    .level { flex: 1; font: inherit; text-align: left; background: var(--glass); border: 1px solid var(--line); color: var(--paper); border-radius: 12px; padding: 10px 12px; cursor: pointer; }
+    .level b { display: block; font-weight: 800; font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .level small { display: block; color: var(--dim); font-size: 11px; margin-top: 3px; line-height: 1.35; }
+    .level.sel { border-color: var(--hot); background: rgba(255, 77, 46, 0.14); box-shadow: inset 0 -3px 0 var(--hot); }
     #lapline { font-weight: 800; font-size: 15px; color: var(--accent); letter-spacing: 0.06em; margin-top: 6px; }
     #map { right: 22px; top: 18px; width: 200px; height: 200px; padding: 0; overflow: hidden; }
     #map canvas { width: 100%; height: 100%; display: block; }
@@ -149,6 +157,7 @@
       <h1 class="brand">RACING<span>.</span></h1>
       <p class="tag">Eight riders · three laps · no rules</p>
       <div class="tracks" id="tracks"></div>
+      <div class="levels" id="levels" role="radiogroup" aria-label="Difficulty"></div>
       <div class="actions">
         <button class="btn primary" id="start">Race</button>
         <span class="keys"><kbd>Enter</kbd> to start</span>
@@ -156,7 +165,8 @@
     </div>
     <div class="keys">
       <kbd>W</kbd><kbd>↑</kbd> throttle &nbsp; <kbd>S</kbd><kbd>↓</kbd> brake &nbsp; <kbd>A</kbd><kbd>D</kbd> steer &nbsp;
-      <kbd>Shift</kbd> boost &nbsp; <kbd>X</kbd> punch &nbsp; <kbd>C</kbd> camera &nbsp; <kbd>Esc</kbd> pause &nbsp; · &nbsp; gamepad supported
+      <kbd>Shift</kbd> boost &nbsp; <kbd>X</kbd> punch &nbsp; <kbd>Z</kbd> kick &nbsp; <kbd>Q</kbd> guard (hold) &nbsp; <kbd>C</kbd> camera &nbsp; <kbd>Esc</kbd> pause &nbsp; · &nbsp; gamepad supported<br>
+      Hold the throttle part-way on the grid for a perfect start. Raise your guard just as a hit lands to parry it.
     </div>
   </div>
 
@@ -173,6 +183,7 @@
       <div class="row num">TIME <b id="h-time">0:00.000</b></div>
       <div class="row num">BEST <b id="h-best">–</b></div>
       <div class="bal"><i id="h-bal"></i></div>
+      <div class="fight"><span id="h-strike">STRIKE</span><span id="h-guard">GUARD</span></div>
     </div>
     <div id="map" class="panel"><canvas id="minimap" width="400" height="400"></canvas></div>
     <div id="dash" class="panel">
@@ -187,7 +198,8 @@
     <div id="center"><div id="count" class="num"></div><div id="banner" class="hidden"></div></div>
     <div id="toast"></div>
     <div id="hint" class="panel">
-      <kbd>W</kbd> throttle <kbd>S</kbd> brake <kbd>A</kbd><kbd>D</kbd> steer <kbd>Shift</kbd> boost <kbd>X</kbd> punch <kbd>C</kbd> camera <kbd>Esc</kbd> pause
+      <kbd>W</kbd> throttle <kbd>S</kbd> brake <kbd>A</kbd><kbd>D</kbd> steer <kbd>Shift</kbd> boost <kbd>X</kbd> punch <kbd>Z</kbd> kick <kbd>Q</kbd> guard <kbd>C</kbd> camera <kbd>Esc</kbd> pause<br>
+      Start: hold throttle about two-thirds open until GO.
     </div>
   </div>
 

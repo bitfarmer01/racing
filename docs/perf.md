@@ -35,6 +35,34 @@ The design-system pass (ink outlines, speed lines, impact frames, split tone,
 grain) runs inside the existing composite pass. Re-measured afterwards:
 640×360 54–61 ms, 1280×720 108–117 ms, same draw and triangle counts.
 
+## Round 2: new bike and rider, contact shadows, combat (2026-11)
+
+Measured the same way at 1280×720, alternating three runs of `main` (75b7ca9)
+and this branch on the same machine, averaged:
+
+| | Golden Coast | Alpine Lake | Dusk Canyon |
+|---|---|---|---|
+| main | 97 ms | 104 ms | 101 ms |
+| this branch | 104 ms (+7 %) | 114 ms (+9 %) | 129 ms (+29 %) |
+
+Where it goes:
+
+- The bike and rider are now about 8,400 triangles each (lofted fairing,
+  round tyres, a jointed rider), drawn instanced in one call per pass for all
+  eight bikes. That is about 50 k more triangles in the main pass.
+- The vertex shader poses the rig (suspension, steering on the rake axis,
+  hang-off, tuck, kick and guard).
+- The contact shadow under each bike runs in the ground shader, only within
+  70 m of the camera and only for bikes in that range; turning it off saves a
+  few milliseconds on llvmpipe.
+- The bench frame is no longer the same picture: the race plays out
+  differently by the 8 s mark (launch control, combat, difficulty), and on
+  Dusk Canyon eight more draw calls are in view. So part of that track's
+  jump is a different scene, not just cost.
+
+This is CPU software rendering, where every vertex and pixel costs the same
+CPU time; on a real GPU this much geometry is small.
+
 ## Before (main @ 53aa156)
 
 The previous build was a 2D sprite scaler (two draw calls), measured by its

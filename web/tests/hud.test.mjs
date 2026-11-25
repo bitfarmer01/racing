@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap, ResolutionGovernor, CUE,
+  DIFFICULTIES, pickDifficulty,
 } from '../hud.js';
 
 test('formatTime renders minutes, seconds and milliseconds', () => {
@@ -46,4 +47,11 @@ test('resolution governor drops under load and recovers when calm', () => {
   for (let i = 0; i < 2000; i++) g.sample(10);
   assert.ok(g.scale > low && g.scale <= 1.0);
   assert.equal(g.sample(1000), g.scale, 'ignores long stalls');
+});
+
+test('difficulty list matches the game and unknown picks fall back to normal', () => {
+  assert.deepEqual(DIFFICULTIES.map((d) => d.slug), ['easy', 'normal', 'hard']);
+  assert.equal(pickDifficulty('hard'), 'hard');
+  assert.equal(pickDifficulty(null), 'normal');
+  assert.equal(pickDifficulty('insane'), 'normal');
 });

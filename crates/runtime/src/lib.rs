@@ -7,7 +7,8 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 
 use game::ai::Rival;
 use game::bike::{Bike, Controls, RiderState, Surface, BOOST_TOP_SPEED};
-use game::race::{EventKind, Phase, Race, DT, PLAYER, RIVAL_NAMES, SWING_SECS};
+use game::difficulty::Difficulty;
+use game::race::{EventKind, Phase, Race, Strike, DT, PLAYER, RIVAL_NAMES};
 use game::track::TrackDef;
 use render::style::palette;
 use render::{BikeDraw, Camera, FrameInput, Particle, ParticleKind};
@@ -22,7 +23,11 @@ pub struct Input {
     pub steer: f32,
     pub analog_steer: bool,
     pub boost: bool,
+    /// Punch.
     pub attack: bool,
+    pub kick: bool,
+    /// Guard, held.
+    pub block: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +44,19 @@ pub enum Cue {
     Go,
     WallHit(f32),
     Contact(f32),
-    HitLanded,
+    /// The player's strike landed (true: a kick).
+    HitLanded(bool),
     GotHit,
+    /// The player's guard soaked a strike.
+    Guarded,
+    /// The player parried a strike.
+    Parried,
+    /// The player's strike was parried.
+    WasParried,
+    /// The player put a rider on the ground: full boost.
+    KnockOff,
+    /// The player's start: perfect, or wheelspin.
+    Launch(bool),
     Crash,
     Lap(u32, f32),
     Finished(usize),
@@ -57,6 +73,8 @@ struct Snap {
     steer: f32,
     rider: Vec3,
     spin: f32,
+    susp: [f32; 2],
+    tuck: f32,
 }
 
 impl Snap {
@@ -70,6 +88,8 @@ impl Snap {
             steer: b.steer,
             rider: b.rider_offset,
             spin: b.rider_spin,
+            susp: b.susp,
+            tuck: b.tuck,
         }
     }
 
@@ -84,6 +104,11 @@ impl Snap {
             steer: a.steer + (b.steer - a.steer) * t,
             rider: a.rider.lerp(b.rider, t),
             spin: a.spin + (b.spin - a.spin) * t,
+            susp: [
+                a.susp[0] + (b.susp[0] - a.susp[0]) * t,
+                a.susp[1] + (b.susp[1] - a.susp[1]) * t,
+            ],
+            tuck: a.tuck + (b.tuck - a.tuck) * t,
         }
     }
 }
@@ -147,7 +172,11 @@ pub const IMPACT_SECS: f32 = 0.15;
 
 impl Session {
     pub fn new(def: TrackDef, seed: u64) -> Self {
-        let race = Race::new(def, seed);
+        Self::with_difficulty(def, seed, Difficulty::Normal)
+    }
+
+    pub fn with_difficulty(def: TrackDef, seed: u64, difficulty: Difficulty) -> Self {
+        let race = Race::with_difficulty(def, seed, difficulty);
         let snaps: Vec<Snap> = race.bikes.iter().map(Snap::of).collect();
         Self {
             race,
@@ -209,6 +238,8 @@ impl Session {
             steer: self.steer,
             boost: input.boost,
             attack: input.attack,
+            kick: input.kick,
+            block: input.block,
         };
         self.acc += dt;
         while self.acc >= DT {
@@ -264,15 +295,52 @@ impl Session {
                         self.cues.push(Cue::Contact(speed));
                     }
                 }
-                EventKind::Hit { attacker } => {
-                    self.burst_dust(b.pos + Vec3::Y * 1.2, 6, [0.5, 0.48, 0.45]);
+                EventKind::Hit { attacker, kick } => {
+                    self.burst_dust(
+                        b.pos + Vec3::Y * 1.2,
+                        if kick { 10 } else { 6 },
+                        [0.5, 0.48, 0.45],
+                    );
                     if mine {
-                        self.trauma = (self.trauma + 0.45).min(1.0);
+                        self.trauma = (self.trauma + if kick { 0.6 } else { 0.45 }).min(1.0);
                         self.impact = IMPACT_SECS;
                         self.cues.push(Cue::GotHit);
                     } else if attacker == PLAYER {
                         self.impact = IMPACT_SECS;
-                        self.cues.push(Cue::HitLanded);
+                        self.cues.push(Cue::HitLanded(kick));
+                    }
+                }
+                EventKind::Blocked { attacker } => {
+                    self.burst_sparks(b.pos + Vec3::Y * 1.2, b, 6);
+                    if mine {
+                        self.trauma = (self.trauma + 0.15).min(1.0);
+                        self.cues.push(Cue::Guarded);
+                    } else if attacker == PLAYER {
+                        self.cues.push(Cue::Contact(0.0));
+                    }
+                }
+                EventKind::Parried { attacker } => {
+                    self.burst_sparks(b.pos + Vec3::Y * 1.25, b, 16);
+                    if mine {
+                        self.impact = IMPACT_SECS;
+                        self.cues.push(Cue::Parried);
+                    } else if attacker == PLAYER {
+                        self.trauma = (self.trauma + 0.4).min(1.0);
+                        self.cues.push(Cue::WasParried);
+                    }
+                }
+                EventKind::KnockOff { .. } => {
+                    if mine {
+                        self.impact = IMPACT_SECS;
+                        self.cues.push(Cue::KnockOff);
+                    }
+                }
+                EventKind::Launch { perfect } => {
+                    if mine {
+                        if !perfect {
+                            self.burst_dust(b.pos + Vec3::Y * 0.3, 18, [0.62, 0.6, 0.58]);
+                        }
+                        self.cues.push(Cue::Launch(perfect));
                     }
                 }
                 EventKind::Crash => {
@@ -591,12 +659,15 @@ impl Session {
                 let b = &self.race.bikes[i];
                 let r = &self.race.racers[i];
                 let model = bike_matrix(&s);
-                let punch = if r.swing > 0.0 {
-                    let ph = 1.0 - r.swing / SWING_SECS;
+                // Strikes: out and back over the swing, towards the target.
+                let swing = r.swing_phase().map_or(0.0, |ph| {
                     (ph * std::f32::consts::PI).sin().powf(0.7) * r.swing_side
-                } else {
-                    0.0
+                });
+                let (punch, kick) = match r.swing_kind {
+                    Strike::Punch => (swing, 0.0),
+                    Strike::Kick => (0.0, swing),
                 };
+                let riding = b.is_riding();
                 let (rider_offset, rider_spin) = if matches!(b.state, RiderState::Crashed { .. }) {
                     let hip = Vec3::new(0.0, 1.0, 0.1);
                     let world = s.pos + s.rider + Vec3::Y * 0.1;
@@ -604,6 +675,9 @@ impl Session {
                 } else {
                     (Vec3::ZERO, 0.0)
                 };
+                let ground_y = self.race.track.ground_at(s.pos.x, s.pos.z, &b.track_pos);
+                // Full contact on the road, fading over the first metre of air.
+                let contact = (1.0 - (s.pos.y - ground_y).max(0.0)).clamp(0.0, 1.0);
                 let (mut paint, leathers) = PAINTS[i % PAINTS.len()];
                 if i == PLAYER {
                     // The player wears the design system's hot colour.
@@ -621,6 +695,19 @@ impl Session {
                     punch,
                     rider_offset,
                     rider_spin,
+                    // Knee out on the inside of the corner (not when thrown off).
+                    hang: if riding {
+                        (s.lean / 0.75).clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                    tuck: s.tuck * (1.0 - r.guard),
+                    susp_front: s.susp[0],
+                    susp_rear: s.susp[1],
+                    kick,
+                    block: r.guard,
+                    ground_y,
+                    contact,
                 }
             })
             .collect()
@@ -709,6 +796,8 @@ impl Session {
             balance: r.balance,
             progress: (r.progress / race.race_distance()).clamp(0.0, 1.0),
             drafting: b.drafting,
+            guard: r.guard,
+            strike_ready: r.attack_cooldown <= 0.0 && r.swing <= 0.0 && b.is_riding(),
         }
     }
 
@@ -761,6 +850,10 @@ pub struct Hud {
     pub balance: f32,
     pub progress: f32,
     pub drafting: bool,
+    /// How far the player's guard is up (0..1).
+    pub guard: f32,
+    /// A punch or kick can be thrown now.
+    pub strike_ready: bool,
 }
 
 fn bike_matrix(s: &Snap) -> Mat4 {
@@ -829,6 +922,8 @@ mod tests {
             steer: 0.0,
             rider: Vec3::ZERO,
             spin: 0.0,
+            susp: [0.03; 2],
+            tuck: 0.0,
         };
         let m = bike_matrix(&s);
         let nose = m.transform_point3(Vec3::new(0.0, 0.0, -1.0));

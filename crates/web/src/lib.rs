@@ -39,7 +39,7 @@ pub fn style_css(slug: &str) -> String {
 }
 
 /// Number of floats in [`Game::hud`].
-pub const HUD_LEN: usize = 22;
+pub const HUD_LEN: usize = 23;
 
 /// Packs the HUD snapshot into a flat array (layout mirrored in loader.js).
 pub fn pack_hud(h: &runtime::Hud, paused: bool) -> [f32; HUD_LEN] {
@@ -67,7 +67,8 @@ pub fn pack_hud(h: &runtime::Hud, paused: bool) -> [f32; HUD_LEN] {
         h.progress,
         b(h.drafting),
         b(paused),
-        0.0,
+        h.guard,
+        b(h.strike_ready),
     ]
 }
 
@@ -81,12 +82,17 @@ pub fn pack_cues(cues: &[runtime::Cue], out: &mut Vec<f32>) {
             Cue::Go => (2.0, 0.0, 0.0),
             Cue::WallHit(s) => (3.0, s, 0.0),
             Cue::Contact(s) => (4.0, s, 0.0),
-            Cue::HitLanded => (5.0, 0.0, 0.0),
+            Cue::HitLanded(kick) => (5.0, if kick { 1.0 } else { 0.0 }, 0.0),
             Cue::GotHit => (6.0, 0.0, 0.0),
             Cue::Crash => (7.0, 0.0, 0.0),
             Cue::Lap(n, t) => (8.0, n as f32, t),
             Cue::Finished(p) => (9.0, p as f32, 0.0),
             Cue::Overtake(gained) => (10.0, if gained { 1.0 } else { 0.0 }, 0.0),
+            Cue::Guarded => (11.0, 0.0, 0.0),
+            Cue::Parried => (12.0, 0.0, 0.0),
+            Cue::WasParried => (13.0, 0.0, 0.0),
+            Cue::KnockOff => (14.0, 0.0, 0.0),
+            Cue::Launch(perfect) => (15.0, if perfect { 1.0 } else { 0.0 }, 0.0),
         };
         out.extend_from_slice(&[code, a, b]);
     }
@@ -96,6 +102,7 @@ pub fn pack_cues(cues: &[runtime::Cue], out: &mut Vec<f32>) {
 mod browser {
     use super::*;
     use game::ai::Rival;
+    use game::difficulty::Difficulty;
     use game::tracks::{by_slug, catalog};
     use render::{Renderer, Settings};
     use runtime::{CamMode, Input, Session};
@@ -114,6 +121,7 @@ mod browser {
         session: Session,
         slug: String,
         seed: u64,
+        difficulty: Difficulty,
         cues: Vec<f32>,
         adapter_name: String,
     }
@@ -199,6 +207,7 @@ mod browser {
                 session: Session::new(def, 1),
                 slug: def.slug.to_owned(),
                 seed: 1,
+                difficulty: Difficulty::Normal,
                 cues: Vec::new(),
                 adapter_name: adapter.get_info().name,
             };
@@ -231,7 +240,7 @@ mod browser {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let cam = self.session.cam_mode;
-            self.session = Session::new(def, self.seed >> 16);
+            self.session = Session::with_difficulty(def, self.seed >> 16, self.difficulty);
             self.session.cam_mode = cam;
             if def.slug != self.slug {
                 self.slug = def.slug.to_owned();
@@ -252,8 +261,10 @@ mod browser {
             self.session.cam_mode = CamMode::Far;
         }
 
-        /// Starts a race the player drives, on `slug`.
-        pub fn start_race(&mut self, slug: &str) {
+        /// Starts a race the player drives, on `slug`, at `difficulty`
+        /// (`easy`, `normal` or `hard`; anything else is normal).
+        pub fn start_race(&mut self, slug: &str, difficulty: &str) {
+            self.difficulty = Difficulty::from_slug(difficulty);
             self.new_session(slug);
             self.session.autopilot = None;
             if self.session.cam_mode == CamMode::Far {
@@ -306,6 +317,8 @@ mod browser {
             analog_steer: bool,
             boost: bool,
             attack: bool,
+            kick: bool,
+            block: bool,
         ) -> Vec<f32> {
             let input = Input {
                 throttle,
@@ -314,6 +327,8 @@ mod browser {
                 analog_steer,
                 boost,
                 attack,
+                kick,
+                block,
             };
             self.session.update(dt, &input);
             pack_cues(&self.session.cues, &mut self.cues);

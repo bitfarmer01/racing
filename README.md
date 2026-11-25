@@ -21,8 +21,10 @@ Open http://localhost:8000/web/. The built bundles in `web/pkg-webgpu` and
 | Throttle | W / ↑ | RT or A |
 | Brake / reverse | S / ↓ | LT |
 | Steer | A D / ← → | left stick |
-| Boost | Shift or Space | LB / RB |
-| Punch | X | X or B |
+| Boost | Shift or Space | RB |
+| Punch | X or J | X |
+| Kick | Z or K | B |
+| Guard (hold) | Q or L | LB |
 | Camera | C | Y |
 | Pause | Esc or P | Start |
 | Restart | R | |
@@ -36,9 +38,25 @@ Open http://localhost:8000/web/. The built bundles in `web/pkg-webgpu` and
   and Armco barriers that crash you if you hit them hard.
 - **Boost** drains while held and refills slowly; riding in a rival's wake
   gives a slipstream tow.
-- **Combat:** punch a rider alongside to unsettle them; enough hits knock them
-  off. Crashed riders get back on after a couple of seconds.
+- **Combat:** punch a rider alongside to unsettle them, or kick: slower to
+  wind up and longer reach, but it hits much harder. Hold guard to soak most
+  of a hit (you ride slower and can't boost or strike while it is up). Raise
+  it just as a hit lands to parry: the attacker is stunned and wobbles.
+  Clean hits top up your boost, and knocking a rider off fills it. Crashed
+  riders get back on after a couple of seconds.
+- **Start:** hold the throttle about two-thirds open as the lights go out for
+  a perfect launch and a little boost; flat out spins the rear tyre.
+- **Riding:** the bike sits on working suspension (it dives under braking,
+  squats on the gas and soaks up landings), the rider hangs off in corners
+  and tucks in when you're flat out for a little more top speed, and
+  overtakes earn a sliver of boost.
+- **Difficulty:** pick Easy, Normal or Hard in the menu (remembered between
+  visits). It changes the field, not your bike: rivals' pace and cornering
+  nerve, how often they attack, block and parry, how hard their hits land on
+  you, and how much the pack waits for you (Easy) or never does (Hard).
 - **Rivals** race the same physics with their own lines, skill and aggression.
+
+![Kick and guard](docs/screenshots/combat-poses.jpg)
 
 ## Look
 
