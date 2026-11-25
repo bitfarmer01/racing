@@ -542,24 +542,41 @@ impl AtlasMapping {
     }
 }
 
-/// The demo track: a straight start, a long right, a rolling climb, a short
-/// left, and a straight run back to the line. Shared by the race and the
-/// frame builder.
+/// The demo track: a straight start, a long gentle left into a medium
+/// right, a climbing hairpin right, a descent into a mirrored hairpin
+/// left, and a straight run back to the line — all over a rolling hill
+/// profile. Shared by the race and the frame builder.
 pub fn track_geometry() -> RoadGeometry {
     RoadGeometry::new(
         vec![
             world::CurveSegment {
                 start: 200.0,
-                length: 700.0,
+                length: 500.0,
                 // Opening bend: winnable flat out under the corner-force
-                // balance — 4.75 m/s of push against 5.0 of steer at top
-                // speed, a fight but a survivable one.
+                // balance — a fight but a survivable one.
                 curvature: -0.003,
             },
             world::CurveSegment {
-                start: 1200.0,
-                length: 400.0,
-                curvature: 0.005,
+                start: 700.0,
+                length: 200.0,
+                // Medium right out of the opening left: rideable flat with
+                // a steady hand, but it punishes a lazy line.
+                curvature: 0.009,
+            },
+            world::CurveSegment {
+                start: 1_100.0,
+                length: 140.0,
+                // The Ridgeback right: a climbing hairpin — flat out, the
+                // bend outlasts the grip; brake to the corner speed or run
+                // off the tarmac.
+                curvature: 0.016,
+            },
+            world::CurveSegment {
+                start: 1_450.0,
+                length: 140.0,
+                // Mirror hairpin left, entered on the descent from the
+                // crest: same bargain, opposite direction.
+                curvature: -0.016,
             },
         ],
         vec![
@@ -2420,5 +2437,92 @@ mod tests {
                 "the draw list must be reused, not reallocated"
             );
         }
+    }
+
+    #[test]
+    fn demo_track_elevation_rolls_gently_across_the_lap() {
+        // 7.5c (a): the demo lap must carry gentle inclines and declines —
+        // never flat, never a wall. Sample every 10 m and read the profile.
+        let geometry = track_geometry();
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut max_grade = 0.0_f32;
+        let mut prev = geometry.elevation_at(0.0);
+        for step in 0..=200 {
+            let d = step as f32 * 10.0;
+            let elevation = geometry.elevation_at(d);
+            min = min.min(elevation);
+            max = max.max(elevation);
+            max_grade = max_grade.max((elevation - prev).abs() / 10.0);
+            prev = elevation;
+        }
+        assert!(
+            max - min > 10.0,
+            "the lap must roll: elevation spans {min}..{max}"
+        );
+        assert!(
+            max_grade <= 0.041,
+            "no section may wall up: steepest grade {max_grade}"
+        );
+        // The lap closes: the line sits at the same height it started.
+        assert_eq!(geometry.elevation_at(0.0), 0.0);
+        assert_eq!(geometry.elevation_at(2_000.0), 0.0);
+    }
+
+    #[test]
+    fn road_projection_rises_over_the_climb_and_dips_into_the_valley() {
+        // 7.5c (a) evidence: the projected road strip must carry the hill.
+        // Each landmark is compared against the same point on a flat
+        // reference course: the climb must project visibly above the flat
+        // line and the valley visibly below it. (The projection converges
+        // to the viewport centre, not the camera's horizon_y_px, so the
+        // flat line — not the horizon — is the honest reference.)
+        let geometry = track_geometry();
+        let flat = world::RoadGeometry::new(Vec::new(), Vec::new(), 12.0);
+        let camera_at = |distance: f32| world::Camera {
+            distance,
+            height: CAMERA_HEIGHT,
+            lateral: 0.0,
+            focal: FOCAL,
+            horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
+            viewport: Viewport {
+                width: VIEWPORT_WIDTH,
+                height: VIEWPORT_HEIGHT,
+            },
+        };
+
+        // From the climb's base (300 m) the 14 m crest at 650 m looms
+        // above where flat ground would project.
+        let climbing = world::Projector::new(&geometry, camera_at(300.0));
+        let flat_view = world::Projector::new(&flat, camera_at(300.0));
+        let crest = climbing
+            .project(650.0, 0.0)
+            .expect("the crest is ahead of the camera");
+        let crest_flat = flat_view
+            .project(650.0, 0.0)
+            .expect("flat ground at the same depth");
+        assert!(
+            crest.screen_y < crest_flat.screen_y - 5.0,
+            "the climb must visibly rise above the flat line (crest {}, flat {})",
+            crest.screen_y,
+            crest_flat.screen_y
+        );
+
+        // From the crest the valley at 1 050 m (elevation 4 m) falls
+        // below where flat ground would project.
+        let on_crest = world::Projector::new(&geometry, camera_at(650.0));
+        let crest_view = world::Projector::new(&flat, camera_at(650.0));
+        let valley = on_crest
+            .project(1_050.0, 0.0)
+            .expect("the valley is ahead of the camera");
+        let valley_flat = crest_view
+            .project(1_050.0, 0.0)
+            .expect("flat ground at the same depth");
+        assert!(
+            valley.screen_y > valley_flat.screen_y + 5.0,
+            "the descent must visibly fall below the flat line (valley {}, flat {})",
+            valley.screen_y,
+            valley_flat.screen_y
+        );
     }
 }

@@ -2210,28 +2210,39 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Wave 7 audit — sim probes (items 1–8). Each probe builds the demo
-    // race: seed 0x5EED_C0DE, a 2 000 m lap from the two curve segments of
+    // race: seed 0x5EED_C0DE, a 2 000 m lap from the curve segments of
     // runtime's `track_geometry`, and pushes inputs each tick while
     // reading the Race's public getters.
     // ------------------------------------------------------------------
 
-    /// The demo course's two curve segments, mirrored from runtime's
+    /// The demo course's curve segments, mirrored from runtime's
     /// `track_geometry` (the game crate cannot depend on runtime): a long
     /// gentle left (negative curvature per the geometry-authoritative
-    /// convention — `center_offset` is −15 m at 300 m) and a shorter,
-    /// tighter right. Elevation does not enter the sim.
+    /// convention — `center_offset` falls), a medium right out of it, and
+    /// the two hairpins — a climbing right and a descending left. Elevation
+    /// does not enter the sim.
     fn demo_geometry() -> RoadGeometry {
         RoadGeometry::new(
             vec![
                 CurveSegment {
                     start: 200.0,
-                    length: 700.0,
+                    length: 500.0,
                     curvature: -0.003,
                 },
                 CurveSegment {
-                    start: 1200.0,
-                    length: 400.0,
-                    curvature: 0.005,
+                    start: 700.0,
+                    length: 200.0,
+                    curvature: 0.009,
+                },
+                CurveSegment {
+                    start: 1_100.0,
+                    length: 140.0,
+                    curvature: 0.016,
+                },
+                CurveSegment {
+                    start: 1_450.0,
+                    length: 140.0,
+                    curvature: -0.016,
                 },
             ],
             Vec::new(),
@@ -2260,6 +2271,186 @@ mod tests {
             race.push_input(GameInput::Accelerate);
             race.tick();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 7.5c track probes — the hairpins must force braking. The grip cap
+    // keeps corner drift small but persistent: a rider who pins the
+    // throttle and leans into a hairpin cannot hold the tarmac, while the
+    // same bend at corner speed holds a braked line all lap.
+    // ------------------------------------------------------------------
+
+    /// Half the road width: a rider past this is off the tarmac.
+    const HALF_WIDTH: f32 = 6.0;
+    /// The braked line's target speed through a hairpin, in m/s.
+    const HAIRPIN_SPEED: f32 = 20.0;
+    /// The climbing hairpin right, on the lap.
+    const HAIRPIN_RIGHT: (f32, f32) = (1_100.0, 1_240.0);
+    /// The descending hairpin left, on the lap.
+    const HAIRPIN_LEFT: (f32, f32) = (1_450.0, 1_590.0);
+
+    /// Whether `distance` sits inside either hairpin (any lap).
+    fn in_a_hairpin(distance: f32) -> bool {
+        let on_lap = distance % 2_000.0;
+        let (a, b) = HAIRPIN_RIGHT;
+        let (c, d) = HAIRPIN_LEFT;
+        (on_lap >= a && on_lap <= b) || (on_lap >= c && on_lap <= d)
+    }
+
+    #[test]
+    fn flat_out_through_the_hairpin_right_leaves_the_tarmac() {
+        let mut race = probe_race(0);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Full throttle up to the hairpin.
+        while race.player_distance() < HAIRPIN_RIGHT.0 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        // Pin the throttle and hold the lean into the bend — the flat-out
+        // line. The hairpin must outlast the grip.
+        let mut left_tarmac = false;
+        while race.player_distance() < HAIRPIN_RIGHT.1 && race.player_control() != Control::Crashed
+        {
+            race.push_input(GameInput::Accelerate);
+            race.push_input(GameInput::SteerRight);
+            race.tick();
+            left_tarmac |= race.player_lateral().abs() > HALF_WIDTH;
+        }
+        assert!(
+            left_tarmac,
+            "flat out through the climbing hairpin must run off the tarmac (exit lateral {}, control {:?})",
+            race.player_lateral(),
+            race.player_control()
+        );
+    }
+
+    #[test]
+    fn a_braked_line_hold_survives_the_hairpin_right() {
+        let mut race = probe_race(0);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Ride to the hairpin, then brake down to the corner speed.
+        while race.player_distance() < 1_050.0 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        while race.player_speed() > HAIRPIN_SPEED {
+            race.push_input(GameInput::Brake);
+            race.tick();
+        }
+        assert!(
+            race.player_distance() < HAIRPIN_RIGHT.0,
+            "braking finishes before the bend ({})",
+            race.player_distance()
+        );
+        // The braked line: hold the centreline with short steering pulses
+        // and keep the speed at the corner target.
+        let mut stayed_on = true;
+        while race.player_distance() < HAIRPIN_RIGHT.1 && race.player_control() != Control::Crashed
+        {
+            let lat = race.player_lateral();
+            if lat > 0.5 {
+                race.push_input(GameInput::SteerLeft);
+            } else if lat < -0.5 {
+                race.push_input(GameInput::SteerRight);
+            }
+            if race.player_speed() > HAIRPIN_SPEED {
+                race.push_input(GameInput::Brake);
+            } else {
+                race.push_input(GameInput::Accelerate);
+            }
+            race.tick();
+            stayed_on &= race.player_lateral().abs() <= HALF_WIDTH - 0.5;
+        }
+        assert!(
+            race.player_control() != Control::Crashed && stayed_on,
+            "a braked line must hold the tarmac through the hairpin (lateral {}, control {:?})",
+            race.player_lateral(),
+            race.player_control()
+        );
+        assert!(
+            race.player_distance() >= HAIRPIN_RIGHT.1,
+            "the braked run completes the bend"
+        );
+    }
+
+    #[test]
+    fn a_braked_line_hold_survives_the_whole_demo_lap_set() {
+        let mut race = probe_race(0);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let mut ticks = 0;
+        while !race.is_finished() && race.player_control() != Control::Crashed {
+            let lat = race.player_lateral();
+            if lat > 0.5 {
+                race.push_input(GameInput::SteerLeft);
+            } else if lat < -0.5 {
+                race.push_input(GameInput::SteerRight);
+            }
+            if race.player_speed() > HAIRPIN_SPEED {
+                race.push_input(GameInput::Brake);
+            } else {
+                race.push_input(GameInput::Accelerate);
+            }
+            race.tick();
+            ticks += 1;
+            assert!(ticks < 30_000, "the braked run never finished");
+        }
+        assert!(
+            race.player_control() != Control::Crashed,
+            "braking down for the hairpins survives every lap"
+        );
+        assert!(race.is_finished(), "the braked run completes the race");
+    }
+
+    #[test]
+    fn rivals_hold_their_tarmac_through_the_hairpins() {
+        let mut race = probe_race(3);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // The player rides the braked line (the pack overtakes a slow
+        // rider; a parked one would clog the road behind them). Every
+        // rival must come through both hairpins still on the road —
+        // their corner speed model brakes for the bends.
+        let mut ticks = 0;
+        let mut leader_done = false;
+        while !leader_done && ticks < 12_000 {
+            let lat = race.player_lateral();
+            if lat > 0.5 {
+                race.push_input(GameInput::SteerLeft);
+            } else if lat < -0.5 {
+                race.push_input(GameInput::SteerRight);
+            }
+            if race.player_speed() > HAIRPIN_SPEED {
+                race.push_input(GameInput::Brake);
+            } else {
+                race.push_input(GameInput::Accelerate);
+            }
+            race.tick();
+            ticks += 1;
+            for (slot, state) in race.bike_states().enumerate().skip(1) {
+                if in_a_hairpin(state.pos_x) {
+                    assert!(
+                        state.pos_y.abs() <= HALF_WIDTH
+                            && race.bike_control(slot) != Control::Crashed,
+                        "rival {slot} left the tarmac in a hairpin (d {:.0}, lateral {})",
+                        state.pos_x,
+                        state.pos_y
+                    );
+                }
+            }
+            leader_done = race
+                .bike_states()
+                .enumerate()
+                .skip(1)
+                .all(|(_, state)| state.pos_x >= 2_000.0);
+        }
+        assert!(leader_done, "the pack completed the lap");
     }
 
     /// Whether the rider in `slot` sits in punch reach of the player.
@@ -2399,12 +2590,15 @@ mod tests {
                 }
                 let (x, y) = (s.pos_x, s.pos_y);
                 let d = x.rem_euclid(2_000.0);
-                // Bend 1 (a left bend): inside is the negative side.
-                if (300.0..800.0).contains(&d) {
+                // Bend 1 (the gentle left, 200–700): inside is the negative
+                // side. Sampled short of 700 so the opposite lock of the
+                // medium right does not bleed into the mean.
+                if (300.0..650.0).contains(&d) {
                     left_bend.push(y);
                 }
-                // Bend 2 (a right bend): inside is the positive side.
-                if (1_300.0..1_500.0).contains(&d) {
+                // Bend 2 (the medium right, 700–900): inside is the positive
+                // side, past the transition at its entry.
+                if (750.0..880.0).contains(&d) {
                     right_bend.push(y);
                 }
             }
@@ -2666,7 +2860,11 @@ mod tests {
             race.is_finished(),
             "the probe race completes inside the tick budget"
         );
-        assert!(rival_crashes < 6, "rival crashes: {rival_crashes}");
+        // The 7.5c course is harder — a bend-sign flip at the left's exit
+        // and two hairpins churn the pack — so the ceiling buys one extra
+        // dismount: six crashes across six rivals and three laps is still
+        // a race, not a pile-up (audit item 7).
+        assert!(rival_crashes < 7, "rival crashes: {rival_crashes}");
         assert!(player_crashes <= 1, "player crashes: {player_crashes}");
     }
 }
