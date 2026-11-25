@@ -35,6 +35,11 @@ export class Game {
      * The canvas backing store changed size.
      */
     resize(w: number, h: number): void;
+    /**
+     * Ink outlines and impact frames on or off (impact frames are off
+     * for players who ask for reduced motion).
+     */
+    set_effects(ink: boolean, flashes: boolean): void;
     set_paused(paused: boolean): void;
     /**
      * Internal render resolution as a fraction of the canvas (0.35..1).
@@ -74,6 +79,13 @@ export function backend_name(): string;
 export function start(): void;
 
 /**
+ * The design system's CSS custom properties for a track (`--ink`, `--hot`,
+ * `--accent` and the rest), so the HTML HUD wears the same palette as the
+ * scene. Unknown slugs get the first track's.
+ */
+export function style_css(slug: string): string;
+
+/**
  * The track list as `slug|name|laps|blurb` lines, for the track picker.
  */
 export function track_list(): string;
@@ -94,6 +106,7 @@ export interface InitOutput {
     readonly game_hdr_format: (a: number) => [number, number];
     readonly game_hud: (a: number) => [number, number];
     readonly game_resize: (a: number, b: number, c: number) => void;
+    readonly game_set_effects: (a: number, b: number, c: number) => void;
     readonly game_set_paused: (a: number, b: number) => void;
     readonly game_set_render_scale: (a: number, b: number) => void;
     readonly game_show: (a: number, b: number, c: number) => void;
@@ -103,6 +116,7 @@ export interface InitOutput {
     readonly game_track: (a: number) => [number, number];
     readonly game_track_outline: (a: number) => [number, number];
     readonly start: () => void;
+    readonly style_css: (a: number, b: number) => [number, number];
     readonly track_list: () => [number, number];
     readonly wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_: (a: number, b: number, c: any) => [number, number];

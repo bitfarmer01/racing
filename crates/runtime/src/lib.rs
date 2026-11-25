@@ -9,6 +9,7 @@ use game::ai::Rival;
 use game::bike::{Bike, Controls, RiderState, Surface, BOOST_TOP_SPEED};
 use game::race::{EventKind, Phase, Race, DT, PLAYER, RIVAL_NAMES, SWING_SECS};
 use game::track::TrackDef;
+use render::style::palette;
 use render::{BikeDraw, Camera, FrameInput, Particle, ParticleKind};
 use sim::rng::XorShift64;
 
@@ -98,6 +99,12 @@ struct Live {
     alpha0: f32,
 }
 
+/// HDR colour of boost flames: the palette's boost blue, pushed bright.
+fn boost_flame() -> [f32; 4] {
+    let [r, g, b] = palette::BOOST.linear();
+    [r * 9.0 + 0.6, g * 9.0, b * 9.0, 1.0]
+}
+
 pub const PAINTS: [([f32; 3], [f32; 3]); 8] = [
     ([0.80, 0.04, 0.03], [0.85, 0.85, 0.86]),
     ([0.03, 0.18, 0.75], [0.05, 0.05, 0.08]),
@@ -130,7 +137,13 @@ pub struct Session {
     pub autopilot: Option<Rival>,
     pub paused: bool,
     best_lap: Option<f32>,
+    /// Seconds left on the current impact frame (see `IMPACT_SECS`).
+    impact: f32,
 }
+
+/// Length of an impact-frame sequence: a held three-tone frame, a beat of
+/// normal picture, then a second held frame, like an anime hit.
+pub const IMPACT_SECS: f32 = 0.15;
 
 impl Session {
     pub fn new(def: TrackDef, seed: u64) -> Self {
@@ -156,6 +169,7 @@ impl Session {
             autopilot: None,
             paused: false,
             best_lap: None,
+            impact: 0.0,
         }
     }
 
@@ -175,6 +189,7 @@ impl Session {
             return;
         }
         self.time += dt;
+        self.impact = (self.impact - dt).max(0.0);
         // Keyboard steering eases in and snaps back; sticks are direct.
         let target = input.steer.clamp(-1.0, 1.0);
         if input.analog_steer {
@@ -236,6 +251,9 @@ impl Session {
                     self.burst_sparks(p + Vec3::Y * 0.5, b, 18 + (speed * 2.0) as usize);
                     if mine {
                         self.trauma = (self.trauma + speed * 0.05).min(1.0);
+                        if speed > 9.0 {
+                            self.impact = IMPACT_SECS;
+                        }
                         self.cues.push(Cue::WallHit(speed));
                     }
                 }
@@ -250,8 +268,10 @@ impl Session {
                     self.burst_dust(b.pos + Vec3::Y * 1.2, 6, [0.5, 0.48, 0.45]);
                     if mine {
                         self.trauma = (self.trauma + 0.45).min(1.0);
+                        self.impact = IMPACT_SECS;
                         self.cues.push(Cue::GotHit);
                     } else if attacker == PLAYER {
+                        self.impact = IMPACT_SECS;
                         self.cues.push(Cue::HitLanded);
                     }
                 }
@@ -260,6 +280,7 @@ impl Session {
                     self.burst_dust(b.pos + Vec3::Y * 0.4, 14, [0.42, 0.4, 0.38]);
                     if mine {
                         self.trauma = 1.0;
+                        self.impact = IMPACT_SECS;
                         self.cues.push(Cue::Crash);
                     }
                 }
@@ -422,7 +443,7 @@ impl Session {
                             kind: ParticleKind::Glow,
                             pos: exhaust,
                             size: 0.09,
-                            color: [1.5, 3.0, 9.0, 1.0],
+                            color: boost_flame(),
                             vel: Vec3::new(b.vel.x, 0.0, b.vel.y) - fwd * 9.0 + j,
                             stretch: 0.02,
                         },
@@ -583,7 +604,11 @@ impl Session {
                 } else {
                     (Vec3::ZERO, 0.0)
                 };
-                let (paint, leathers) = PAINTS[i % PAINTS.len()];
+                let (mut paint, leathers) = PAINTS[i % PAINTS.len()];
+                if i == PLAYER {
+                    // The player wears the design system's hot colour.
+                    paint = palette::HOT.linear();
+                }
                 BikeDraw {
                     model,
                     paint,
@@ -636,6 +661,20 @@ impl Session {
             start_lights: self.start_lights(),
             boost: if b.boosting { 1.0 } else { 0.0 },
             focus: s.pos + fwd * 30.0,
+            impact: self.impact_frame(),
+        }
+    }
+
+    /// 1 while an impact frame is held, else 0.
+    pub fn impact_frame(&self) -> f32 {
+        if self.impact <= 0.0 {
+            return 0.0;
+        }
+        let t = IMPACT_SECS - self.impact;
+        if t < 0.05 || (0.08..0.11).contains(&t) {
+            1.0
+        } else {
+            0.0
         }
     }
 
@@ -740,6 +779,23 @@ fn bike_matrix(s: &Snap) -> Mat4 {
 mod tests {
     use super::*;
     use game::tracks::catalog;
+
+    #[test]
+    fn impact_frames_hold_twice_then_clear() {
+        let mut s = Session::new(catalog()[0], 1);
+        assert_eq!(s.impact_frame(), 0.0);
+        s.impact = IMPACT_SECS;
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            seen.push(s.impact_frame());
+            s.update(1.0 / 120.0, &Input::default());
+        }
+        // on, off, on again, then the normal picture.
+        let edges = seen.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(seen[0], 1.0);
+        assert_eq!(edges, 3, "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), 0.0);
+    }
 
     #[test]
     fn session_runs_a_race_start_with_autopilot() {

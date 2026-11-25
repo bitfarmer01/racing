@@ -9,6 +9,7 @@ use game::track::{Track, RUNOFF};
 
 use crate::camera::{aabb_in_planes, Camera, Frustum};
 use crate::mesh::Vertex;
+use crate::style::{palette, track_style};
 use crate::world::{Chunk, PropInstance, PropModel, WorldGeometry};
 
 const COMMON: &str = include_str!("shaders/common.wgsl");
@@ -30,6 +31,10 @@ pub struct Settings {
     /// Internal resolution as a fraction of the output (dynamic resolution).
     pub render_scale: f32,
     pub bloom: bool,
+    /// Ink outlines drawn from the depth buffer.
+    pub ink: bool,
+    /// Full-screen impact frames on crashes and hits (off for reduced motion).
+    pub flashes: bool,
 }
 
 impl Default for Settings {
@@ -38,6 +43,8 @@ impl Default for Settings {
             shadow_size: 2048,
             render_scale: 1.0,
             bloom: true,
+            ink: true,
+            flashes: true,
         }
     }
 }
@@ -92,6 +99,8 @@ pub struct FrameInput<'a> {
     pub boost: f32,
     /// Centre of the sharp-shadow region (usually the player).
     pub focus: Vec3,
+    /// 0..1 impact-frame strength (a crash or a landed hit just happened).
+    pub impact: f32,
 }
 
 #[repr(C)]
@@ -122,6 +131,18 @@ struct PostUniform {
     params: [f32; 4],
     grade: [f32; 4],
     extra: [f32; 4],
+    /// Ink rgb (linear), w: outline strength.
+    ink: [f32; 4],
+    /// Impact, speed lines, grain, camera near plane.
+    fx: [f32; 4],
+    /// Split-tone shadow tint, w: unused.
+    shadow_tint: [f32; 4],
+    /// Split-tone highlight tint, w: unused.
+    high_tint: [f32; 4],
+    /// Impact-frame hit tone (linear), w: unused.
+    accent: [f32; 4],
+    /// Impact-frame paper tone (linear), w: unused.
+    paper: [f32; 4],
 }
 
 #[repr(C)]
@@ -245,6 +266,7 @@ pub struct Renderer {
     fxaa_pipe: wgpu::RenderPipeline,
 
     post_bgl: wgpu::BindGroupLayout,
+    composite_bgl: wgpu::BindGroupLayout,
     post_sampler: wgpu::Sampler,
     post_uniforms: Vec<wgpu::Buffer>,
     targets: Targets,
@@ -675,50 +697,78 @@ impl Renderer {
             false,
         );
 
+        let post_entries = [
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ];
         let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post"),
+            entries: &post_entries,
+        });
+        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("post"),
+            bind_group_layouts: &[&post_bgl],
+            push_constant_ranges: &[],
+        });
+        // The composite also reads scene depth for the ink outlines.
+        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite"),
             entries: &[
+                post_entries[0],
+                post_entries[1],
+                post_entries[2],
+                post_entries[3],
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        // Bound as plain float, not depth, so the GLSL
+                        // backend (WebGL2) can texelFetch it.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
                     },
                     count: None,
                 },
             ],
         });
-        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post"),
-            bind_group_layouts: &[&post_bgl],
+        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite"),
+            bind_group_layouts: &[&composite_bgl],
             push_constant_ranges: &[],
         });
         let full = |label, fs, format| {
@@ -737,7 +787,17 @@ impl Renderer {
         let prefilter_pipe = full("bloom prefilter", "fs_prefilter", hdr_format);
         let down_pipe = full("bloom down", "fs_down", hdr_format);
         let up_pipe = full("bloom up", "fs_up", hdr_format);
-        let composite_pipe = full("composite", "fs_composite", LDR);
+        let composite_pipe = mk(
+            "composite",
+            &composite_layout,
+            &post_mod,
+            "vs_full",
+            "fs_composite",
+            &[],
+            Some((LDR, None)),
+            None,
+            false,
+        );
         let fxaa_pipe = full("fxaa", "fs_fxaa", out_format);
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -778,6 +838,7 @@ impl Renderer {
         let targets = create_targets(
             device,
             &post_bgl,
+            &composite_bgl,
             &post_sampler,
             &post_uniforms,
             hdr_format,
@@ -815,6 +876,7 @@ impl Renderer {
             composite_pipe,
             fxaa_pipe,
             post_bgl,
+            composite_bgl,
             post_sampler,
             post_uniforms,
             targets,
@@ -867,6 +929,7 @@ impl Renderer {
         self.targets = create_targets(
             &self.device,
             &self.post_bgl,
+            &self.composite_bgl,
             &self.post_sampler,
             &self.post_uniforms,
             self.hdr_format,
@@ -884,6 +947,7 @@ impl Renderer {
                 params: [0.0; 4],
                 grade: [1.0, 1.0, 1.0, 0.0],
                 extra: [1.6, 0.8, 0.0, 1.0 / self.hdr_scale],
+                ..Zeroable::zeroed()
             };
             self.queue
                 .write_buffer(&self.post_uniforms[i], 0, bytemuck::bytes_of(&u));
@@ -1143,6 +1207,7 @@ impl Renderer {
 
         // Post uniforms that change per frame.
         let t = &w.theme;
+        let style = track_style(t);
         let comp = PostUniform {
             texel: [1.0 / iw as f32, 1.0 / ih as f32, iw as f32, ih as f32],
             params: [
@@ -1153,6 +1218,28 @@ impl Renderer {
             ],
             grade: [t.grade[0], t.grade[1], t.grade[2], 0.0],
             extra: [1.6, 0.8, input.time.fract(), 1.0 / self.hdr_scale],
+            ink: v4(
+                style.ink.linear(),
+                if self.settings.ink {
+                    style.ink_strength
+                } else {
+                    0.0
+                },
+            ),
+            fx: [
+                if self.settings.flashes {
+                    input.impact.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                input.boost.clamp(0.0, 1.0),
+                style.grain,
+                input.camera.near,
+            ],
+            shadow_tint: v4(style.shadow_tint, 0.0),
+            high_tint: v4(style.highlight_tint, 0.0),
+            accent: v4(palette::HOT.linear(), 0.0),
+            paper: v4(palette::PAPER.linear(), 0.0),
         };
         self.queue.write_buffer(
             &self.post_uniforms[2 * BLOOM_LEVELS - 1],
@@ -1169,6 +1256,7 @@ impl Renderer {
             params: [0.0; 4],
             grade: [1.0, 1.0, 1.0, if self.out_srgb { 1.0 } else { 0.0 }],
             extra: [0.0; 4],
+            ..Zeroable::zeroed()
         };
         self.queue.write_buffer(
             &self.post_uniforms[2 * BLOOM_LEVELS],
@@ -1398,9 +1486,11 @@ fn scaled(w: u32, h: u32, s: f32) -> (u32, u32) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_targets(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
+    composite_bgl: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     uniforms: &[wgpu::Buffer],
     hdr_format: wgpu::TextureFormat,
@@ -1475,7 +1565,32 @@ fn create_targets(
         };
         post_groups.push(group(low, &down[l].0, &uniforms[BLOOM_LEVELS + l]));
     }
-    post_groups.push(group(&hdr, &up[0], &uniforms[2 * BLOOM_LEVELS - 1]));
+    post_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("composite"),
+        layout: composite_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&hdr),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&up[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: uniforms[2 * BLOOM_LEVELS - 1].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&depth),
+            },
+        ],
+    }));
     post_groups.push(group(&ldr, &ldr, &uniforms[2 * BLOOM_LEVELS]));
     Targets {
         iw,

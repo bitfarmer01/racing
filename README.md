@@ -40,19 +40,28 @@ Open http://localhost:8000/web/. The built bundles in `web/pkg-webgpu` and
   off. Crashed riders get back on after a couple of seconds.
 - **Rivals** race the same physics with their own lines, skill and aggression.
 
+## Look
+
+One palette and one list of race events drive the scene, the post finish
+and the HUD: ink outlines drawn from the depth buffer, anime-style impact
+frames on hits and crashes, inked speed lines while boosting, per-track
+split tone and grain, and a track accent that runs from the menu to the
+minimap. See [docs/design-system.md](docs/design-system.md).
+
 ## Layout
 
 - `crates/sim` — fixed-tick clock, deterministic RNG, small pools
 - `crates/game` — tracks (spline centreline, banking, elevation, terrain),
   bike physics, race rules, AI rivals, scenery placement
-- `crates/render` — the wgpu renderer: HDR scene with sun shadows, PBR-ish
+- `crates/render` — the wgpu renderer (`style.rs` is the palette): HDR scene with sun shadows, PBR-ish
   shading, sky and fog, water, instanced scenery with LODs, particles,
   bloom, tone mapping, colour grade and FXAA, with dynamic resolution
 - `crates/runtime` — the session the browser and native tools share: fixed
   120 Hz simulation with interpolation, chase camera, effects, HUD snapshot;
   `shot` renders screenshots and frame-time benches natively
 - `crates/web` — wasm-bindgen entry points for the page
-- `web/` — page, loader, HUD, menus, audio
+- `web/` — page, loader, HUD, menus, audio; `design.js` holds the page's
+  half of the design system (tokens and the cue direction table)
 
 ## Build and check
 

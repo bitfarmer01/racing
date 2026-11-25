@@ -29,6 +29,15 @@ pub fn track_list() -> String {
         .join("\n")
 }
 
+/// The design system's CSS custom properties for a track (`--ink`, `--hot`,
+/// `--accent` and the rest), so the HTML HUD wears the same palette as the
+/// scene. Unknown slugs get the first track's.
+#[wasm_bindgen]
+pub fn style_css(slug: &str) -> String {
+    let def = game::tracks::by_slug(slug).unwrap_or(game::tracks::catalog()[0]);
+    render::style::css_vars(&def.theme)
+}
+
 /// Number of floats in [`Game::hud`].
 pub const HUD_LEN: usize = 22;
 
@@ -273,6 +282,13 @@ mod browser {
             self.renderer.resize(w, h);
         }
 
+        /// Ink outlines and impact frames on or off (impact frames are off
+        /// for players who ask for reduced motion).
+        pub fn set_effects(&mut self, ink: bool, flashes: bool) {
+            self.renderer.settings.ink = ink;
+            self.renderer.settings.flashes = flashes;
+        }
+
         /// Internal render resolution as a fraction of the canvas (0.35..1).
         pub fn set_render_scale(&mut self, s: f32) {
             self.renderer.set_render_scale(s);
@@ -382,6 +398,18 @@ mod tests {
         for line in list.lines() {
             assert_eq!(line.split('|').count(), 4, "{line}");
         }
+    }
+
+    #[test]
+    fn style_css_follows_the_track() {
+        let a = style_css(catalog()[0].slug);
+        let b = style_css(catalog()[1].slug);
+        assert!(
+            a.contains("--accent:") && a.contains("--hot: #ff4d2e;"),
+            "{a}"
+        );
+        assert_ne!(a, b, "tracks share the palette but not the accent");
+        assert_eq!(style_css("nope"), a);
     }
 
     #[test]

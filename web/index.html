@@ -6,8 +6,14 @@
   <title>Racing</title>
   <link rel="icon" href="data:,">
   <style>
+    /* Design tokens. The same palette drives the 3D scene (render/src/style.rs);
+       loader.js overwrites these from the wasm on boot and on each track
+       change, so --accent follows the track. */
     :root {
-      --ink: #f4f1ea;
+      --ink: #14121a;
+      --paper: #f4f1ea;
+      --accent: #ffb347;
+      --accent-rgb: 255, 179, 71;
       --dim: rgba(244, 241, 234, 0.62);
       --glass: rgba(10, 12, 18, 0.46);
       --glass-strong: rgba(10, 12, 18, 0.72);
@@ -20,7 +26,7 @@
     }
     * { box-sizing: border-box; }
     html, body {
-      margin: 0; height: 100%; overflow: hidden; background: #07080b; color: var(--ink);
+      margin: 0; height: 100%; overflow: hidden; background: #07080b; color: var(--paper);
       font-family: var(--font); -webkit-font-smoothing: antialiased; user-select: none;
     }
     canvas#game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; outline: none; }
@@ -40,26 +46,26 @@
     #menu { z-index: 20; display: flex; flex-direction: column; justify-content: space-between;
       background: linear-gradient(90deg, rgba(7, 8, 11, 0.82) 0%, rgba(7, 8, 11, 0.35) 45%, rgba(7, 8, 11, 0) 70%); padding: 6vh 5vw; }
     .brand { font-weight: 900; font-style: italic; letter-spacing: -0.02em; font-size: clamp(48px, 8vw, 104px); line-height: 0.9; margin: 0;
-      text-shadow: 0 6px 40px rgba(0, 0, 0, 0.5); }
+      text-shadow: 5px 5px 0 var(--ink), 0 6px 40px rgba(0, 0, 0, 0.5); }
     .brand span { color: var(--hot); }
     .tag { color: var(--dim); margin: 14px 0 0; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; }
     .tracks { display: flex; flex-direction: column; gap: 10px; width: min(440px, 90vw); margin-top: 4vh; }
-    .track { text-align: left; background: var(--glass); border: 1px solid var(--line); color: var(--ink); border-radius: 12px; padding: 14px 16px;
+    .track { text-align: left; background: var(--glass); border: 1px solid var(--line); color: var(--paper); border-radius: 12px; padding: 14px 16px;
       cursor: pointer; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: transform 0.15s, border-color 0.15s, background 0.15s; font: inherit; }
     .track:hover { transform: translateX(4px); border-color: rgba(255, 255, 255, 0.3); }
-    .track.sel { border-color: var(--hot); background: rgba(40, 14, 10, 0.6); }
+    .track.sel { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.16); box-shadow: inset 4px 0 0 var(--accent), 4px 4px 0 var(--ink); }
     .track .t { font-weight: 800; font-size: 18px; display: flex; justify-content: space-between; align-items: baseline; }
     .track .t small { color: var(--dim); font-weight: 600; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
     .track .b { color: var(--dim); font-size: 13px; margin-top: 4px; line-height: 1.4; }
     .actions { display: flex; gap: 12px; align-items: center; margin-top: 22px; flex-wrap: wrap; }
     .btn { font: inherit; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; border-radius: 999px; padding: 14px 30px; cursor: pointer;
-      border: 1px solid var(--line); background: var(--glass); color: var(--ink); }
+      border: 1px solid var(--line); background: var(--glass); color: var(--paper); }
     .btn.primary { background: var(--hot); border-color: var(--hot); color: #fff; box-shadow: 0 10px 30px rgba(255, 77, 46, 0.35); }
     .btn:hover { filter: brightness(1.1); }
     .keys { color: var(--dim); font-size: 13px; line-height: 1.9; }
-    kbd { font: 700 11px var(--font); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; margin: 0 2px; color: var(--ink); background: rgba(255, 255, 255, 0.06); }
+    kbd { font: 700 11px var(--font); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; margin: 0 2px; color: var(--paper); background: rgba(255, 255, 255, 0.06); }
     .corner { position: fixed; right: 18px; top: 16px; display: flex; gap: 8px; z-index: 25; }
-    .icon { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line); background: var(--glass); color: var(--ink); cursor: pointer; font-size: 16px; }
+    .icon { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line); background: var(--glass); color: var(--paper); cursor: pointer; font-size: 16px; }
 
     /* HUD */
     #hud { z-index: 10; pointer-events: none; }
@@ -70,11 +76,11 @@
     #pos .p sup { font-size: 22px; margin-left: 2px; }
     #pos .p small { font-size: 22px; color: var(--dim); font-style: normal; font-weight: 700; margin-left: 6px; }
     .row { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; color: var(--dim); margin-top: 6px; }
-    .row b { color: var(--ink); font-weight: 700; }
+    .row b { color: var(--paper); font-weight: 700; }
     .bal { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.1); margin-top: 10px; overflow: hidden; }
     .bal i { display: block; height: 100%; width: 100%; background: var(--good); transition: width 0.15s, background 0.15s; }
     .bal i.low { background: var(--hot); }
-    #lapline { font-weight: 800; font-size: 15px; color: var(--ink); letter-spacing: 0.06em; margin-top: 6px; }
+    #lapline { font-weight: 800; font-size: 15px; color: var(--accent); letter-spacing: 0.06em; margin-top: 6px; }
     #map { right: 22px; top: 18px; width: 200px; height: 200px; padding: 0; overflow: hidden; }
     #map canvas { width: 100%; height: 100%; display: block; }
     #dash { right: 22px; bottom: 22px; width: 250px; padding: 14px 18px 16px; }
@@ -91,10 +97,12 @@
     #draft { color: var(--good); opacity: 0; transition: opacity 0.2s; }
     #draft.on { opacity: 1; }
     #center { position: absolute; left: 0; right: 0; top: 24vh; text-align: center; }
-    #count { font-weight: 900; font-style: italic; font-size: clamp(90px, 16vw, 190px); line-height: 1; text-shadow: 0 10px 40px rgba(0, 0, 0, 0.55); }
+    #count { font-weight: 900; font-style: italic; font-size: clamp(90px, 16vw, 190px); line-height: 1;
+      -webkit-text-stroke: 3px var(--ink); paint-order: stroke fill; text-shadow: 7px 7px 0 var(--ink), 0 10px 40px rgba(0, 0, 0, 0.55); }
     #count.go { color: var(--good); }
     #banner { display: inline-block; margin-top: 10px; font-weight: 900; font-style: italic; font-size: clamp(26px, 4vw, 44px); letter-spacing: 0.02em;
-      padding: 6px 22px; border-radius: 10px; text-shadow: 0 4px 20px rgba(0, 0, 0, 0.6); }
+      padding: 6px 22px; border-radius: 10px; text-shadow: 3px 3px 0 var(--ink); }
+    #banner.lap { background: var(--accent); color: var(--ink); text-shadow: none; box-shadow: 5px 5px 0 var(--ink); }
     #banner.warn { background: rgba(200, 20, 20, 0.75); }
     #toast { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); text-align: center; }
     #toast div { font-weight: 800; font-size: 18px; padding: 8px 18px; border-radius: 999px; background: var(--glass-strong); border: 1px solid var(--line); margin-bottom: 6px;

@@ -13,6 +13,7 @@ export const game_frame: (a: number, b: number, c: number, d: number, e: number,
 export const game_hdr_format: (a: number) => [number, number];
 export const game_hud: (a: number) => [number, number];
 export const game_resize: (a: number, b: number, c: number) => void;
+export const game_set_effects: (a: number, b: number, c: number) => void;
 export const game_set_paused: (a: number, b: number) => void;
 export const game_set_render_scale: (a: number, b: number) => void;
 export const game_show: (a: number, b: number, c: number) => void;
@@ -22,6 +23,7 @@ export const game_stats: (a: number) => [number, number];
 export const game_track: (a: number) => [number, number];
 export const game_track_outline: (a: number) => [number, number];
 export const start: () => void;
+export const style_css: (a: number, b: number) => [number, number];
 export const track_list: () => [number, number];
 export const wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_: (a: number, b: number, c: any) => [number, number];

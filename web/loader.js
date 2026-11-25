@@ -4,9 +4,10 @@
 
 import { RaceAudio } from './audio.js';
 import {
-  HUD, CUE, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
+  HUD, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
   ResolutionGovernor,
 } from './hud.js';
+import { applyStyle, canvasPalette, direct, prefersReducedMotion } from './design.js';
 
 const $ = (id) => document.getElementById(id);
 let canvasEl = $('game');
@@ -29,6 +30,18 @@ const ui = {
 };
 
 const params = new URLSearchParams(location.search);
+let pal = canvasPalette({});
+let reducedMotion = prefersReducedMotion();
+
+// Puts the track's tokens on the page and refreshes canvas colours.
+function applyTrackStyle(mod, slug) {
+  pal = canvasPalette(applyStyle(mod.style_css(slug)));
+  mapBg = null;
+}
+
+function applyEffects() {
+  game.set_effects(params.get('ink') !== '0', !reducedMotion);
+}
 const DPR_CAP = 1.5;
 
 // ---------------------------------------------------------------- boot ----
@@ -133,6 +146,7 @@ function padEdge(pad, i) {
 // ---------------------------------------------------------------- state ----
 
 let game = null;
+let wasm = null;
 let tracks = [];
 let selected = 0;
 let mode = 'menu'; // menu | race | paused | results
@@ -175,6 +189,7 @@ function selectTrack(i) {
   localStorage.setItem('track', tracks[selected].slug);
   renderTrackList();
   game.show(tracks[selected].slug);
+  applyTrackStyle(wasm, tracks[selected].slug);
   loadMap();
 }
 
@@ -266,7 +281,7 @@ function drawTach(rpm, boosting) {
     const hh = h * (0.32 + 0.68 * Math.pow(i / (bars - 1), 1.6));
     const on = i < lit;
     let col = 'rgba(255,255,255,0.12)';
-    if (on) col = r > REDLINE_RPM ? '#ff4d2e' : r > REDLINE_RPM * 0.8 ? '#ffc23d' : boosting ? '#48c8ff' : '#f4f1ea';
+    if (on) col = r > REDLINE_RPM ? pal.hot : r > REDLINE_RPM * 0.8 ? pal.gold : boosting ? pal.boost : pal.paper;
     g.fillStyle = col;
     g.fillRect(i * (bw + gap), h - hh, bw, hh);
   }
@@ -288,10 +303,10 @@ function drawMinimap(points) {
       else b.lineTo(x, y);
     }
     b.closePath();
-    b.strokeStyle = 'rgba(0,0,0,0.5)';
+    b.strokeStyle = pal.ink;
     b.lineWidth = 18;
     b.stroke();
-    b.strokeStyle = 'rgba(244,241,234,0.85)';
+    b.strokeStyle = pal.accent;
     b.lineWidth = 8;
     b.stroke();
     const [sx, sy] = mapper(outline[0], outline[1]);
@@ -308,10 +323,10 @@ function drawMinimap(points) {
     const me = i === 0;
     g.beginPath();
     g.arc(x, y, me ? 13 : 9, 0, Math.PI * 2);
-    g.fillStyle = me ? '#ff4d2e' : 'rgba(30,34,44,0.95)';
+    g.fillStyle = me ? pal.hot : pal.ink;
     g.fill();
     g.lineWidth = me ? 4 : 3;
-    g.strokeStyle = me ? '#fff' : 'rgba(244,241,234,0.8)';
+    g.strokeStyle = pal.paper;
     g.stroke();
   }
 }
@@ -355,6 +370,7 @@ function updateHud(h) {
   setText(ui.banner, banner);
   show(ui.banner, banner !== '');
   ui.banner.classList.toggle('warn', warn);
+  ui.banner.classList.toggle('lap', banner === 'FINISH');
 }
 
 function showResults() {
@@ -399,48 +415,18 @@ function audioFrame(h, extra = {}) {
   };
 }
 
+// What each cue does on the page lives in design.js (DIRECTION).
 function handleCues(cues, h) {
   for (const c of cues) {
-    switch (c.code) {
-      case CUE.WALL:
-        flash(0.25 + c.a / 40);
-        if (audio.ctx) audio.blip(70, 0.12, 'sawtooth', Math.min(0.5, 0.15 + c.a / 60));
-        break;
-      case CUE.CONTACT:
-        if (audio.ctx) audio.blip(120, 0.06, 'square', 0.2);
-        break;
-      case CUE.HIT_LANDED:
-        toast('Hit!', 'best');
-        if (audio.ctx) audio.blip(180, 0.08, 'triangle', 0.4);
-        break;
-      case CUE.GOT_HIT:
-        flash(0.5);
-        break;
-      case CUE.CRASH:
-        flash(0.9);
-        break;
-      case CUE.LAP: {
-        const lapDone = c.a;
-        const best = h[HUD.BEST_LAP];
-        const isBest = best >= 0 && Math.abs(best - c.b) < 0.0005;
-        toast(`Lap ${lapDone}  ${formatTime(c.b)}${isBest ? '  · best' : ''}`, isBest ? 'best' : '');
-        if (lapDone === h[HUD.LAPS] - 1) setTimeout(() => toast('Final lap', 'bad'), 600);
-        break;
-      }
-      case CUE.FINISHED:
-        finishedAt = performance.now();
-        break;
-      case CUE.OVERTAKE:
-        if (c.a > 0) {
-          toast(`${h[HUD.POSITION]}${ordinal(h[HUD.POSITION])}`, 'best');
-          if (audio.ctx) audio.blip(660, 0.07, 'sine', 0.18);
-        } else {
-          toast(`${h[HUD.POSITION]}${ordinal(h[HUD.POSITION])}`, 'bad');
-        }
-        break;
-      default:
-        break;
+    const d = direct(c, h);
+    if (d.flash && !reducedMotion) flash(d.flash);
+    if (d.sound && audio.ctx) audio.blip(...d.sound);
+    if (d.toast) toast(...d.toast);
+    if (d.later) {
+      const [ms, text, kind] = d.later;
+      setTimeout(() => toast(text, kind), ms);
     }
+    if (d.finished) finishedAt = performance.now();
   }
 }
 
@@ -565,8 +551,15 @@ window.addEventListener('pointerdown', () => audio.unlock(), { once: false });
   try {
     const { mod, game: g } = await boot();
     game = g;
+    wasm = mod;
     tracks = parseTracks(mod.track_list());
     selected = Math.max(0, tracks.findIndex((t) => t.slug === game.track()));
+    applyTrackStyle(mod, game.track());
+    applyEffects();
+    globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').addEventListener?.('change', (e) => {
+      reducedMotion = e.matches;
+      applyEffects();
+    });
     renderTrackList();
     if (localStorage.getItem('muted')) {
       audio.setMuted(true);

@@ -135,6 +135,15 @@ export class Game {
         wasm.game_resize(this.__wbg_ptr, w, h);
     }
     /**
+     * Ink outlines and impact frames on or off (impact frames are off
+     * for players who ask for reduced motion).
+     * @param {boolean} ink
+     * @param {boolean} flashes
+     */
+    set_effects(ink, flashes) {
+        wasm.game_set_effects(this.__wbg_ptr, ink, flashes);
+    }
+    /**
      * @param {boolean} paused
      */
     set_paused(paused) {
@@ -239,6 +248,28 @@ export function backend_name() {
 
 export function start() {
     wasm.start();
+}
+
+/**
+ * The design system's CSS custom properties for a track (`--ink`, `--hot`,
+ * `--accent` and the rest), so the HTML HUD wears the same palette as the
+ * scene. Unknown slugs get the first track's.
+ * @param {string} slug
+ * @returns {string}
+ */
+export function style_css(slug) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.style_css(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
 }
 
 /**
@@ -1270,7 +1301,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1321, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1322, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_);
             return ret;
         },

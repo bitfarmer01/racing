@@ -31,6 +31,10 @@ Simulation plus effects: about 0.05 ms per frame.
 Scenery level of detail and dropping terrain from the shadow pass took Alpine
 Lake from 99 ms to 58 ms at 640×360 (605 k to 238 k triangles).
 
+The design-system pass (ink outlines, speed lines, impact frames, split tone,
+grain) runs inside the existing composite pass. Re-measured afterwards:
+640×360 54–61 ms, 1280×720 108–117 ms, same draw and triangle counts.
+
 ## Before (main @ 53aa156)
 
 The previous build was a 2D sprite scaler (two draw calls), measured by its

@@ -148,9 +148,15 @@ impl Offscreen {
 }
 
 fn render(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
+    render_impact(r, s, view, 0.0);
+}
+
+/// Renders with an impact frame forced on (1) or left to the session (0).
+fn render_impact(r: &mut Renderer, s: &Session, view: &wgpu::TextureView, impact: f32) {
     let bikes = s.bike_draws();
     let particles = s.particles();
-    let input = s.frame_input(&bikes, &particles);
+    let mut input = s.frame_input(&bikes, &particles);
+    input.impact = input.impact.max(impact);
     r.render(view, &input);
 }
 
@@ -181,7 +187,10 @@ fn main() {
     );
     eprintln!("hdr format: {:?}", r.hdr_format());
     // RENDER_SCALE=0.5 benches what the browser's dynamic resolution falls back to.
-    if let Some(scale) = std::env::var("RENDER_SCALE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(scale) = std::env::var("RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         r.set_render_scale(scale);
     }
 
@@ -238,6 +247,8 @@ fn main() {
         advance(&mut s, 14.0);
         render(&mut r, &s, &off.view);
         off.save(&gpu, &out.join(format!("{}-2-chase.png", def.slug)));
+        render_impact(&mut r, &s, &off.view, 1.0);
+        off.save(&gpu, &out.join(format!("{}-4-impact.png", def.slug)));
         advance(&mut s, 9.0);
         s.cam_mode = CamMode::Far;
         advance(&mut s, 0.5);
