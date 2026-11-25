@@ -62,9 +62,11 @@ pub fn start_swing(combat: &mut Combat, attack: Attack) {
 /// Adjacency: lateral distance across the road under which two riders are
 /// "alongside", in meters.
 pub const ADJACENT_LATERAL: f32 = 2.5;
-/// Punch reach along the road, in meters: short — a hooked punch, not a
-/// jab across a gap.
-pub const PUNCH_REACH: f32 = 2.4;
+/// Longitudinal reach of a punch, in meters. Sits well outside the
+/// bike-overlap band (~2.2) so a pace-matching rival holding the 2.3 m
+/// stagger can never flicker across the reach boundary — that flicker
+/// fragmented one engagement into shard windows (audit item 6).
+pub const PUNCH_REACH: f32 = 3.2;
 /// Kick reach along the road, in meters: a full legswing, longer than the
 /// punch.
 pub const KICK_REACH: f32 = 4.0;
@@ -80,9 +82,11 @@ pub const RETALIATION_TRAFFIC_RAGE: f32 = 2.0;
 pub const NEAR_TRAFFIC_RANGE: f32 = 8.0;
 /// Instability at which a rider dismounts.
 pub const INSTABILITY_DISMOUNT: f32 = 100.0;
-/// Instability one landed punch adds. Two punches at full stability cross
-/// the threshold with the decay between swings accounted for.
-pub const PUNCH_HIT: f32 = 55.0;
+/// Instability one landed punch adds. A rapid four-punch chain crosses
+/// the threshold with the decay between swings accounted for; a two-punch
+/// rattle stays under it — fights should hold long enough for the player
+/// to take part (audit item 6).
+pub const PUNCH_HIT: f32 = 30.0;
 /// Instability one landed kick adds: three kicks cross the threshold.
 pub const KICK_HIT: f32 = 40.0;
 /// Instability that fades per second while a rider is not being hit, so
@@ -92,15 +96,40 @@ pub const INSTABILITY_DECAY: f32 = 10.0;
 pub const PUNCH_COST: f32 = 0.35;
 /// Stamina a landed kick costs the attacker.
 pub const KICK_COST: f32 = 0.25;
-/// Stamina a landed hit drains from the target.
-pub const HIT_STAMINA_DRAIN: f32 = 0.4;
+/// Stamina a landed hit drains from the target: five clean punches to
+/// empty a fresh bar, so a dismount is a grind, not a moment.
+pub const HIT_STAMINA_DRAIN: f32 = 0.2;
 /// Ticks between a rival's wind-up pose starting and the hit landing: the
 /// telegraph. Long enough that the swing pose (same duration) is clearly
 /// visible before damage applies.
 pub const WINDUP_TICKS: u32 = 18;
-/// Seconds a rival in punch reach of the player holds the player's pace,
-/// so a fight stays joined long enough for the player to take part.
-pub const PACE_MATCH_SECS: f32 = 3.0;
+/// Speed difference under which a rival and the player are considered in a
+/// fight rather than one arriving at or abandoning the other, in m/s:
+/// only then does pace matching apply.
+pub const PACE_MATCH_TOLERANCE: f32 = 8.0;
+/// Seconds a pace-matching engagement holds: a rival in punch reach rides
+/// the player's trimmed pace for this long, then breaks off. Long enough
+/// that a fight, not a passing crossing, is the typical reach episode
+/// (audit item 6 asks for a 2 s median) — and long enough to spare the
+/// first second or two the servo spends closing from the arm range.
+pub const PACE_MATCH_SECS: f32 = 8.0;
+/// Cool-down after an engagement before a rival may join again, in
+/// seconds: long enough that a break-off is a real gap for overtaking,
+/// short enough that a rival crossing punch reach during the cooldown
+/// re-engages instead of shearing past unengaged — unengaged crossings
+/// are the shard windows that drag the reach-stay median down.
+pub const PACE_MATCH_COOLDOWN: f32 = 1.5;
+/// Longitudinal stagger a pace-matching rival holds from the player, in
+/// meters: just past the bike-length overlap band (`BIKE_HALF_LENGTH * 2`)
+/// and well inside punch reach, so a fighting rival shadows without ever
+/// rubbing and without flickering out of reach.
+pub const PACE_STAGGER: f32 = 2.3;
+/// How fast a pace-matching rival closes or eases toward the stagger, in
+/// m/s: a rejoined rival shadows the player instead of ramming. Twice the
+/// old trim so a rival arming at the edge of the arm range reaches punch
+/// reach within the first second or two of the engagement instead of
+/// burning a third of it still out of reach.
+pub const PACE_TRIM: f32 = 3.0;
 /// How many times a rider can be dismounted by hits in one race. Past the
 /// cap, instability and drains still hurt, but the rider stays in the
 /// saddle — a race is not a pile-up.
@@ -223,14 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn two_punches_or_three_kicks_cross_the_dismount_threshold() {
-        // The spec'd hit counts must survive the instability decay over the
-        // swing cooldown: punch-punch with the cooldown between must cross.
+    fn four_punches_or_three_kicks_cross_the_dismount_threshold() {
+        // A beatdown, not a pair, dumps a fresh rider: four rapid punches
+        // must cross the instability threshold, while a two-punch rattle
+        // stays under it — fights should hold long enough for the player
+        // to take part (audit item 6).
         let gap_secs = ATTACK_COOLDOWN;
-        let punch_chain = PUNCH_HIT + PUNCH_HIT - INSTABILITY_DECAY * gap_secs;
+        let punch_chain = PUNCH_HIT * 4.0 - INSTABILITY_DECAY * 3.0 * gap_secs;
         assert!(
             punch_chain >= INSTABILITY_DISMOUNT,
             "punch chain: {punch_chain}"
+        );
+        let punch_pair = PUNCH_HIT * 2.0 - INSTABILITY_DECAY * gap_secs;
+        assert!(
+            punch_pair < INSTABILITY_DISMOUNT,
+            "punch pair: {punch_pair}"
         );
         let kick_chain = KICK_HIT * 3.0 - INSTABILITY_DECAY * 2.0 * ATTACK_COOLDOWN;
         assert!(
