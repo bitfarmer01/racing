@@ -74,6 +74,29 @@ impl QualityTier {
         }
     }
 
+    /// MSAA sample count for the frame attachment (item 14): 4x on every
+    /// tier except the WebGL2 low-end floor, which renders unmultisampled —
+    /// 4x MSAA at native resolution is exactly the fixed cost the tier
+    /// ladder exists to remove, and the 2015-iGPU floor is where it hurts.
+    pub const fn msaa_sample_count(self) -> u32 {
+        match self {
+            Self::WebGl2LowEnd => 1,
+            Self::WebGl2Capable | Self::WebGpuLowEnd | Self::WebGpuCapable => 4,
+        }
+    }
+
+    /// Backing size of the render surface at this tier's resolution scale,
+    /// in pixels (item 14): the renderer configures the surface at the
+    /// scaled size and the browser upscales on present. Dimensions never
+    /// drop below 1 px.
+    pub fn scaled_size(self, width: u32, height: u32) -> (u32, u32) {
+        let scale = self.resolution_scale();
+        (
+            ((width as f32 * scale).floor() as u32).max(1),
+            ((height as f32 * scale).floor() as u32).max(1),
+        )
+    }
+
     /// Optional effects this tier enables.
     pub const fn effects(self) -> Effects {
         match self {
@@ -122,4 +145,40 @@ impl QualityTier {
 pub enum Backend {
     WebGl2,
     WebGpu,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_low_end_webgl2_tier_renders_unmultisampled() {
+        // Item 14: MSAA was pinned at 4x for every tier; the ladder must
+        // actually differentiate where it matters most.
+        assert_eq!(QualityTier::WebGl2LowEnd.msaa_sample_count(), 1);
+        assert_eq!(QualityTier::WebGl2Capable.msaa_sample_count(), 4);
+        assert_eq!(QualityTier::WebGpuLowEnd.msaa_sample_count(), 4);
+        assert_eq!(QualityTier::WebGpuCapable.msaa_sample_count(), 4);
+        // And the low-end tier is also the softest at native resolution.
+        assert!(
+            QualityTier::WebGl2LowEnd.resolution_scale()
+                < QualityTier::WebGpuCapable.resolution_scale(),
+            "the low-end tier renders softer than the capable one"
+        );
+    }
+
+    #[test]
+    fn the_scaled_backing_size_tracks_the_resolution_scale() {
+        // 0.6 and 0.8 of a 1000x600 surface, floored to whole pixels.
+        assert_eq!(
+            QualityTier::WebGl2LowEnd.scaled_size(1_000, 600),
+            (600, 360)
+        );
+        assert_eq!(
+            QualityTier::WebGpuCapable.scaled_size(1_000, 600),
+            (800, 480)
+        );
+        // Degenerate sizes never collapse to zero.
+        assert_eq!(QualityTier::WebGl2LowEnd.scaled_size(1, 1), (1, 1));
+    }
 }

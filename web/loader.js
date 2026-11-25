@@ -1,6 +1,9 @@
 // Loader: picks the wasm bundle matching the browser's GPU backend, boots it,
 // and drives the frame loop.
 import { badgeForState } from './badge.js';
+import { DEMO_ZONES, buildZoneMarkers, highlightZone } from './zones.js';
+import { RaceTimer, formatTime } from './race-timer.js';
+import { RaceAudio } from './audio.js';
 //
 // Backend selection mirrors render::QualityTier::select — the loader probes
 // for a WebGPU adapter, then loads exactly one of the two builds produced by
@@ -28,10 +31,14 @@ const speedValue = document.getElementById('speed-value');
 const hudPos = document.getElementById('hud-pos');
 const hudLap = document.getElementById('hud-lap');
 const lapFill = document.getElementById('lap-fill');
+const lapBar = document.getElementById('lap-bar');
+const staminaFill = document.getElementById('stamina-fill');
 const riderStateEl = document.getElementById('rider-state');
 const countdownEl = document.getElementById('countdown');
 const finishEl = document.getElementById('finish');
 const finishText = document.getElementById('finish-text');
+const finishTimes = document.getElementById('finish-times');
+const muteButton = document.getElementById('mute-btn');
 const restartButton = document.getElementById('restart');
 const focusOverlay = document.getElementById('focus-overlay');
 const hudKeys = document.getElementById('hud-keys');
@@ -113,6 +120,16 @@ async function importBundle(bundle) {
   return glue;
 }
 
+// Audio lives at module scope so the mute control works from the very first
+// click, even before the wasm finishes booting. unlock() runs inside the
+// CLICK TO RIDE engagement gesture (autoplay policy — see audio.js).
+const audio = new RaceAudio();
+muteButton.addEventListener('click', () => {
+  audio.setMuted(!audio.muted);
+  setText(muteButton, audio.muted ? '🔇' : '🔊');
+  muteButton.title = audio.muted ? 'Unmute' : 'Mute';
+});
+
 async function boot() {
   const lowEnd = detectLowEndDevice();
   const hasWebGpu = await detectWebGpu();
@@ -151,13 +168,34 @@ async function boot() {
   hud.hidden = false;
   hudKeys.hidden = false;
 
-  const keys = { accelerate: false, brake: false, steerLeft: false, steerRight: false };
+  // Race clock (race-timer.js): fed from the fixed-60 Hz accumulator below —
+  // total time is ticks since the green light x 1/60; lap boundaries come
+  // from the lap counter the HUD already reads.
+  const timer = new RaceTimer();
+
+  // Zone ticks + labels on the lap bar. DEMO_ZONES is presentation config
+  // duplicated from crates/world/src/geometry.rs (ZoneLayout::FOR_TRACK) —
+  // that file is the demo course's source of truth; the course is fixed.
+  const zoneMarkers = buildZoneMarkers(DEMO_ZONES, game.lap_length());
+  lapBar.appendChild(zoneMarkers);
+
+  const keys = {
+    accelerate: false,
+    brake: false,
+    steerLeft: false,
+    steerRight: false,
+    punch: false,
+    kick: false,
+  };
   const map = {
     ArrowUp: 'accelerate', KeyW: 'accelerate',
     ArrowDown: 'brake', KeyS: 'brake', Space: 'brake',
     ArrowLeft: 'steerLeft', KeyA: 'steerLeft',
     ArrowRight: 'steerRight', KeyD: 'steerRight',
   };
+  // Combat keys are action semantics, not flag-sets: one swing per press,
+  // so key repeats don't re-arm a swing while the key is held.
+  const attackMap = { KeyX: 'punch', KeyZ: 'kick' };
 
   // Keys are captured on BOTH window and document: inside an iframe, which
   // of the two receives an event depends on how the embedding page targets
@@ -169,7 +207,9 @@ async function boot() {
   // and held-key repeats just re-set the same flag.
   const onKeyDown = (e) => {
     const key = map[e.code];
-    if (key) { keys[key] = true; e.preventDefault(); }
+    if (key) { keys[key] = true; e.preventDefault(); return; }
+    const attack = attackMap[e.code];
+    if (attack && !e.repeat) { keys[attack] = true; e.preventDefault(); }
   };
   const onKeyUp = (e) => {
     const key = map[e.code];
@@ -202,8 +242,17 @@ async function boot() {
   window.focus(); // best-effort: same-origin embedders may allow it; the overlay covers the rest
   refreshFocusUI();
 
+  // Audio unlock rides the same engagement events as focus capture; unlock()
+  // is idempotent, so every later click/keydown is a cheap no-op.
+  const unlockAudio = () => audio.unlock();
+  addEventListener('pointerdown', unlockAudio, true);
+  addEventListener('keydown', unlockAudio, true);
+  document.addEventListener('pointerdown', unlockAudio, true);
+  document.addEventListener('keydown', unlockAudio, true);
+
   restartButton.addEventListener('click', () => {
     game.restart();
+    timer.reset();
     finishEl.hidden = true;
   });
 
@@ -231,6 +280,7 @@ async function boot() {
     if (e.code !== 'KeyR' || e.repeat || e === lastRestartEvent) return;
     lastRestartEvent = e;
     game.restart();
+    timer.reset();
     finishEl.hidden = true;
   };
   addEventListener('keydown', onRestartKey);
@@ -277,14 +327,31 @@ async function boot() {
     // case. Rendering still happens every rAF. While paused, no ticks are fed
     // and the clock is kept current so unpausing doesn't burst catch-up ticks.
     const now = performance.now();
+    // Race-clock inputs, read once per frame from the glue the HUD already
+    // polls: the countdown gate and the lap counter drive the timer.
+    const countingDown = game.is_counting_down();
+    const lapIndex = game.lap_index();
+    const finishedNow = game.is_finished();
     if (paused) {
       lastFrameTime = now;
     } else {
       accumulator += Math.min(now - lastFrameTime, MAX_CATCH_UP_TICKS * TICK_MS);
       lastFrameTime = now;
       while (accumulator >= TICK_MS) {
-        game.advance_frame(keys.accelerate, keys.brake, keys.steerLeft, keys.steerRight);
+        game.advance_frame(
+          keys.accelerate,
+          keys.brake,
+          keys.steerLeft,
+          keys.steerRight,
+          keys.punch,
+          keys.kick,
+        );
+        // One swing per press: the first tick of the frame consumes it.
+        keys.punch = false;
+        keys.kick = false;
         accumulator -= TICK_MS;
+        // Total race time is ticks fed since the green light x 1/60.
+        timer.tick({ countingDown, lapIndex, finished: finishedNow });
       }
     }
 
@@ -302,6 +369,16 @@ async function boot() {
     );
     const progressPct = `${(Math.min(game.lap_progress(), 1) * 100).toFixed(1)}%`;
     if (lapFill.style.width !== progressPct) lapFill.style.width = progressPct;
+    highlightZone(zoneMarkers, DEMO_ZONES, game.player_distance());
+
+    // Combat stamina: amber bar while fighting, red once it runs low.
+    const stamina = Math.min(Math.max(game.player_stamina(), 0), 1);
+    const staminaPct = `${(stamina * 100).toFixed(1)}%`;
+    if (staminaFill.style.width !== staminaPct) staminaFill.style.width = staminaPct;
+    const low = stamina < 0.25;
+    if (staminaFill.classList.contains('low') !== low) {
+      staminaFill.classList.toggle('low', low);
+    }
 
     updateStateBadge(game.rider_state(), game.is_counting_down());
 
@@ -313,11 +390,28 @@ async function boot() {
       countdownEl.hidden = true;
     }
 
-    // Finish: show the result, race keeps rendering behind it.
-    if (game.is_finished()) {
+    // Audio cues, fed exactly what the HUD strip already reads (audio.js):
+    // engine tone tracks the HUD speed; hit/crash/countdown cues come from
+    // the stamina bar, the rider-state bitmask, and the countdown overlay.
+    audio.update({
+      speedKmh: game.speed_kmh(),
+      state: game.rider_state(),
+      stamina: Math.min(Math.max(game.player_stamina(), 0), 1),
+      countingDown,
+      countdownSecs: game.countdown_secs(),
+      paused,
+      finished: finishedNow,
+    });
+
+    // Finish: show the result and the clock, race keeps rendering behind it.
+    if (finishedNow) {
       setText(
         finishText,
         `You finished ${ordinal(game.race_position())} of ${game.bike_count()}.`,
+      );
+      setText(
+        finishTimes,
+        `Total time ${formatTime(timer.totalSeconds)} · Best lap ${formatTime(timer.bestLapSeconds)}`,
       );
       finishEl.hidden = false;
     }

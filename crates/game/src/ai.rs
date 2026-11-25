@@ -7,8 +7,9 @@
 //! curvature at the near lookahead point. The same state, geometry, and
 //! distance always produce the same decision — no RNG in the tick path.
 //!
-//! Positive curvature bends the road left (heading increases), so the inside
-//! of a left-hand corner is on the negative-lateral side.
+//! Positive curvature bends the road right (the centreline shifts
+//! positive), so the inside of a left-hand corner — negative curvature — is
+//! on the negative-lateral side.
 
 use crate::input::{Intent, Steer, Throttle};
 use world::RoadGeometry;
@@ -21,9 +22,26 @@ pub const LOOKAHEAD_NEAR: f32 = 30.0;
 pub const CORNER_SENSITIVITY: f32 = 80.0;
 /// Curvature below this is treated as straight, in 1/meters.
 pub const CURVE_DEADZONE: f32 = 0.004;
+/// Half the lateral span of lanes the grid spreads across, in meters: a
+/// six-rival field then rides lanes a lane-and-a-half apart, clear of the
+/// side-crash gap and of the shoulder rumble band.
+pub const GRID_HALF_SPAN: f32 = 4.0;
 /// How far off the preferred lane toward the inside of a corner the AI leans,
-/// in meters.
-pub const INSIDE_BIAS: f32 = 2.0;
+/// in meters. Scaled per rival by [`lane_bias_factor`] so a packed field
+/// spreads across the bend instead of stacking on one line.
+pub const INSIDE_BIAS: f32 = 3.0;
+
+/// The share of [`INSIDE_BIAS`] a rival on lane `lane` takes: riders near
+/// an edge barely cut in, riders near the centre cut deepest. Keeps
+/// in-bend lines apart by roughly a lane width.
+pub fn lane_bias_factor(lane: f32) -> f32 {
+    (0.5 + 0.5 * (lane / GRID_HALF_SPAN)).clamp(0.1, 0.9)
+}
+
+/// Curvature at which the inside-line bias reaches its full
+/// [`INSIDE_BIAS`]: the demo track's sharpest bend. Gentler bends bias
+/// proportionally, so the demo's 0.003 left bend still cuts in.
+pub const INSIDE_BIAS_CURVATURE: f32 = 0.005;
 /// Lateral error below which the AI stops steering, in meters.
 pub const LANE_DEADZONE: f32 = 0.25;
 /// Speed error below which the AI coasts rather than throttles, in m/s.
@@ -41,13 +59,16 @@ pub fn corner_speed(curvature: f32, top_speed: f32) -> f32 {
 ///
 /// `speed` and `lateral` are the rival's current state, `distance` is its
 /// position along the road, and `target_lane` is its preferred lateral
-/// offset. All world lookups run at `distance + LOOKAHEAD_*`.
+/// offset. `avoid`, when set, is an absolute lane to dodge to because
+/// another bike is in the way — it overrides the preferred line for the
+/// tick. All world lookups run at `distance + LOOKAHEAD_*`.
 pub fn decide(
     speed: f32,
     lateral: f32,
     distance: f32,
     target_lane: f32,
     top_speed: f32,
+    avoid: Option<f32>,
     geometry: &RoadGeometry,
 ) -> Intent {
     // Far lookahead: how fast this corner may be taken.
@@ -63,15 +84,19 @@ pub fn decide(
     };
 
     // Near lookahead: lean toward the inside of the upcoming corner.
+    // RoadGeometry is authoritative: negative curvature is a left bend and
+    // the centreline shifts negative, so the inside of a bend lies on the
+    // same side as the curvature sign. The bias scales with bend severity
+    // up to INSIDE_BIAS_CURVATURE instead of a hard deadzone — the demo
+    // track's gentlest bend (0.003) must still visibly cut in.
     let curvature_near = geometry.curvature_at(distance + LOOKAHEAD_NEAR);
-    let inside_bias = if curvature_near.abs() < CURVE_DEADZONE {
-        0.0
-    } else {
-        -curvature_near.signum() * INSIDE_BIAS
-    };
+    let severity = (curvature_near.abs() / INSIDE_BIAS_CURVATURE).min(1.0);
+    let inside_bias =
+        curvature_near.signum() * INSIDE_BIAS * lane_bias_factor(target_lane) * severity;
 
     // Lateral error drives steering; a small deadzone stops dithering.
-    let lane_error = target_lane + inside_bias - lateral;
+    let lane_target = avoid.unwrap_or(target_lane + inside_bias);
+    let lane_error = lane_target - lateral;
     let steer = if lane_error > LANE_DEADZONE {
         Steer::Right
     } else if lane_error < -LANE_DEADZONE {
@@ -80,7 +105,13 @@ pub fn decide(
         Steer::None
     };
 
-    Intent { throttle, steer }
+    // Rival pursuit never attacks: retaliation resolves in the race's
+    // combat pass, not through a steering intent.
+    Intent {
+        throttle,
+        steer,
+        attack: None,
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +138,7 @@ mod tests {
 
     #[test]
     fn straight_road_means_full_throttle_and_centreline_hold() {
-        let intent = decide(20.0, 1.0, 100.0, 0.0, MAX_SPEED, &straight());
+        let intent = decide(20.0, 1.0, 100.0, 0.0, MAX_SPEED, None, &straight());
         assert_eq!(intent.throttle, Throttle::Accelerate, "below target speed");
         // 1 m right of the target lane: steer back left.
         assert_eq!(intent.steer, Steer::Left);
@@ -116,7 +147,7 @@ mod tests {
     #[test]
     fn near_target_speed_the_ai_coasts() {
         let target = corner_speed(0.0, MAX_SPEED);
-        let intent = decide(target, 0.0, 0.0, 0.0, MAX_SPEED, &straight());
+        let intent = decide(target, 0.0, 0.0, 0.0, MAX_SPEED, None, &straight());
         assert_eq!(intent.throttle, Throttle::Coast);
         assert_eq!(intent.steer, Steer::None, "on the lane: no steering");
     }
@@ -124,27 +155,28 @@ mod tests {
     #[test]
     fn too_fast_for_a_corner_means_brake() {
         let corner = left_hand(400.0, 0.02);
-        let intent = decide(MAX_SPEED, 0.0, 0.0, 0.0, MAX_SPEED, &corner);
+        let intent = decide(MAX_SPEED, 0.0, 0.0, 0.0, MAX_SPEED, None, &corner);
         assert_eq!(intent.throttle, Throttle::Brake);
     }
 
     #[test]
     fn left_hand_corner_biases_the_inside_line_left() {
-        let corner = left_hand(400.0, 0.02);
-        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, &corner);
-        // Positive curvature (left) pulls the target lane negative (left).
+        let corner = left_hand(400.0, -0.02);
+        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, None, &corner);
+        // Negative curvature (a left bend) pulls the target lane negative
+        // (left) — the inside is the side the centreline shifts toward.
         assert_eq!(intent.steer, Steer::Left);
 
-        let mirrored = left_hand(400.0, -0.02);
-        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, &mirrored);
+        let mirrored = left_hand(400.0, 0.02);
+        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, None, &mirrored);
         assert_eq!(intent.steer, Steer::Right, "mirror symmetry");
     }
 
     #[test]
     fn identical_inputs_decide_identically() {
         let corner = left_hand(400.0, 0.015);
-        let one = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, &corner);
-        let two = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, &corner);
+        let one = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, None, &corner);
+        let two = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, None, &corner);
         assert_eq!(one, two, "the AI is a pure function of its inputs");
     }
 

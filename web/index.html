@@ -49,8 +49,9 @@
       padding: 1rem;
     }
     #overlay.error { color: #ff8383; }
-    /* HUD: translucent dark strip with bright figures, readable over the
-       pale sky (playtest E1). */
+    /* HUD: translucent glass strip with bright figures, readable over the
+       pale sky (playtest E1); blurred and gradient-shaded to match the HD
+       in-game look. */
     #hud:not([hidden]) {
       position: absolute;
       top: 12px;
@@ -59,9 +60,11 @@
       align-items: center;
       gap: 16px;
       padding: 8px 16px;
-      background: rgba(8, 10, 14, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.09);
+      background: linear-gradient(180deg, rgba(18, 20, 28, 0.72), rgba(8, 10, 14, 0.84));
+      border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 10px;
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(6px);
       color: #f2f4f8;
       pointer-events: none;
     }
@@ -82,16 +85,67 @@
     #lap-bar {
       width: 180px;
       height: 4px;
-      margin-top: 4px;
       border-radius: 2px;
       background: rgba(255, 255, 255, 0.14);
       overflow: hidden;
     }
+    /* Zone ticks + labels on the lap bar (presentation config duplicated
+       from crates/world/src/geometry.rs — see zones.js). Ticks sit at the
+       zone boundaries, labels under each zone's midpoint; the current zone's
+       label lights up. Lives outside the bar's overflow:hidden. */
+    #lap-track {
+      position: relative;
+      width: 180px;
+      margin-top: 4px;
+    }
+    #zone-markers {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      font: 9px/1 ui-monospace, monospace;
+    }
+    .zone-tick {
+      position: absolute;
+      top: 0;
+      width: 1px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.55);
+    }
+    .zone-label {
+      position: absolute;
+      top: 6px;
+      transform: translateX(-50%);
+      color: rgba(213, 218, 226, 0.65);
+      letter-spacing: 0.04em;
+    }
+    .zone-label.current {
+      color: #86efac;
+      font-weight: 700;
+    }
     #lap-fill {
       width: 0%;
       height: 100%;
-      background: #4ade80;
+      background: linear-gradient(90deg, #34d399, #86efac);
       border-radius: 2px;
+    }
+    /* Combat stamina bar, under the lap bar: amber while fighting, red
+       when the bar runs low. */
+    #stamina-bar {
+      width: 180px;
+      height: 4px;
+      margin-top: 3px;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.14);
+      overflow: hidden;
+    }
+    #stamina-fill {
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, #fbbf24, #fde68a);
+      border-radius: 2px;
+    }
+    #stamina-fill.low {
+      background: linear-gradient(90deg, #ef4444, #fca5a5);
     }
     /* Rider-state badge, top-right (playtest E5). */
     #rider-state:not([hidden]) {
@@ -103,11 +157,12 @@
       color: #ffffff;
       padding: 6px 14px;
       border-radius: 999px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
       pointer-events: none;
     }
-    #rider-state.crashed { background: #c62828; }
-    #rider-state.offroad { background: #b45309; }
-    #rider-state.braking { background: #1d4ed8; }
+    #rider-state.crashed { background: linear-gradient(180deg, #d63a3a, #a52222); }
+    #rider-state.offroad { background: linear-gradient(180deg, #cd6a1b, #99450c); }
+    #rider-state.braking { background: linear-gradient(180deg, #2f63e0, #1c3f9e); }
     #rider-state.grid {
       background: rgba(8, 10, 14, 0.78);
       border: 1px solid rgba(255, 255, 255, 0.2);
@@ -165,6 +220,26 @@
       cursor: pointer;
     }
     #restart:hover { background: #33333e; }
+    /* Mute control (bottom-right): toggles the shell's Web Audio master
+       gain — see audio.js. Pointer-events auto, unlike the HUD chrome. */
+    #mute-btn {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      font-size: 18px;
+      line-height: 1;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(8, 10, 14, 0.72);
+      cursor: pointer;
+      z-index: 10;
+    }
+    #mute-btn:hover { background: rgba(30, 32, 42, 0.85); }
+    #finish-times {
+      font: 600 1.05rem ui-monospace, monospace;
+      color: #f2f4f8;
+    }
     #keys {
       margin-top: 0.75rem;
       font-size: 0.85rem;
@@ -220,14 +295,17 @@
       <div id="hud-lines">
         <div id="hud-pos"></div>
         <div id="hud-lap"></div>
-        <div id="lap-bar"><div id="lap-fill"></div></div>
+        <div id="lap-track">
+          <div id="lap-bar"><div id="lap-fill"></div></div>
+        </div>
+        <div id="stamina-bar"><div id="stamina-fill"></div></div>
       </div>
     </div>
     <div id="focus-overlay" hidden><div>
       <div id="focus-title">CLICK TO RIDE</div>
       <div id="focus-keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
     </div></div>
-    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
+    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · X punch · Z kick · R restart · Esc pause</div>
     <div id="rider-state" hidden></div>
     <div id="countdown" hidden></div>
     <div id="paused" hidden>PAUSED — Esc to resume</div>
@@ -235,9 +313,11 @@
       <div>
         <h1>Finish!</h1>
         <p id="finish-text"></p>
+        <p id="finish-times"></p>
         <button id="restart" type="button">Race again</button>
       </div>
     </div>
+    <button id="mute-btn" type="button" title="Mute" aria-label="Mute">🔊</button>
     </div>
   </div>
   <script type="module" src="loader.js"></script>
