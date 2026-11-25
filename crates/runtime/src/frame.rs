@@ -1108,6 +1108,12 @@ fn push_lane_dashes(
 /// leans against the rider — widening with speed, and carrying the tick's
 /// shake offsets. Pure: the shake terms arrive precomputed so the caller
 /// keeps the one deterministic RNG.
+///
+/// The lean terms set the *feel*; turn framing (`framed_for_rider`) sets
+/// the *guarantee*: the camera axis never strays past the road edge plus a
+/// small margin, and the rider is held inside a bounded screen band — so
+/// the road ahead and the rider both stay in frame through any bend and at
+/// any lateral offset, on or off the tarmac.
 fn player_camera(
     race: &Race,
     geometry: &RoadGeometry,
@@ -1119,28 +1125,30 @@ fn player_camera(
     let player_curvature = geometry.curvature_at(player_distance);
     let player_heading = race.player_heading();
     let player_lateral = race.player_lateral();
-    // Lean with the player's steering and the road bend (2b), then clamp —
-    // but only on the tarmac. Off it, the camera follows the bike's
-    // lateral outright (3b): clamped at ±1.5 m, the sprite rode off the
-    // screen for the whole OFF ROAD stretch.
+    // Lean with the player's steering and the road bend (2b), softly
+    // clamped; the framing below turns this bias into a bounded one.
     let lean =
         player_heading * CAMERA_HEADING_LEAN + camera_bend_lean(player_curvature, player_speed);
-    let lateral = if player_lateral.abs() > geometry.road_width() * 0.5 {
-        player_lateral + lean
-    } else {
-        lean.clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
-    };
-    world::Camera {
+    let camera = world::Camera {
         distance: player_distance - CAMERA_TRAIL,
         height: CAMERA_HEIGHT + shake_height,
-        lateral: lateral + shake_lateral,
+        lateral: lean.clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX) + shake_lateral,
         focal: FOCAL * (1.0 - SPEED_WIDENING * (player_speed / game::bike::MAX_SPEED)),
         horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
         viewport: Viewport {
             width: VIEWPORT_WIDTH,
             height: VIEWPORT_HEIGHT,
         },
-    }
+    };
+    // Turn framing: keep the road ahead in frame and the rider inside the
+    // screen band, whatever the lean terms, the bend, and the bike's
+    // lateral offset (on or off the tarmac) do between them.
+    camera.framed_for_rider(world::FramingBounds {
+        trail: CAMERA_TRAIL,
+        road_half_width: geometry.road_width() * 0.5,
+        rider_axis: player_lateral + geometry.center_offset(player_distance)
+            - geometry.center_offset(camera.distance),
+    })
 }
 
 /// Bike poses at the last two ticks, plus the leftover fraction between
@@ -2257,31 +2265,51 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_follows_the_bike_when_it_leaves_the_tarmac() {
+    fn the_camera_keeps_the_road_and_the_bike_in_frame_off_the_tarmac() {
         let (mut race, geometry) = demo_race();
         while race.is_counting_down() {
             race.tick();
         }
         let half_width = geometry.road_width() * 0.5;
-        // Off the tarmac, right verge: the camera must track the bike's
-        // lateral so the sprite stays on screen (the OFF ROAD sprite
+        // Off the tarmac, right verge: the camera axis stays at the road
+        // bound (the road ahead stays in frame) while the framing shift
+        // holds the bike's sprite on screen (the OFF ROAD sprite
         // disappearing was the hosted-run defect).
         race.place_bike(0, 300.0, half_width + 3.0);
         let off = player_camera(&race, &geometry, 0.0, 0.0);
         assert!(
-            (off.lateral - race.player_lateral()).abs() < 0.5,
-            "off tarmac the camera must follow the bike's lateral (bike {}, camera {})",
-            race.player_lateral(),
+            off.lateral <= half_width + world::AXIS_OFFROAD_MARGIN_M + 1e-3,
+            "the camera axis must stay near the road (got {})",
             off.lateral
         );
-        // On the tarmac the soft-lean clamp still applies: the camera stays
-        // near the centreline even when the bike hugs the edge.
+        // The bike's projected position stays inside the screen band: the
+        // framing shifts the axis toward the bike as far as the road bound
+        // allows.
+        let px_per_m = off.focal / CAMERA_TRAIL;
+        let rider_offset_px = px_per_m
+            * (race.player_lateral() + geometry.center_offset(300.0)
+                - geometry.center_offset(off.distance)
+                - off.lateral);
+        assert!(
+            rider_offset_px.abs() <= world::RIDER_BAND_FRAC * VIEWPORT_WIDTH * 0.5 + 1.0,
+            "the off-road bike must stay in the screen band (got {rider_offset_px} px)"
+        );
+        // On the tarmac with the bike hugging the edge, the lean stays soft
+        // and the band still holds the sprite.
         race.place_bike(0, 300.0, half_width - 1.0);
         let on = player_camera(&race, &geometry, 0.0, 0.0);
         assert!(
-            on.lateral.abs() <= CAMERA_LEAN_MAX + 1e-3,
-            "on tarmac the lean stays clamped (got {})",
+            on.lateral.abs() <= half_width + world::AXIS_OFFROAD_MARGIN_M + 1e-3,
+            "the camera axis stays near the road on tarmac too (got {})",
             on.lateral
+        );
+        let on_offset_px = px_per_m
+            * (race.player_lateral() + geometry.center_offset(300.0)
+                - geometry.center_offset(on.distance)
+                - on.lateral);
+        assert!(
+            on_offset_px.abs() <= world::RIDER_BAND_FRAC * VIEWPORT_WIDTH * 0.5 + 1.0,
+            "the edge-hugging bike stays in the band (got {on_offset_px} px)"
         );
     }
 
