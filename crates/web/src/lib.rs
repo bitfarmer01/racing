@@ -31,8 +31,14 @@
 //!   feature builds) and exercised in a browser only by the recorded
 //!   follow-up smoke test.
 //!
-//! No tests: the blueprint's test gate does not apply to the wasm shell, and
-//! the no-tests constraint for this task forbids adding any.
+//! No GPU here on the dev host: this crate is compile-checked for wasm32
+//! (`cargo check -p web --target wasm32-unknown-unknown`, both feature
+//! builds) and exercised in a browser only by the recorded follow-up smoke
+//! test. What IS testable headless is the boot path's course resolution —
+//! `BrowserGame::boot` resolves the track-select value through
+//! `resolve_course` and builds the race through `race_for_course`, and the
+//! wave-8 gate asks for headless boot evidence that each selection loads its
+//! own course (see the `tests` module at the bottom).
 
 #![forbid(unsafe_code)]
 
@@ -41,15 +47,17 @@
 // `not(native)`), so every item that touches a GPU type is compiled only for
 // `wasm32-unknown-unknown` — the target the two workspace wasm checks build.
 // Host builds see the crate as the panic hook plus `backend_name`.
+use wasm_bindgen::prelude::*;
+// The race-construction path exists only on wasm and in the headless boot
+// tests; host non-test builds see neither, so the imports carry its gate.
+#[cfg(any(target_arch = "wasm32", test))]
+use game::race::{Race, RaceConfig};
 #[cfg(target_arch = "wasm32")]
 use render::{AtlasDims, AtlasUpload, GpuRenderer, OrthoCamera, QualityTier, SpriteBatch};
 #[cfg(target_arch = "wasm32")]
-use runtime::frame::demo_race;
-#[cfg(target_arch = "wasm32")]
 use runtime::{advance_game_frame, pack_placeholder_atlas, AtlasMapping, RoadMesh};
-use wasm_bindgen::prelude::*;
-#[cfg(target_arch = "wasm32")]
-use world::RoadGeometry;
+#[cfg(any(target_arch = "wasm32", test))]
+use world::{Course, CourseId, RoadGeometry};
 
 #[cfg(target_arch = "wasm32")]
 use game::bike::Control;
@@ -132,6 +140,9 @@ fn frame_inputs(
 #[wasm_bindgen]
 pub struct BrowserGame {
     race: game::race::Race,
+    /// The course this race was booted from: the restart path re-boots the
+    /// same course, never falling back to the demo (spec: locked decision).
+    course: Course,
     geometry: RoadGeometry,
     mapping: AtlasMapping,
     batch: SpriteBatch,
@@ -144,6 +155,7 @@ pub struct BrowserGame {
 pub(crate) enum BootError {
     Atlas(String),
     Render(String),
+    Course(String),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -152,21 +164,62 @@ impl std::fmt::Display for BootError {
         match self {
             Self::Atlas(e) => write!(f, "placeholder atlas pack failed: {e}"),
             Self::Render(e) => write!(f, "renderer bring-up failed: {e}"),
+            Self::Course(e) => write!(f, "track selection failed: {e}"),
         }
     }
+}
+
+/// Builds the race for a catalog course: the same shape `runtime::demo_race`
+/// gives the demo — three rivals, three laps, the fixed seed — but with the
+/// selected course's own lap length and geometry (spec: "Track-select flow").
+/// Lives here rather than in `runtime`: `runtime::frame` is another
+/// workstream's lane, so its five `ZoneLayout::for_track()` call sites (the
+/// composed scenery still samples the demo table) move onto the selected
+/// course's layout when that lane migrates.
+#[cfg(any(target_arch = "wasm32", test))]
+fn race_for_course(course: &Course) -> (Race, RoadGeometry) {
+    let geometry = RoadGeometry::new(
+        course.curves.to_vec(),
+        course.elevation.to_vec(),
+        course.road_width,
+    );
+    let race = Race::new(RaceConfig {
+        rivals: 3,
+        // One lap = one pass through every zone; landmarks and dressing
+        // repeat per lap on the same fixed distances (7c).
+        track_length: course.layout.lap_length,
+        total_laps: 3,
+        seed: 0x5EED_C0DE,
+        geometry: geometry.clone(),
+    });
+    (race, geometry)
+}
+
+/// Resolves the track-select control's value to a catalog course. An unknown
+/// value is a boot error on the loading screen, same path as today's boot
+/// failures (spec: "Track-select flow").
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_course(course_id: &str) -> Result<&'static Course, String> {
+    let id = CourseId::from_slug(course_id).ok_or_else(|| {
+        format!("unknown track '{course_id}' — expected one of the catalog slugs")
+    })?;
+    world::for_course(id).ok_or_else(|| format!("course '{course_id}' is not registered"))
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl BrowserGame {
-    /// Boots the demo race on `canvas`: packs the placeholder atlas, selects
-    /// the quality tier from the loader's capability facts, and brings up the
-    /// GPU pipeline (warm behind the loading screen per the blueprint).
+    /// Boots the selected course on `canvas`: packs the placeholder atlas,
+    /// selects the quality tier from the loader's capability facts, and
+    /// brings up the GPU pipeline (warm behind the loading screen per the
+    /// blueprint).
     ///
     /// `low_end_device` comes from the loader's device heuristics;
     /// `has_webgpu` is compile-time — this build either carries the WebGPU
     /// backend or it does not, and the loader already chose the build to
-    /// match its adapter probe.
+    /// match its adapter probe. `course_id` is the track-select control's
+    /// value, resolved through `resolve_course`; an unknown value takes the
+    /// loading screen's error path.
     ///
     /// The canvas is sized before this call; its current `width`/`height`
     /// become the swap-chain size.
@@ -177,8 +230,9 @@ impl BrowserGame {
     pub async fn boot(
         canvas: web_sys::HtmlCanvasElement,
         low_end_device: bool,
+        course_id: &str,
     ) -> Result<BrowserGame, JsError> {
-        Self::bring_up(canvas, low_end_device)
+        Self::bring_up(canvas, low_end_device, course_id)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -186,7 +240,11 @@ impl BrowserGame {
     async fn bring_up(
         canvas: web_sys::HtmlCanvasElement,
         low_end_device: bool,
+        course_id: &str,
     ) -> Result<Self, BootError> {
+        // The course resolves before any GPU work: an unknown track-select
+        // value fails fast on the loading screen.
+        let course = resolve_course(course_id).map_err(BootError::Course)?;
         let has_webgpu = cfg!(feature = "webgpu");
         let tier = QualityTier::select(has_webgpu, low_end_device);
 
@@ -197,7 +255,7 @@ impl BrowserGame {
         let atlas = AtlasUpload::from_rgba(AtlasDims::new(width, height), rgba)
             .map_err(|e| BootError::Atlas(e.to_string()))?;
 
-        let (race, geometry) = demo_race();
+        let (race, geometry) = race_for_course(course);
 
         // One backend per bundle — the loader's probe already picked it.
         // This matters even though wgpu only compiles the matching backend:
@@ -229,6 +287,7 @@ impl BrowserGame {
 
         Ok(Self {
             race,
+            course: *course,
             geometry,
             mapping,
             batch: SpriteBatch::for_tier(tier),
@@ -348,10 +407,59 @@ impl BrowserGame {
         self.race.is_finished()
     }
 
-    /// Back to the grid: a fresh race with the same track. Inputs and camera
-    /// state rebuild through the normal per-frame path.
+    /// Back to the grid: a fresh race on the same course the player chose at
+    /// boot. Inputs and camera state rebuild through the normal per-frame
+    /// path.
     pub fn restart(&mut self) {
-        let (race, _geometry) = demo_race();
+        let (race, _geometry) = race_for_course(&self.course);
         self.race = race;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wave-8 gate evidence (headless boot): the boot path resolves each
+    /// track-select value and loads that course's own race. BrowserGame's
+    /// GPU bring-up needs a canvas, but the course resolution and the race
+    /// it builds are the same host-side calls, so each selection's course
+    /// can be checked headless.
+    #[test]
+    fn booting_each_track_select_option_loads_that_course() {
+        for (slug, lap_length) in [("coast-run", 2_000.0), ("island-hop", 1_600.0)] {
+            let course = resolve_course(slug)
+                .unwrap_or_else(|error| panic!("booting '{slug}' failed: {error}"));
+            let (race, geometry) = race_for_course(course);
+            assert!(
+                (race.lap_length() - lap_length).abs() < 1e-3,
+                "'{slug}' booted a {:#} m lap, expected {lap_length} m",
+                race.lap_length()
+            );
+            assert!((geometry.road_width() - course.road_width).abs() < 1e-6);
+        }
+    }
+
+    /// The selection semantic the shell consumes: two track-select values,
+    /// two different loaded courses.
+    #[test]
+    fn booting_different_tracks_loads_different_courses() {
+        let coast = resolve_course("coast-run").expect("coast-run must resolve");
+        let island = resolve_course("island-hop").expect("island-hop must resolve");
+        assert_ne!(coast.id, island.id);
+        let (coast_race, _coast_geometry) = race_for_course(coast);
+        let (island_race, _island_geometry) = race_for_course(island);
+        assert!(
+            (coast_race.lap_length() - island_race.lap_length()).abs() > 1.0,
+            "distinct track-select values must load distinct courses"
+        );
+    }
+
+    /// An unknown track-select value is a boot error on the loading screen,
+    /// same path as today's boot failures.
+    #[test]
+    fn an_unknown_track_select_value_is_a_boot_error() {
+        let error = resolve_course("demo").expect_err("an unknown slug must fail to resolve");
+        assert!(error.contains("demo"));
     }
 }

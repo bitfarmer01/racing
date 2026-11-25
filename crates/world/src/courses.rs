@@ -1,13 +1,13 @@
-//! Wave 8 — the course catalog (RED-STATE SKELETON).
+//! Wave 8 — the course catalog.
 //!
-//! This module is the compile seam for the wave-8 failing acceptance tests
-//! (spec: `.obvious/specs/wave8-tracks.md`). It carries the course-definition
-//! API surface ONLY: the catalog still registers exactly one course — the
-//! wave-7 demo — so every wave-8 test in this file fails at assertion today
-//! and passes, unmodified, once the catalog lists the spec'd courses and the
-//! shell wires selection through. None of the feature is implemented here.
+//! Every selectable course is pure, compile-time data (spec:
+//! `.obvious/specs/wave8-tracks.md`): its own zone table, landmarks, corner
+//! composition, hill profile, and lap length. The zone/landmark machinery in
+//! `geometry.rs` is course-agnostic — adding a course is data, never render
+//! code. Selection happens at boot only; the shell resolves an id through
+//! [`for_course`] and the race is built from the entry's own tables.
 
-use crate::geometry::{CurveSegment, ElevationKey, Landmark, ZoneLayout};
+use crate::geometry::{CurveSegment, ElevationKey, Landmark, LandmarkKind, ZoneLayout};
 
 /// Stable selector for a course, mirrored in the web shell's track-select UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,8 +18,29 @@ pub enum CourseId {
     IslandHop,
 }
 
+impl CourseId {
+    /// The stable string the web shell's track-select control carries as its
+    /// option value and passes across the wasm boundary.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::CoastRun => "coast-run",
+            Self::IslandHop => "island-hop",
+        }
+    }
+
+    /// Resolves a selection-UI value back to a course id. An unknown slug is
+    /// a boot error on the loading screen — same path as today's boot
+    /// failures (spec: "Track-select flow").
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        [Self::CoastRun, Self::IslandHop]
+            .into_iter()
+            .find(|id| id.slug() == slug)
+    }
+}
+
 /// One selectable course: pure data end to end — its own zone table,
 /// landmarks, corner composition, hill profile, and lap length.
+#[derive(Debug, Clone, Copy)]
 pub struct Course {
     pub id: CourseId,
     pub name: &'static str,
@@ -35,32 +56,113 @@ pub struct Course {
     pub road_width: f32,
 }
 
+/// The Coast Run hill profile, moved verbatim from `runtime::track_geometry`
+/// (the demo course's authored curve/elevation tables now live with the rest
+/// of the course's data — no tuning change rode along).
+const COAST_RUN_CURVES: &[CurveSegment] = &[
+    CurveSegment {
+        start: 200.0,
+        length: 500.0,
+        // Opening bend: winnable flat out under the corner-force
+        // balance — a fight but a survivable one.
+        curvature: -0.003,
+    },
+    CurveSegment {
+        start: 700.0,
+        length: 200.0,
+        // Medium right out of the opening left: rideable flat with
+        // a steady hand, but it punishes a lazy line.
+        curvature: 0.009,
+    },
+    CurveSegment {
+        start: 1_100.0,
+        length: 140.0,
+        // The Ridgeback right: a climbing hairpin — flat out, the
+        // bend outlasts the grip; brake to the corner speed or run
+        // off the tarmac.
+        curvature: 0.016,
+    },
+    CurveSegment {
+        start: 1_450.0,
+        length: 140.0,
+        // Mirror hairpin left, entered on the descent from the
+        // crest: same bargain, opposite direction.
+        curvature: -0.016,
+    },
+];
+
+/// The Coast Run hill profile (see `COAST_RUN_CURVES`).
+const COAST_RUN_ELEVATION: &[ElevationKey] = &[
+    ElevationKey {
+        distance: 0.0,
+        elevation: 0.0,
+    },
+    ElevationKey {
+        distance: 250.0,
+        elevation: 0.0,
+    },
+    ElevationKey {
+        distance: 450.0,
+        elevation: 7.0,
+    },
+    ElevationKey {
+        distance: 650.0,
+        elevation: 14.0,
+    },
+    ElevationKey {
+        distance: 900.0,
+        elevation: 10.0,
+    },
+    ElevationKey {
+        distance: 1_100.0,
+        elevation: 2.0,
+    },
+    ElevationKey {
+        distance: 1_400.0,
+        elevation: 9.0,
+    },
+    ElevationKey {
+        distance: 1_700.0,
+        elevation: 3.0,
+    },
+    ElevationKey {
+        distance: 2_000.0,
+        elevation: 0.0,
+    },
+];
+
 /// Every selectable course, in selection-UI order.
-///
-/// RED STATE: only the demo course is registered. The wave-8 implementation
-/// adds Island Hop (and any later course) here — see the spec's course table.
 pub fn catalog() -> &'static [Course] {
     // OnceLock rather than a promoted const: the demo entry borrows the
     // landmark table through `course_landmarks()`, a function call, which
     // const promotion cannot evaluate.
-    static CATALOG: std::sync::OnceLock<[Course; 1]> = std::sync::OnceLock::new();
+    static CATALOG: std::sync::OnceLock<[Course; 2]> = std::sync::OnceLock::new();
     CATALOG
         .get_or_init(|| {
-            [Course {
-                id: CourseId::CoastRun,
-                name: "Coast Run",
-                blurb: "The wave-7 demo lap: coast out of the grid, through the town, \
-                        up the forest climb, along the ridge.",
-                layout: ZoneLayout::FOR_TRACK,
-                landmarks: crate::course_landmarks(),
-                // RED STATE: the demo course's corner and hill tables still
-                // live in runtime::track_geometry; moving them into this entry
-                // is part of the wave-8 implementation, so they are not
-                // restated (or tested) yet.
-                curves: &[],
-                elevation: &[],
-                road_width: 12.0,
-            }]
+            [
+                Course {
+                    id: CourseId::CoastRun,
+                    name: "Coast Run",
+                    blurb: "The wave-7 demo lap: coast out of the grid, through the town, \
+                            up the forest climb, along the ridge.",
+                    layout: ZoneLayout::FOR_TRACK,
+                    landmarks: crate::course_landmarks(),
+                    curves: COAST_RUN_CURVES,
+                    elevation: COAST_RUN_ELEVATION,
+                    road_width: 12.0,
+                },
+                Course {
+                    id: CourseId::IslandHop,
+                    name: "Island Hop",
+                    blurb: "A shorter, tighter island loop: out along the lagoon, through \
+                            the village, under the jungle canopy, up to the summit crest.",
+                    layout: ZoneLayout::from_zones(1_600.0, 80.0, ISLAND_HOP_ZONES),
+                    landmarks: ISLAND_HOP_LANDMARKS,
+                    curves: ISLAND_HOP_CURVES,
+                    elevation: ISLAND_HOP_ELEVATION,
+                    road_width: 12.0,
+                },
+            ]
         })
         .as_slice()
 }
@@ -69,6 +171,185 @@ pub fn catalog() -> &'static [Course] {
 pub fn for_course(id: CourseId) -> Option<&'static Course> {
     catalog().iter().find(|course| course.id == id)
 }
+
+// ---------------------------------------------------------------------------
+// Island Hop — the wave-8 course. Authored here as data, bounded by the
+// spec's tiling and lap-length contract (1 600 m, lagoon/village/jungle/
+// summit, landmarks in the wave-7 `LandmarkKind` set).
+// ---------------------------------------------------------------------------
+
+/// Island Hop's zone table: the spec'd sequence tiles the 1 600 m lap
+/// contiguously (lagoon 0/480, village 480/440, jungle 920/360, summit
+/// 1280/320).
+const ISLAND_HOP_ZONES: &[crate::geometry::Zone] = &[
+    crate::geometry::Zone {
+        name: "lagoon",
+        start: 0.0,
+        length: 480.0,
+        grass_tint: [0.52, 0.58, 0.30, 1.0],
+        sky_tint: [0.62, 0.84, 0.96, 1.0],
+        backdrop_amp: 0.6,
+        dressing: crate::geometry::DressingMix {
+            palm: 0.55,
+            tree: 0.10,
+            building: 0.0,
+            rock: 0.05,
+            bush: 0.20,
+            sign: 0.02,
+            skip: 0.08,
+        },
+        fences: false,
+        poles: false,
+    },
+    crate::geometry::Zone {
+        name: "village",
+        start: 480.0,
+        length: 440.0,
+        grass_tint: [0.36, 0.50, 0.26, 1.0],
+        sky_tint: [0.66, 0.72, 0.78, 1.0],
+        backdrop_amp: 0.9,
+        dressing: crate::geometry::DressingMix {
+            palm: 0.0,
+            tree: 0.06,
+            building: 0.36,
+            rock: 0.0,
+            bush: 0.10,
+            sign: 0.26,
+            skip: 0.22,
+        },
+        fences: true,
+        poles: true,
+    },
+    crate::geometry::Zone {
+        name: "jungle",
+        start: 920.0,
+        length: 360.0,
+        grass_tint: [0.14, 0.36, 0.18, 1.0],
+        sky_tint: [0.46, 0.62, 0.80, 1.0],
+        backdrop_amp: 1.2,
+        dressing: crate::geometry::DressingMix {
+            palm: 0.10,
+            tree: 0.70,
+            building: 0.0,
+            rock: 0.06,
+            bush: 0.10,
+            sign: 0.0,
+            skip: 0.04,
+        },
+        fences: false,
+        poles: false,
+    },
+    crate::geometry::Zone {
+        name: "summit",
+        start: 1_280.0,
+        length: 320.0,
+        grass_tint: [0.44, 0.46, 0.34, 1.0],
+        sky_tint: [0.74, 0.82, 0.92, 1.0],
+        backdrop_amp: 1.7,
+        dressing: crate::geometry::DressingMix {
+            palm: 0.0,
+            tree: 0.08,
+            building: 0.0,
+            rock: 0.48,
+            bush: 0.14,
+            sign: 0.04,
+            skip: 0.26,
+        },
+        fences: false,
+        poles: false,
+    },
+];
+
+/// Island Hop's landmarks, in the wave-7 `LandmarkKind` set: a windmill over
+/// the lagoon, a water tower in the village, and a billboard cluster on the
+/// summit run-in.
+const ISLAND_HOP_LANDMARKS: &[Landmark] = &[
+    Landmark {
+        kind: LandmarkKind::Windmill,
+        distance: 300.0,
+        lateral: -16.0,
+    },
+    Landmark {
+        kind: LandmarkKind::WaterTower,
+        distance: 850.0,
+        lateral: 18.0,
+    },
+    Landmark {
+        kind: LandmarkKind::Billboards,
+        distance: 1_420.0,
+        lateral: -15.0,
+    },
+];
+
+/// Island Hop's corner composition: a lagoon sweeper, a village kink, and a
+/// jungle/summit hairpin pair steeper than Coast Run's — the shorter lap
+/// pays for it with tighter bends.
+const ISLAND_HOP_CURVES: &[CurveSegment] = &[
+    CurveSegment {
+        start: 140.0,
+        length: 160.0,
+        // Lagoon sweeper: an early right that sets the lap's rhythm.
+        curvature: 0.011,
+    },
+    CurveSegment {
+        start: 500.0,
+        length: 120.0,
+        // Village kink left: shallow, but the fences punish a wide exit.
+        curvature: -0.007,
+    },
+    CurveSegment {
+        start: 880.0,
+        length: 130.0,
+        // Jungle hairpin right: the lap's main stop — brake or run wide
+        // into the trees.
+        curvature: 0.018,
+    },
+    CurveSegment {
+        start: 1_180.0,
+        length: 120.0,
+        // Summit hairpin left, climbing: mirror of the jungle bend on
+        // the way up to the crest.
+        curvature: -0.018,
+    },
+];
+
+/// Island Hop's hill profile: flat lagoon, a village rise, a jungle dip, and
+/// the summit crest at 18 m — back down toward the line to keep the lap
+/// wrap from popping.
+const ISLAND_HOP_ELEVATION: &[ElevationKey] = &[
+    ElevationKey {
+        distance: 0.0,
+        elevation: 0.0,
+    },
+    ElevationKey {
+        distance: 200.0,
+        elevation: 0.0,
+    },
+    ElevationKey {
+        distance: 430.0,
+        elevation: 5.0,
+    },
+    ElevationKey {
+        distance: 680.0,
+        elevation: 11.0,
+    },
+    ElevationKey {
+        distance: 900.0,
+        elevation: 4.0,
+    },
+    ElevationKey {
+        distance: 1_150.0,
+        elevation: 12.0,
+    },
+    ElevationKey {
+        distance: 1_420.0,
+        elevation: 18.0,
+    },
+    ElevationKey {
+        distance: 1_600.0,
+        elevation: 6.0,
+    },
+];
 
 #[cfg(test)]
 mod tests {
