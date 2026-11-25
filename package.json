@@ -1,0 +1,9 @@
+{
+  "name": "racing",
+  "private": true,
+  "type": "module",
+  "description": "Browser shell of the racing game. `type: module` lets `node --test` import the shell's ES modules (web/*.js) for headless probe tests.",
+  "scripts": {
+    "test:shell": "node --test web/tracks.test.mjs"
+  }
+}
