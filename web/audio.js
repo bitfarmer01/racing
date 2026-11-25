@@ -4,9 +4,29 @@
 // context is created-or-resumed inside the CLICK TO RIDE engagement (browser
 // autoplay policy refuses audio before a user gesture). No wasm API changes.
 //
+// Engine tone shaping (playtest: high-speed engine read as a grating static
+// drone): the old chain was one sawtooth through a FIXED 900 Hz lowpass, so
+// at speed the sawtooth's upper harmonics (760/950 Hz at the ~190 Hz top
+// speed pitch) sat permanently in the harshest band at constant amplitude.
+// Three changes, loudness held comparable:
+//   1. Speed-tightening lowpass — cutoff falls from ~1400 Hz at idle to
+//      ~620 Hz at top speed, so the bright partials roll off exactly as the
+//      speed (and the ear's exposure) rises. A fixed highshelf cut above
+//      ~1.1 kHz plus a small lowshelf lift at ~160 Hz keeps the body so the
+//      tone softens without simply getting quieter.
+//   2. Breathing amplitude — a slow ~0.6 Hz LFO swells the engine level a
+//      few percent, so the tone swells and recedes instead of sitting still.
+//   3. Firing pulses — a second LFO whose rate tracks the engine pitch
+//      (roughly one pulse per four revolutions) chops the amplitude a few
+//      percent, modelling combustion pulses; plus a very slow detune drift
+//      so the pitch itself never locks into one static buzz.
+// The LFOs modulate their own gain nodes in the chain (not the engine gain
+// parameter), so a silent engine (paused/finished) stays exactly silent.
+//
 // Extracted as a class so a headless probe can construct it, call update()
 // directly, and assert the engine frequency tracks speed without a real
-// AudioContext.
+// AudioContext. An AnalyserNode taps the engine chain so probes can also
+// assert the frequency-domain behaviour (engineSpectrum / bandEnergy).
 
 export class RaceAudio {
   constructor() {
@@ -14,6 +34,10 @@ export class RaceAudio {
     this.master = null;
     this.engineOsc = null;
     this.engineGain = null;
+    this.engineLowpass = null;
+    this.engineAnalyser = null;
+    this.engineSpectrumBuf = null;
+    this.pulseLfo = null;
     this.muted = false;
     this.prevState = 0;
     this.prevStamina = 1;
@@ -37,17 +61,79 @@ export class RaceAudio {
   }
 
   startEngine() {
-    // Engine: a sawtooth through a lowpass reads as a buzzy motor at low
-    // gain; frequency is driven per-frame from the HUD's km/h figure.
+    // Sawtooth core through a speed-tightening filter stack reads as a motor
+    // that leans into its powerband; frequency is driven per-frame from the
+    // HUD's km/h figure. The analyser taps the shaped tone pre-master so
+    // probes (and diagnostics) can read the actual delivered spectrum.
     this.engineOsc = this.ctx.createOscillator();
     this.engineOsc.type = 'sawtooth';
     this.engineOsc.frequency.value = 40;
+
     this.engineGain = this.ctx.createGain();
     this.engineGain.gain.value = 0;
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 900;
-    this.engineOsc.connect(this.engineGain).connect(filter).connect(this.master);
+
+    // Breathing LFO: slow level swell, ±7% around unity. Runs into its own
+    // gain node in the chain so a zeroed engine gain still silences it.
+    const breathGain = this.ctx.createGain();
+    breathGain.gain.value = 1;
+    const breathLfo = this.ctx.createOscillator();
+    breathLfo.type = 'sine';
+    breathLfo.frequency.value = 0.6;
+    const breathDepth = this.ctx.createGain();
+    breathDepth.gain.value = 0.07;
+    breathLfo.connect(breathDepth).connect(breathGain.gain);
+    breathLfo.start();
+
+    // Firing-pulse LFO: rate follows the engine pitch (set per-frame), ±6%
+    // chop — the pulse character that stops the tone holding one flat buzz.
+    const pulseGain = this.ctx.createGain();
+    pulseGain.gain.value = 1;
+    this.pulseLfo = this.ctx.createOscillator();
+    this.pulseLfo.type = 'sine';
+    this.pulseLfo.frequency.value = 10;
+    const pulseDepth = this.ctx.createGain();
+    pulseDepth.gain.value = 0.06;
+    this.pulseLfo.connect(pulseDepth).connect(pulseGain.gain);
+    this.pulseLfo.start();
+
+    // Pitch drift: a very slow ±11-cent wobble so the pitch itself breathes.
+    const driftLfo = this.ctx.createOscillator();
+    driftLfo.type = 'sine';
+    driftLfo.frequency.value = 0.37;
+    const driftDepth = this.ctx.createGain();
+    driftDepth.gain.value = 11;
+    driftLfo.connect(driftDepth).connect(this.engineOsc.detune);
+    driftLfo.start();
+
+    // Tone shaping: the cutoff tightens with speed (engineCutoff), the
+    // highshelf trims the harsh top band, the lowshelf keeps the body so
+    // loudness stays comparable to the pre-shaping tone.
+    this.engineLowpass = this.ctx.createBiquadFilter();
+    this.engineLowpass.type = 'lowpass';
+    this.engineLowpass.frequency.value = RaceAudio.engineCutoff(0);
+    this.engineLowpass.Q.value = 0.8;
+    const highshelf = this.ctx.createBiquadFilter();
+    highshelf.type = 'highshelf';
+    highshelf.frequency.value = 1100;
+    highshelf.gain.value = -7.5;
+    const lowshelf = this.ctx.createBiquadFilter();
+    lowshelf.type = 'lowshelf';
+    lowshelf.frequency.value = 160;
+    lowshelf.gain.value = 2;
+
+    this.engineAnalyser = this.ctx.createAnalyser();
+    this.engineAnalyser.fftSize = 2048;
+    this.engineSpectrumBuf = new Float32Array(this.engineAnalyser.frequencyBinCount);
+
+    this.engineOsc
+      .connect(this.engineGain)
+      .connect(breathGain)
+      .connect(pulseGain)
+      .connect(this.engineLowpass)
+      .connect(highshelf)
+      .connect(lowshelf)
+      .connect(this.engineAnalyser)
+      .connect(this.master);
     this.engineOsc.start();
   }
 
@@ -55,6 +141,42 @@ export class RaceAudio {
   // ~180 km/h tops out near 190 Hz. Returned so probes can assert tracking.
   static engineFreq(speedKmh) {
     return 40 + Math.min(speedKmh, 180) * (150 / 180);
+  }
+
+  // Lowpass cutoff from the same speed: bright at idle, tightening to ~620 Hz
+  // at top speed so the grating upper partials roll off as speed rises.
+  static engineCutoff(speedKmh) {
+    return 1400 - Math.min(speedKmh, 180) * (780 / 180);
+  }
+
+  // Engine level from the same speed. Slightly above the old curve (the
+  // tightened filter and shelf cut remove energy) so perceived loudness
+  // stays comparable instead of the fix just reading as "quieter".
+  static engineBaseGain(speedKmh) {
+    return 0.046 + (Math.min(speedKmh, 180) / 180) * 0.066;
+  }
+
+  // Mean linear magnitude of the engine spectrum in [lo, hi) Hz, from a
+  // getFloatFrequencyData snapshot. Pure, so probes can assert band levels.
+  static bandEnergy(spectrum, sampleRate, lo, hi) {
+    const binHz = sampleRate / (spectrum.length * 2);
+    const first = Math.max(0, Math.ceil(lo / binHz));
+    const last = Math.min(spectrum.length, Math.ceil(hi / binHz));
+    let sum = 0;
+    let n = 0;
+    for (let i = first; i < last; i++) {
+      const mag = Math.pow(10, spectrum[i] / 20);
+      sum += mag * mag;
+      n++;
+    }
+    return n === 0 ? 0 : Math.sqrt(sum / n);
+  }
+
+  // Current engine spectrum (dB per bin) or null before unlock().
+  engineSpectrum() {
+    if (!this.engineAnalyser) return null;
+    this.engineAnalyser.getFloatFrequencyData(this.engineSpectrumBuf);
+    return this.engineSpectrumBuf;
   }
 
   // One short pitched blip; used for countdown and combat cues.
@@ -87,8 +209,18 @@ export class RaceAudio {
     // tone stops when the sim does.
     const freq = RaceAudio.engineFreq(speedKmh);
     this.engineOsc.frequency.setTargetAtTime(freq, t, 0.05);
+    // The filter closes as speed rises — the high-end softening.
+    const cutoff = RaceAudio.engineCutoff(speedKmh);
+    this.engineLowpass.frequency.setTargetAtTime(cutoff, t, 0.12);
+    // Firing pulses: roughly one per four revolutions, clamped to a band
+    // that reads as pulse rather than a second buzz.
+    this.pulseLfo.frequency.setTargetAtTime(
+      Math.min(48, Math.max(8, freq / 4)),
+      t,
+      0.1,
+    );
     const running = !paused && !finished && this.ctx.state === 'running';
-    const engineGain = running ? 0.04 + Math.min(speedKmh, 180) / 180 * 0.06 : 0;
+    const engineGain = running ? RaceAudio.engineBaseGain(speedKmh) : 0;
     this.engineGain.gain.setTargetAtTime(engineGain, t, 0.08);
 
     // Crash cue: crashed bit rising edge.
@@ -143,11 +275,13 @@ export class RaceAudio {
     }
   }
 
-  // Probe/diagnostic surface: the live engine frequency and context state.
+  // Probe/diagnostic surface: the live engine frequency, filter cutoff,
+  // context state and mute state.
   diagnostics() {
     return {
       state: this.ctx ? this.ctx.state : 'none',
       engineFreq: this.engineOsc ? this.engineOsc.frequency.value : null,
+      engineCutoff: this.engineLowpass ? this.engineLowpass.frequency.value : null,
       muted: this.muted,
     };
   }
