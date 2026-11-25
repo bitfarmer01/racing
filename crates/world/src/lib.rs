@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 
 mod camera;
+mod courses;
 mod geometry;
 mod projection;
 
 pub use camera::{Camera, FramingBounds, Viewport, AXIS_OFFROAD_MARGIN_M, RIDER_BAND_FRAC};
+pub use courses::{catalog, for_course, Course, CourseId};
 pub use geometry::{
     course_landmarks, pick_dressing, CurveSegment, DressingKind, DressingMix, ElevationKey,
     Landmark, LandmarkKind, RoadGeometry, Zone, ZoneLayout, ZoneSample,

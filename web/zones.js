@@ -1,16 +1,36 @@
-// Zone presentation config for the demo course's lap-progress bar.
+// Per-course zone presentation catalog: one entry per selectable course
+// (spec: .obvious/specs/wave8-tracks.md, "HUD integration").
 //
-// DUPLICATED from crates/world/src/geometry.rs — ZoneLayout::FOR_TRACK, which
-// is the source of truth for the demo course's fixed zone table. The demo
-// course is fixed, so the shell re-states only the presentation-relevant
-// slice (name + per-lap distance span, in meters of the 2 000 m lap). If the
-// course's zone table ever changes there, this table must be updated to
+// Each entry mirrors its course's zone table from crates/world/src/courses.rs
+// — the source of truth for the spans; the shell re-states only the
+// presentation-relevant slice (name + per-lap distance span, in meters). The
+// loader feeds the track-select control's chosen entry to
+// buildZoneMarkers/highlightZone, so the lap bar follows the selected course.
+// If a course's zone table ever changes there, this table must be updated to
 // match — the build/test gates cannot catch a drift between the two.
-export const DEMO_ZONES = [
-  { name: 'coast', start: 0, end: 520 },
-  { name: 'town', start: 520, end: 1080 },
-  { name: 'forest', start: 1080, end: 1600 },
-  { name: 'ridge', start: 1600, end: 2000 },
+export const COURSES = [
+  {
+    id: 'coast-run',
+    name: 'Coast Run',
+    lapLength: 2000,
+    zones: [
+      { name: 'coast', start: 0, end: 520 },
+      { name: 'town', start: 520, end: 1080 },
+      { name: 'forest', start: 1080, end: 1600 },
+      { name: 'ridge', start: 1600, end: 2000 },
+    ],
+  },
+  {
+    id: 'island-hop',
+    name: 'Island Hop',
+    lapLength: 1600,
+    zones: [
+      { name: 'lagoon', start: 0, end: 480 },
+      { name: 'village', start: 480, end: 920 },
+      { name: 'jungle', start: 920, end: 1280 },
+      { name: 'summit', start: 1280, end: 1600 },
+    ],
+  },
 ];
 
 // Builds the DOM for the lap bar's zone ticks: one tick at each zone

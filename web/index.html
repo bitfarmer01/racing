@@ -240,6 +240,28 @@
       font: 600 1.05rem ui-monospace, monospace;
       color: #f2f4f8;
     }
+    /* Track-select control (wave 8): the boot overlay lists every catalog
+       course; the loader reads its value and boots that course. Styled to
+       the overlay's dark-glass idiom. */
+    #track-select {
+      font: 600 1rem system-ui, sans-serif;
+      color: #f0f0f4;
+      background: #26262e;
+      border: 1px solid #4a4a56;
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      margin-top: 0.75rem;
+      cursor: pointer;
+    }
+    #track-select:hover { background: #33333e; }
+    .track-choice {
+      display: block;
+      margin-top: 1.25rem;
+      margin-bottom: 0.35rem;
+      font: 700 0.8rem system-ui, sans-serif;
+      letter-spacing: 0.08em;
+      color: #aeb6c2;
+    }
     #keys {
       margin-top: 0.75rem;
       font-size: 0.85rem;
@@ -288,6 +310,11 @@
     <canvas id="game"></canvas>
     <div id="overlay"><div>
       <div id="status">Loading…</div>
+      <label class="track-choice" for="track-select">TRACK</label>
+      <select id="track-select">
+        <option value="coast-run">Coast Run</option>
+        <option value="island-hop">Island Hop</option>
+      </select>
       <div id="keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
     </div></div>
     <div id="hud" hidden>
