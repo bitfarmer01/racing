@@ -1,437 +1,586 @@
-// Loader: picks the wasm bundle matching the browser's GPU backend, boots it,
-// and drives the frame loop.
-import { badgeForState } from './badge.js';
-import { COURSES, buildZoneMarkers, highlightZone } from './zones.js';
-import { RaceTimer, formatTime } from './race-timer.js';
+// Loader and shell: boots the wasm bundle that matches the browser (WebGPU,
+// else WebGL2), then runs menus, HUD, input, audio and the frame loop. The
+// game itself (simulation, camera, all 3D drawing) lives in the wasm.
+
 import { RaceAudio } from './audio.js';
-//
-// Backend selection mirrors render::QualityTier::select — the loader probes
-// for a WebGPU adapter, then loads exactly one of the two builds produced by
-// web/build.sh. A failed WebGPU boot falls back to the WebGL2 build once;
-// failing both surfaces a clean error on the loading screen.
-//
-// Canvas sizing (playtest E6): the CSS keeps the canvas full-window; the
-// backing store is window size x devicePixelRatio, with the DPR capped at 2
-// for the 2015-iGPU fill budget, refreshed on resize. The renderer is built
-// for the boot size; wgpu 25 reconfigures a canvas surface whose element
-// size has changed when `get_current_texture` runs, so live resizes work
-// without rebuilding the renderer.
-//
-// Aspect ratio: the runtime composes every frame in a fixed 800x450 pixel
-// space (runtime::VIEWPORT_WIDTH/HEIGHT) and the ortho camera stretches that
-// space over whatever surface size it gets — the render path tolerates any
-// size and aspect, but a non-16:9 window stretches the scene non-uniformly.
-// That fixed viewport is load-bearing in runtime's frame builder (another
-// worker's crate), so it is documented here rather than changed.
+import {
+  HUD, CUE, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
+  ResolutionGovernor,
+} from './hud.js';
 
-const overlay = document.getElementById('overlay');
-const status = document.getElementById('status');
-const trackSelect = document.getElementById('track-select');
-const hud = document.getElementById('hud');
-const speedValue = document.getElementById('speed-value');
-const hudPos = document.getElementById('hud-pos');
-const hudLap = document.getElementById('hud-lap');
-const lapFill = document.getElementById('lap-fill');
-const lapBar = document.getElementById('lap-bar');
-const staminaFill = document.getElementById('stamina-fill');
-const riderStateEl = document.getElementById('rider-state');
-const countdownEl = document.getElementById('countdown');
-const finishEl = document.getElementById('finish');
-const finishText = document.getElementById('finish-text');
-const finishTimes = document.getElementById('finish-times');
-const muteButton = document.getElementById('mute-btn');
-const restartButton = document.getElementById('restart');
-const focusOverlay = document.getElementById('focus-overlay');
-const hudKeys = document.getElementById('hud-keys');
-const pausedEl = document.getElementById('paused');
-const canvas = document.getElementById('game');
+const $ = (id) => document.getElementById(id);
+let canvasEl = $('game');
 
-// Dirty-check helper (playtest E2): DOM text is only written when the
-// formatted string actually changed, so the 60 Hz loop stops churning
-// layout for identical frames.
-const lastText = new Map();
-function setText(el, text) {
-  if (lastText.get(el) !== text) {
-    lastText.set(el, text);
-    el.textContent = text;
-  }
+function replaceCanvas() {
+  const fresh = canvasEl.cloneNode();
+  canvasEl.replaceWith(fresh);
+  canvasEl = fresh;
+  sizeCanvas();
 }
+const ui = {
+  boot: $('boot'), bootStatus: $('boot-status'), menu: $('menu'), tracks: $('tracks'), start: $('start'),
+  hud: $('hud'), pos: $('h-pos'), suf: $('h-suf'), of: $('h-of'), lap: $('h-lap'), time: $('h-time'), best: $('h-best'),
+  bal: $('h-bal'), speed: $('h-speed'), gear: $('h-gear'), boost: $('h-boost'), boostLbl: $('h-boostlbl'), draft: $('draft'),
+  count: $('count'), banner: $('banner'), toast: $('toast'), hint: $('hint'), flash: $('flash'),
+  tach: $('tach'), minimap: $('minimap'),
+  pause: $('pause'), pauseSub: $('pause-sub'), resume: $('resume'), restart: $('restart'), quit: $('quit'),
+  results: $('results'), rTitle: $('r-title'), rSub: $('r-sub'), rTable: $('r-table'), again: $('again'), toMenu: $('tomenu'),
+  mute: $('mute'), fs: $('fs'),
+};
 
-function setStatus(text) {
-  setText(status, text);
-}
+const params = new URLSearchParams(location.search);
+const DPR_CAP = 1.5;
 
-function showError(text) {
-  overlay.classList.add('error');
-  setStatus(text);
-}
+// ---------------------------------------------------------------- boot ----
 
-function hideOverlay() {
-  overlay.remove();
-}
-
-// Adapter-present probe: a `navigator.gpu` existence check alone lies on
-// browsers where WebGPU is exposed but no adapter can be created.
-async function detectWebGpu() {
-  if (!('gpu' in navigator)) return false;
+async function hasWebGpu() {
+  if (!navigator.gpu) return false;
   try {
-    return (await navigator.gpu.requestAdapter()) !== null;
+    return !!(await navigator.gpu.requestAdapter());
   } catch {
     return false;
   }
 }
 
-// Same facts the tier ladder consumes. `deviceMemory` is the Device Memory
-// API in GiB and is missing on Firefox/Safari; `hardwareConcurrency` is the
-// broader signal. Either floor trips low-end.
-function detectLowEndDevice() {
-  const cores = navigator.hardwareConcurrency ?? 8;
-  const memoryGiB = navigator.deviceMemory ?? 8;
-  return cores <= 4 || memoryGiB <= 4;
-}
-
-// Backing store from window size x DPR, capped (playtest E6). Called before
-// boot — the renderer adopts whatever size is set — and on every resize
-// while running.
-const MAX_DPR = 2;
-// Backing-store cap (playtest finding): a 3840x1886 backing store with 4x
-// MSAA measured ~116 MB of GPU memory. The internal resolution is capped at
-// 1920 wide and CSS scales the canvas up — above that cap, extra pixels buy
-// memory cost, not detail, since the scene composes in a fixed 800x450 space.
-const MAX_BACKING_WIDTH = 1920;
-function resizeBackingStore() {
-  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-  let width = Math.max(1, Math.round(canvas.clientWidth * dpr));
-  let height = Math.max(1, Math.round(canvas.clientHeight * dpr));
-  if (width > MAX_BACKING_WIDTH) {
-    height = Math.round((height * MAX_BACKING_WIDTH) / width);
-    width = MAX_BACKING_WIDTH;
+function sizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+  const w = Math.max(1, Math.round(window.innerWidth * dpr));
+  const h = Math.max(1, Math.round(window.innerHeight * dpr));
+  if (canvasEl.width !== w || canvasEl.height !== h) {
+    canvasEl.width = w;
+    canvasEl.height = h;
+    return true;
   }
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-}
-resizeBackingStore();
-addEventListener('resize', resizeBackingStore);
-
-async function importBundle(bundle) {
-  const glue = await import(`./dist/${bundle}/racing_web.js`);
-  await glue.default();
-  return glue;
+  return false;
 }
 
-// Audio lives at module scope so the mute control works from the very first
-// click, even before the wasm finishes booting. unlock() runs inside the
-// CLICK TO RIDE engagement gesture (autoplay policy — see audio.js).
-const audio = new RaceAudio();
-muteButton.addEventListener('click', () => {
-  audio.setMuted(!audio.muted);
-  setText(muteButton, audio.muted ? '🔇' : '🔊');
-  muteButton.title = audio.muted ? 'Unmute' : 'Mute';
-});
+async function bootBundle(name, slug) {
+  const mod = await import(`./${name}/racing_web.js`);
+  await mod.default();
+  const game = await mod.Game.boot(canvasEl, slug);
+  return { mod, game };
+}
 
 async function boot() {
-  const lowEnd = detectLowEndDevice();
-  const hasWebGpu = await detectWebGpu();
-
-  // Boot-time track selection (wave 8): the overlay's control carries the
-  // catalog slug; the wasm boundary resolves it and boots that course. Read
-  // once here — no mid-race switching (spec: locked decision), and the
-  // restart path re-boots the same course wasm-side.
-  const courseId = trackSelect.value;
-
-  let glue;
-  if (hasWebGpu) {
-    setStatus('Loading WebGPU build…');
-    glue = await importBundle('pkg-webgpu');
-  } else if (window.WebGL2RenderingContext) {
-    setStatus('Loading WebGL2 build…');
-    glue = await importBundle('pkg-webgl2');
-  } else {
-    showError(
-      'This game needs WebGPU or WebGL2, and this browser offers neither. ' +
-        'Try a current version of Chrome, Edge, or Firefox.',
-    );
-    return;
+  sizeCanvas();
+  const forced = params.get('backend');
+  const order = forced === 'webgl2' ? ['pkg-webgl2'] : forced === 'webgpu' ? ['pkg-webgpu'] : (await hasWebGpu()) ? ['pkg-webgpu', 'pkg-webgl2'] : ['pkg-webgl2'];
+  let lastErr;
+  for (const name of order) {
+    ui.bootStatus.textContent = `Loading ${name === 'pkg-webgpu' ? 'WebGPU' : 'WebGL2'} renderer…`;
+    try {
+      // A failed WebGPU boot leaves the canvas bound to that context, so the
+      // WebGL2 retry gets a fresh canvas.
+      if (lastErr) replaceCanvas();
+      return await bootBundle(name, localStorage.getItem('track') || '');
+    } catch (e) {
+      console.error(e);
+      lastErr = e;
+    }
   }
+  throw lastErr;
+}
 
-  setStatus('Booting…');
-  let game;
-  try {
-    game = await glue.BrowserGame.boot(canvas, lowEnd, courseId);
-  } catch (bootError) {
-    if (!hasWebGpu) throw bootError;
-    // The WebGPU adapter probed fine but bring-up failed (context loss,
-    // driver blocklist). The WebGL2 build renders on the same browser.
-    console.warn('WebGPU boot failed, falling back to WebGL2:', bootError);
-    setStatus('Falling back to WebGL2 build…');
-    glue = await importBundle('pkg-webgl2');
-    game = await glue.BrowserGame.boot(canvas, lowEnd, courseId);
+
+// --------------------------------------------------------------- input ----
+
+const keys = new Set();
+let attackLatch = false;
+const KEYMAP = {
+  throttle: ['KeyW', 'ArrowUp'],
+  brake: ['KeyS', 'ArrowDown'],
+  left: ['KeyA', 'ArrowLeft'],
+  right: ['KeyD', 'ArrowRight'],
+  boost: ['ShiftLeft', 'ShiftRight', 'Space'],
+};
+const held = (k) => KEYMAP[k].some((c) => keys.has(c));
+const GAME_KEYS = new Set([...Object.values(KEYMAP).flat(), 'KeyX', 'KeyC']);
+
+function readInput() {
+  let throttle = held('throttle') ? 1 : 0;
+  let brake = held('brake') ? 1 : 0;
+  let steer = (held('right') ? 1 : 0) - (held('left') ? 1 : 0);
+  let analog = false;
+  let boost = held('boost');
+  let attack = attackLatch;
+  attackLatch = false;
+  const pad = navigator.getGamepads ? [...navigator.getGamepads()].find((p) => p && p.connected) : null;
+  if (pad) {
+    const b = (i) => pad.buttons[i] || { pressed: false, value: 0 };
+    const sx = pad.axes[0] || 0;
+    if (Math.abs(sx) > 0.12) {
+      steer = Math.sign(sx) * ((Math.abs(sx) - 0.12) / 0.88);
+      analog = true;
+    }
+    throttle = Math.max(throttle, b(7).value, b(0).pressed ? 1 : 0);
+    brake = Math.max(brake, b(6).value);
+    boost = boost || b(5).pressed || b(4).pressed;
+    attack = attack || padEdge(pad, 2) || padEdge(pad, 1);
+    if (padEdge(pad, 3)) cycleCamera();
+    if (padEdge(pad, 9)) onEscape();
   }
+  return { throttle, brake, steer, analog, boost, attack };
+}
 
-  console.info(`racing: booted the ${glue.backend_name()} build`);
-  hideOverlay();
-  hud.hidden = false;
-  hudKeys.hidden = false;
+const padPrev = new Map();
+function padEdge(pad, i) {
+  const now = !!(pad.buttons[i] && pad.buttons[i].pressed);
+  const was = padPrev.get(i) || false;
+  padPrev.set(i, now);
+  return now && !was;
+}
 
-  // Race clock (race-timer.js): fed from the fixed-60 Hz accumulator below —
-  // total time is ticks since the green light x 1/60; lap boundaries come
-  // from the lap counter the HUD already reads.
-  const timer = new RaceTimer();
+// ---------------------------------------------------------------- state ----
 
-  // Zone ticks + labels on the lap bar, from the selected course's own
-  // presentation table (zones.js COURSES mirrors crates/world's catalog).
-  // An unknown value cannot reach here — the wasm boot already failed it —
-  // but guard anyway rather than render a markerless bar.
-  const selectedCourse =
-    COURSES.find((course) => course.id === courseId) ?? COURSES[0];
-  const zoneMarkers = buildZoneMarkers(selectedCourse.zones, game.lap_length());
-  lapBar.appendChild(zoneMarkers);
+let game = null;
+let tracks = [];
+let selected = 0;
+let mode = 'menu'; // menu | race | paused | results
+let outline = null;
+let mapper = null;
+let mapBg = null;
+let finishedAt = null;
+let lastHud = null;
+const audio = new RaceAudio();
+const governor = new ResolutionGovernor();
 
-  const keys = {
-    accelerate: false,
-    brake: false,
-    steerLeft: false,
-    steerRight: false,
-    punch: false,
-    kick: false,
-  };
-  const map = {
-    ArrowUp: 'accelerate', KeyW: 'accelerate',
-    ArrowDown: 'brake', KeyS: 'brake', Space: 'brake',
-    ArrowLeft: 'steerLeft', KeyA: 'steerLeft',
-    ArrowRight: 'steerRight', KeyD: 'steerRight',
-  };
-  // Combat keys are action semantics, not flag-sets: one swing per press,
-  // so key repeats don't re-arm a swing while the key is held.
-  const attackMap = { KeyX: 'punch', KeyZ: 'kick' };
+function show(el, on) {
+  el.classList.toggle('hidden', !on);
+}
 
-  // Keys are captured on BOTH window and document: inside an iframe, which
-  // of the two receives an event depends on how the embedding page targets
-  // the frame, and covering only one is how the frame can sit at 0 km/h with
-  // keys landing in the parent page. A bubbling event reaches both listeners
-  // once per target; setting the flag twice is idempotent.
-  // preventDefault stays limited to mapped game keys (space scrolling, arrow
-  // scrolling); unmapped keys and browser shortcuts pass through untouched,
-  // and held-key repeats just re-set the same flag.
-  const onKeyDown = (e) => {
-    const key = map[e.code];
-    if (key) { keys[key] = true; e.preventDefault(); return; }
-    const attack = attackMap[e.code];
-    if (attack && !e.repeat) { keys[attack] = true; e.preventDefault(); }
-  };
-  const onKeyUp = (e) => {
-    const key = map[e.code];
-    if (key) { keys[key] = false; e.preventDefault(); }
-  };
-  addEventListener('keydown', onKeyDown);
-  addEventListener('keyup', onKeyUp);
-  document.addEventListener('keydown', onKeyDown);
-  document.addEventListener('keyup', onKeyUp);
+function setText(el, text) {
+  if (el._t !== text) {
+    el._t = text;
+    el.textContent = text;
+  }
+}
 
-  // Focus capture: in an iframe artifact, keyboard focus often stays with
-  // the parent page, so the sim reads no input and the race appears frozen.
-  // Attempt focus on boot, then surface CLICK TO RIDE until the frame has
-  // been engaged (a focus event, a click, or a keydown — whichever comes
-  // first). Engagement is sticky: once focused, the prompt never returns.
-  let engaged = false;
-  const refreshFocusUI = () => {
-    if (document.hasFocus()) engaged = true;
-    if (focusOverlay.hidden !== engaged) focusOverlay.hidden = engaged;
-  };
-  addEventListener('focus', refreshFocusUI);
-  addEventListener('blur', refreshFocusUI);
-  addEventListener('pointerdown', refreshFocusUI, true);
-  addEventListener('keydown', refreshFocusUI, true);
-  document.addEventListener('pointerdown', refreshFocusUI, true);
-  document.addEventListener('keydown', refreshFocusUI, true);
-  // hasFocus() can flip without a focus/blur event firing in some embedding
-  // setups, so poll as a backstop.
-  setInterval(refreshFocusUI, 300);
-  window.focus(); // best-effort: same-origin embedders may allow it; the overlay covers the rest
-  refreshFocusUI();
-
-  // Audio unlock rides the same engagement events as focus capture; unlock()
-  // is idempotent, so every later click/keydown is a cheap no-op.
-  const unlockAudio = () => audio.unlock();
-  addEventListener('pointerdown', unlockAudio, true);
-  addEventListener('keydown', unlockAudio, true);
-  document.addEventListener('pointerdown', unlockAudio, true);
-  document.addEventListener('keydown', unlockAudio, true);
-
-  restartButton.addEventListener('click', () => {
-    game.restart();
-    timer.reset();
-    finishEl.hidden = true;
+function renderTrackList() {
+  ui.tracks.innerHTML = '';
+  tracks.forEach((t, i) => {
+    const b = document.createElement('button');
+    b.className = 'track' + (i === selected ? ' sel' : '');
+    b.innerHTML = `<div class="t"><span></span><small></small></div><div class="b"></div>`;
+    b.querySelector('.t span').textContent = t.name;
+    b.querySelector('.t small').textContent = `${t.laps} laps`;
+    b.querySelector('.b').textContent = t.blurb;
+    b.addEventListener('click', () => selectTrack(i));
+    b.addEventListener('dblclick', startRace);
+    ui.tracks.appendChild(b);
   });
+}
 
-  // Fixed 60 Hz simulation (playtest finding: one advance_frame per rAF made
-  // a 120 Hz display play at double speed). advance_frame is one sim tick;
-  // elapsed time accumulates and each rAF drains whole ticks, with the
-  // per-frame catch-up clamped to MAX_CATCH_UP_TICKS so a slow render path
-  // (SwiftShader, weak iGPU) falls behind gradually instead of spiraling.
-  const TICK_MS = 1000 / 60;
-  const MAX_CATCH_UP_TICKS = 5;
-  let lastFrameTime = performance.now();
-  let accumulator = 0;
+function selectTrack(i) {
+  selected = (i + tracks.length) % tracks.length;
+  localStorage.setItem('track', tracks[selected].slug);
+  renderTrackList();
+  game.show(tracks[selected].slug);
+  loadMap();
+}
 
-  // Keyboard affordances (playtest): R restarts alongside the button,
-  // Escape pauses the sim shell-side — rendering keeps running, but no
-  // advance_frame ticks are fed, so the whole race holds still without any
-  // wasm-side pause API. Neither key is in the game-key map, so the browser
-  // keeps default handling for them.
-  // R and Escape are toggle/action semantics, not idempotent flag-sets, so a
-  // single event reaching both the window and document listeners must act
-  // once: dedupe on event identity (the same Event instance bubbles through
-  // both targets).
-  let lastRestartEvent = null;
-  const onRestartKey = (e) => {
-    if (e.code !== 'KeyR' || e.repeat || e === lastRestartEvent) return;
-    lastRestartEvent = e;
-    game.restart();
-    timer.reset();
-    finishEl.hidden = true;
-  };
-  addEventListener('keydown', onRestartKey);
-  document.addEventListener('keydown', onRestartKey);
+function loadMap() {
+  outline = game.track_outline();
+  mapper = fitMap(outline, ui.minimap.width, 26);
+  mapBg = null;
+}
 
-  let paused = false;
-  let lastPauseEvent = null;
-  const onPauseKey = (e) => {
-    if (e.code !== 'Escape' || e.repeat || e === lastPauseEvent) return;
-    lastPauseEvent = e;
-    paused = !paused;
-    pausedEl.hidden = !paused;
-    if (!paused) {
-      // Drop the backlog so unpausing doesn't burst a wave of catch-up ticks.
-      accumulator = 0;
-      lastFrameTime = performance.now();
+function enterMenu() {
+  mode = 'menu';
+  audio.update(audioFrame(null, { paused: true }));
+  show(ui.menu, true);
+  show(ui.hud, false);
+  show(ui.pause, false);
+  show(ui.results, false);
+  game.set_paused(false);
+  game.show(tracks[selected].slug);
+  loadMap();
+}
+
+function startRace() {
+  audio.unlock();
+  mode = 'race';
+  finishedAt = null;
+  show(ui.menu, false);
+  show(ui.pause, false);
+  show(ui.results, false);
+  show(ui.hud, true);
+  ui.hint.style.opacity = '1';
+  setTimeout(() => (ui.hint.style.opacity = '0'), 9000);
+  ui.toast.innerHTML = '';
+  game.start_race(tracks[selected].slug);
+  loadMap();
+  canvasEl.focus();
+}
+
+function setPaused(on) {
+  if (mode !== 'race' && mode !== 'paused') return;
+  mode = on ? 'paused' : 'race';
+  game.set_paused(on);
+  show(ui.pause, on);
+  if (on && lastHud) {
+    ui.pauseSub.textContent = `${tracks[selected].name} · lap ${lastHud[HUD.LAP]} of ${lastHud[HUD.LAPS]}`;
+  }
+}
+
+function onEscape() {
+  if (mode === 'race') setPaused(true);
+  else if (mode === 'paused') setPaused(false);
+  else if (mode === 'results') enterMenu();
+}
+
+function cycleCamera() {
+  if (mode === 'race') game.cycle_camera();
+}
+
+function toast(text, cls = '') {
+  const d = document.createElement('div');
+  d.textContent = text;
+  if (cls) d.className = cls;
+  ui.toast.appendChild(d);
+  setTimeout(() => d.remove(), 2400);
+  while (ui.toast.children.length > 3) ui.toast.firstChild.remove();
+}
+
+function flash(strength) {
+  ui.flash.style.transition = 'none';
+  ui.flash.style.opacity = String(Math.min(1, strength));
+  requestAnimationFrame(() => {
+    ui.flash.style.transition = 'opacity 0.45s';
+    ui.flash.style.opacity = '0';
+  });
+}
+
+// ------------------------------------------------------------------ HUD ----
+
+function drawTach(rpm, boosting) {
+  const c = ui.tach;
+  const g = c.getContext('2d');
+  const w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  const bars = 36;
+  const gap = 3;
+  const bw = (w - gap * (bars - 1)) / bars;
+  const lit = (rpm / MAX_RPM) * bars;
+  for (let i = 0; i < bars; i++) {
+    const r = (i + 1) / bars * MAX_RPM;
+    const hh = h * (0.32 + 0.68 * Math.pow(i / (bars - 1), 1.6));
+    const on = i < lit;
+    let col = 'rgba(255,255,255,0.12)';
+    if (on) col = r > REDLINE_RPM ? '#ff4d2e' : r > REDLINE_RPM * 0.8 ? '#ffc23d' : boosting ? '#48c8ff' : '#f4f1ea';
+    g.fillStyle = col;
+    g.fillRect(i * (bw + gap), h - hh, bw, hh);
+  }
+}
+
+function drawMinimap(points) {
+  const c = ui.minimap;
+  const g = c.getContext('2d');
+  if (!mapBg) {
+    mapBg = document.createElement('canvas');
+    mapBg.width = c.width;
+    mapBg.height = c.height;
+    const b = mapBg.getContext('2d');
+    b.lineJoin = 'round';
+    b.beginPath();
+    for (let i = 0; i + 1 < outline.length; i += 2) {
+      const [x, y] = mapper(outline[i], outline[i + 1]);
+      if (i === 0) b.moveTo(x, y);
+      else b.lineTo(x, y);
     }
-  };
-  addEventListener('keydown', onPauseKey);
-  document.addEventListener('keydown', onPauseKey);
+    b.closePath();
+    b.strokeStyle = 'rgba(0,0,0,0.5)';
+    b.lineWidth = 18;
+    b.stroke();
+    b.strokeStyle = 'rgba(244,241,234,0.85)';
+    b.lineWidth = 8;
+    b.stroke();
+    const [sx, sy] = mapper(outline[0], outline[1]);
+    b.fillStyle = '#fff';
+    b.fillRect(sx - 9, sy - 9, 18, 18);
+    b.fillStyle = '#000';
+    b.fillRect(sx - 9, sy - 9, 9, 9);
+    b.fillRect(sx, sy, 9, 9);
+  }
+  g.clearRect(0, 0, c.width, c.height);
+  g.drawImage(mapBg, 0, 0);
+  for (let i = points.length - 2; i >= 0; i -= 2) {
+    const [x, y] = mapper(points[i], points[i + 1]);
+    const me = i === 0;
+    g.beginPath();
+    g.arc(x, y, me ? 13 : 9, 0, Math.PI * 2);
+    g.fillStyle = me ? '#ff4d2e' : 'rgba(30,34,44,0.95)';
+    g.fill();
+    g.lineWidth = me ? 4 : 3;
+    g.strokeStyle = me ? '#fff' : 'rgba(244,241,234,0.8)';
+    g.stroke();
+  }
+}
 
-  const ORDINALS = ['1st', '2nd', '3rd', '4th', '5th', '6th'];
-  const ordinal = (pos) => ORDINALS[pos - 1] ?? `${pos}th`;
+function updateHud(h) {
+  const pos = h[HUD.POSITION];
+  setText(ui.pos, String(pos));
+  setText(ui.suf, ordinal(pos));
+  setText(ui.of, `/ ${h[HUD.RACERS]}`);
+  const lap = h[HUD.LAP], laps = h[HUD.LAPS];
+  setText(ui.lap, `${lap} / ${laps}`);
+  setText(ui.time, formatTime(h[HUD.LAP_TIME]));
+  setText(ui.best, formatTime(h[HUD.BEST_LAP]));
+  setText(ui.speed, String(Math.round(h[HUD.SPEED])));
+  setText(ui.gear, String(h[HUD.GEAR]));
+  ui.boost.style.width = `${Math.round(h[HUD.BOOST] * 100)}%`;
+  ui.boostLbl.classList.toggle('on', h[HUD.BOOSTING] > 0 || h[HUD.BOOST] > 0.98);
+  setText(ui.boostLbl, h[HUD.BOOSTING] > 0 ? 'BOOSTING' : h[HUD.BOOST] > 0.98 ? 'BOOST READY' : 'BOOST');
+  ui.draft.classList.toggle('on', h[HUD.DRAFTING] > 0);
+  const bal = Math.max(0, Math.min(1, h[HUD.BALANCE] / 100));
+  ui.bal.style.width = `${Math.round(bal * 100)}%`;
+  ui.bal.classList.toggle('low', bal < 0.35);
+  drawTach(h[HUD.RPM], h[HUD.BOOSTING] > 0);
 
-  // Rider-state badge (playtest E5): the wasm's bitmask maps to one visible
-  // badge, most severe first — see badge.js for the (probe-asserted) mapping.
-  // The start grid counts as a state too — that is the moment the playtest
-  // flagged as an "inconsistency" (0 km/h, last place, rivals drawn right
-  // beside the player): the values are correct, the red lights explain them.
-  function updateStateBadge(state, countingDown) {
-    const badge = badgeForState(state, countingDown);
-    if (badge === null) {
-      riderStateEl.hidden = true;
-      return;
-    }
-    riderStateEl.hidden = false;
-    setText(riderStateEl, badge.text);
-    if (riderStateEl.className !== badge.className) riderStateEl.className = badge.className;
+  const cd = h[HUD.COUNTDOWN];
+  if (cd > 0) {
+    ui.count.classList.remove('go');
+    setText(ui.count, String(Math.ceil(cd)));
+  } else if (h[HUD.RACE_TIME] < 1.2 && h[HUD.FINISHED] < 0) {
+    ui.count.classList.add('go');
+    setText(ui.count, 'GO!');
+  } else {
+    setText(ui.count, '');
   }
 
-  const frame = () => {
-    // Drain whole 60 Hz ticks due since the last frame; the elapsed clamp in
-    // the accumulator keeps this loop at MAX_CATCH_UP_TICKS iterations worst
-    // case. Rendering still happens every rAF. While paused, no ticks are fed
-    // and the clock is kept current so unpausing doesn't burst catch-up ticks.
-    const now = performance.now();
-    // Race-clock inputs, read once per frame from the glue the HUD already
-    // polls: the countdown gate and the lap counter drive the timer.
-    const countingDown = game.is_counting_down();
-    const lapIndex = game.lap_index();
-    const finishedNow = game.is_finished();
-    if (paused) {
-      lastFrameTime = now;
-    } else {
-      accumulator += Math.min(now - lastFrameTime, MAX_CATCH_UP_TICKS * TICK_MS);
-      lastFrameTime = now;
-      while (accumulator >= TICK_MS) {
-        game.advance_frame(
-          keys.accelerate,
-          keys.brake,
-          keys.steerLeft,
-          keys.steerRight,
-          keys.punch,
-          keys.kick,
-        );
-        // One swing per press: the first tick of the frame consumes it.
-        keys.punch = false;
-        keys.kick = false;
-        accumulator -= TICK_MS;
-        // Total race time is ticks fed since the green light x 1/60.
-        timer.tick({ countingDown, lapIndex, finished: finishedNow });
-      }
+  let banner = '';
+  let warn = false;
+  if (h[HUD.FINISHED] >= 0) banner = 'FINISH';
+  else if (h[HUD.WRONG_WAY] > 0) { banner = 'WRONG WAY'; warn = true; }
+  else if (h[HUD.CRASHED] > 0) banner = 'GET BACK ON!';
+  setText(ui.banner, banner);
+  show(ui.banner, banner !== '');
+  ui.banner.classList.toggle('warn', warn);
+}
+
+function showResults() {
+  mode = 'results';
+  show(ui.hud, false);
+  show(ui.results, true);
+  const rows = parseStandings(game.standings());
+  const me = rows.findIndex((r) => r.name === 'You');
+  ui.rTitle.textContent = me === 0 ? 'Victory!' : `${me + 1}${ordinal(me + 1)} place`;
+  const h = lastHud;
+  ui.rSub.textContent = `${tracks[selected].name} · best lap ${formatTime(h[HUD.BEST_LAP])}`;
+  ui.rTable.innerHTML = '';
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    if (r.name === 'You') tr.className = 'me';
+    const cells = [String(i + 1), r.name, r.done ? formatTime(r.time) : 'racing…'];
+    for (const t of cells) {
+      const td = document.createElement('td');
+      td.textContent = t;
+      tr.appendChild(td);
     }
+    ui.rTable.appendChild(tr);
+  });
+}
 
-    // HUD: speed, position, lap of N with progress toward the lap length
-    // (playtest E1/E2/E3).
-    setText(speedValue, String(game.speed_kmh()));
-    setText(hudPos, `${ordinal(game.race_position())} of ${game.bike_count()}`);
-    const lap = Math.min(game.lap_index() + 1, game.total_laps());
-    const lapLength = Math.round(game.lap_length());
-    setText(
-      hudLap,
-      `lap ${lap} of ${game.total_laps()} · ` +
-        `${Math.floor(game.player_distance()).toLocaleString('en-US')} / ` +
-        `${lapLength.toLocaleString('en-US')} m`,
-    );
-    const progressPct = `${(Math.min(game.lap_progress(), 1) * 100).toFixed(1)}%`;
-    if (lapFill.style.width !== progressPct) lapFill.style.width = progressPct;
-    highlightZone(zoneMarkers, selectedCourse.zones, game.player_distance());
+// ---------------------------------------------------------------- audio ----
 
-    // Combat stamina: amber bar while fighting, red once it runs low.
-    const stamina = Math.min(Math.max(game.player_stamina(), 0), 1);
-    const staminaPct = `${(stamina * 100).toFixed(1)}%`;
-    if (staminaFill.style.width !== staminaPct) staminaFill.style.width = staminaPct;
-    const low = stamina < 0.25;
-    if (staminaFill.classList.contains('low') !== low) {
-      staminaFill.classList.toggle('low', low);
-    }
-
-    updateStateBadge(game.rider_state(), game.is_counting_down());
-
-    // Green-light countdown.
-    if (game.is_counting_down()) {
-      countdownEl.hidden = false;
-      setText(countdownEl, String(game.countdown_secs()));
-    } else {
-      countdownEl.hidden = true;
-    }
-
-    // Audio cues, fed exactly what the HUD strip already reads (audio.js):
-    // engine tone tracks the HUD speed; hit/crash/countdown cues come from
-    // the stamina bar, the rider-state bitmask, and the countdown overlay.
-    audio.update({
-      speedKmh: game.speed_kmh(),
-      state: game.rider_state(),
-      stamina: Math.min(Math.max(game.player_stamina(), 0), 1),
-      countingDown,
-      countdownSecs: game.countdown_secs(),
-      paused,
-      finished: finishedNow,
-    });
-
-    // Finish: show the result and the clock, race keeps rendering behind it.
-    if (finishedNow) {
-      setText(
-        finishText,
-        `You finished ${ordinal(game.race_position())} of ${game.bike_count()}.`,
-      );
-      setText(
-        finishTimes,
-        `Total time ${formatTime(timer.totalSeconds)} · Best lap ${formatTime(timer.bestLapSeconds)}`,
-      );
-      finishEl.hidden = false;
-    }
-
-    requestAnimationFrame(frame);
+function audioFrame(h, extra = {}) {
+  const inp = extra.input || { throttle: 0, brake: 0 };
+  return {
+    speedKmh: h ? h[HUD.SPEED] : 0,
+    state: h && h[HUD.CRASHED] > 0 ? 1 : 0,
+    // Rider balance (0..100) drives the audio's hit cue on a sudden drop.
+    stamina: h ? h[HUD.BALANCE] / 100 : 1,
+    countingDown: !!h && h[HUD.COUNTDOWN] > 0,
+    countdownSecs: h ? Math.ceil(h[HUD.COUNTDOWN]) : 0,
+    paused: extra.paused ?? false,
+    finished: !!h && h[HUD.FINISHED] >= 0,
+    rpm: h ? h[HUD.RPM] : 0,
+    throttle: inp.brake > 0.1 ? 'brake' : inp.throttle > 0.1 ? 'accelerate' : 'coast',
+    zone: h ? `lap${h[HUD.LAP]}` : null,
   };
+}
+
+function handleCues(cues, h) {
+  for (const c of cues) {
+    switch (c.code) {
+      case CUE.WALL:
+        flash(0.25 + c.a / 40);
+        if (audio.ctx) audio.blip(70, 0.12, 'sawtooth', Math.min(0.5, 0.15 + c.a / 60));
+        break;
+      case CUE.CONTACT:
+        if (audio.ctx) audio.blip(120, 0.06, 'square', 0.2);
+        break;
+      case CUE.HIT_LANDED:
+        toast('Hit!', 'best');
+        if (audio.ctx) audio.blip(180, 0.08, 'triangle', 0.4);
+        break;
+      case CUE.GOT_HIT:
+        flash(0.5);
+        break;
+      case CUE.CRASH:
+        flash(0.9);
+        break;
+      case CUE.LAP: {
+        const lapDone = c.a;
+        const best = h[HUD.BEST_LAP];
+        const isBest = best >= 0 && Math.abs(best - c.b) < 0.0005;
+        toast(`Lap ${lapDone}  ${formatTime(c.b)}${isBest ? '  · best' : ''}`, isBest ? 'best' : '');
+        if (lapDone === h[HUD.LAPS] - 1) setTimeout(() => toast('Final lap', 'bad'), 600);
+        break;
+      }
+      case CUE.FINISHED:
+        finishedAt = performance.now();
+        break;
+      case CUE.OVERTAKE:
+        if (c.a > 0) {
+          toast(`${h[HUD.POSITION]}${ordinal(h[HUD.POSITION])}`, 'best');
+          if (audio.ctx) audio.blip(660, 0.07, 'sine', 0.18);
+        } else {
+          toast(`${h[HUD.POSITION]}${ordinal(h[HUD.POSITION])}`, 'bad');
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+// ----------------------------------------------------------------- loop ----
+
+let last = performance.now();
+let lastScale = 1;
+
+function frame(now) {
+  const dtMs = now - last;
+  last = now;
+  const dt = Math.min(dtMs / 1000, 0.1);
+
+  if (sizeCanvas()) game.resize(canvasEl.width, canvasEl.height);
+  const scale = governor.sample(dtMs);
+  if (Math.abs(scale - lastScale) > 0.001) {
+    lastScale = scale;
+    game.set_render_scale(scale);
+  }
+
+  const playing = mode === 'race';
+  const input = playing ? readInput() : { throttle: 0, brake: 0, steer: 0, analog: false, boost: false, attack: false };
+  if (!playing && navigator.getGamepads) pollMenuPad();
+  const cues = decodeCues(game.frame(dt, input.throttle, input.brake, input.steer, input.analog, input.boost, input.attack));
+
+  if (mode === 'race' || mode === 'paused' || mode === 'results') {
+    const h = game.hud();
+    lastHud = h;
+    if (mode === 'race') {
+      handleCues(cues, h);
+      updateHud(h);
+      drawMinimap(game.bike_points());
+      if (finishedAt && now - finishedAt > 3200) showResults();
+    }
+    audio.update(audioFrame(h, { paused: mode === 'paused', input }));
+  }
   requestAnimationFrame(frame);
 }
 
-boot().catch((error) => {
-  console.error(error);
-  showError(`Boot failed: ${error}`);
+function pollMenuPad() {
+  const pad = [...navigator.getGamepads()].find((p) => p && p.connected);
+  if (!pad) return;
+  if (mode === 'menu') {
+    if (padEdge(pad, 0) || padEdge(pad, 9)) startRace();
+    if (padEdge(pad, 12)) selectTrack(selected - 1);
+    if (padEdge(pad, 13)) selectTrack(selected + 1);
+  } else if (mode === 'paused') {
+    if (padEdge(pad, 9) || padEdge(pad, 0)) setPaused(false);
+  } else if (mode === 'results') {
+    if (padEdge(pad, 0)) startRace();
+    if (padEdge(pad, 1)) enterMenu();
+  }
+}
+
+// --------------------------------------------------------------- events ----
+
+window.addEventListener('keydown', (e) => {
+  if (!game) return;
+  audio.unlock();
+  if (GAME_KEYS.has(e.code)) e.preventDefault();
+  if (e.repeat) {
+    keys.add(e.code);
+    return;
+  }
+  keys.add(e.code);
+  switch (e.code) {
+    case 'Escape':
+    case 'KeyP':
+      onEscape();
+      break;
+    case 'KeyX':
+      attackLatch = true;
+      break;
+    case 'KeyC':
+      cycleCamera();
+      break;
+    case 'KeyR':
+      if (mode === 'race' || mode === 'paused' || mode === 'results') startRace();
+      break;
+    case 'Enter':
+      if (mode === 'menu' || mode === 'results') startRace();
+      else if (mode === 'paused') setPaused(false);
+      break;
+    case 'ArrowUp':
+    case 'ArrowDown':
+      if (mode === 'menu') selectTrack(selected + (e.code === 'ArrowUp' ? -1 : 1));
+      break;
+    default:
+      break;
+  }
 });
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => {
+  keys.clear();
+  if (mode === 'race') setPaused(true);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && mode === 'race') setPaused(true);
+});
+
+ui.start.addEventListener('click', startRace);
+ui.resume.addEventListener('click', () => setPaused(false));
+ui.restart.addEventListener('click', startRace);
+ui.quit.addEventListener('click', enterMenu);
+ui.again.addEventListener('click', startRace);
+ui.toMenu.addEventListener('click', enterMenu);
+ui.mute.addEventListener('click', () => {
+  audio.unlock();
+  audio.setMuted(!audio.muted);
+  localStorage.setItem('muted', audio.muted ? '1' : '');
+  ui.mute.textContent = audio.muted ? '🔇' : '🔊';
+});
+ui.fs.addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.();
+});
+window.addEventListener('pointerdown', () => audio.unlock(), { once: false });
+
+// ---------------------------------------------------------------- start ----
+
+(async () => {
+  try {
+    const { mod, game: g } = await boot();
+    game = g;
+    tracks = parseTracks(mod.track_list());
+    selected = Math.max(0, tracks.findIndex((t) => t.slug === game.track()));
+    renderTrackList();
+    if (localStorage.getItem('muted')) {
+      audio.setMuted(true);
+      ui.mute.textContent = '🔇';
+    }
+    loadMap();
+    show(ui.boot, false);
+    show(ui.menu, true);
+    console.info(`racing: ${game.backend()} on ${game.adapter()} (HDR ${game.hdr_format()})`);
+    window.__racing = { game, governor, stats: () => game.stats() };
+    last = performance.now();
+    requestAnimationFrame(frame);
+  } catch (e) {
+    ui.bootStatus.textContent = `This browser couldn't start the renderer (${e && e.message ? e.message : e}). Try a recent Chrome, Edge, Firefox or Safari.`;
+    document.querySelector('#boot .spin').style.display = 'none';
+  }
+})();

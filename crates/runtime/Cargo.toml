@@ -2,24 +2,15 @@
 name = "runtime"
 version.workspace = true
 edition.workspace = true
-description = "Frame composition: advances the race, builds the sprite batch, and proves the GPU path offscreen."
+description = "Session glue: fixed-step race, chase camera, particles, HUD; native screenshot and bench tools."
 
 [dependencies]
-sim = { path = "../sim" }
-world = { path = "../world" }
-assets = { path = "../assets" }
 game = { path = "../game" }
 render = { path = "../render" }
-# `default-features = false` for the same feature-unification reason recorded
-# in `render/Cargo.toml`: one default-features wgpu dependency re-enables the
-# browser-WebGPU backend in the web crate's webgl2 bundle. Native backends
-# match wgpu's defaults minus `webgpu` so the offscreen proof is unchanged.
-wgpu = { version = "25.0.0", default-features = false, features = [
-    "wgsl",
-    "gles",
-    "vulkan",
-    "metal",
-    "dx12",
-] }
-bytemuck = { version = "1", features = ["derive"] }
+sim = { path = "../sim" }
+glam.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native tools only (offscreen screenshots and the frame bench).
+wgpu = { version = "25.0.0", default-features = false, features = ["wgsl", "gles", "vulkan", "metal", "dx12"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

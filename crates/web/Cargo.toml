@@ -2,30 +2,25 @@
 name = "web"
 version.workspace = true
 edition.workspace = true
-description = "WASM browser shell: wasm-bindgen entrypoints composing runtime frames into the render GPU path on a canvas."
+description = "Browser shell: wasm-bindgen entry points that drive a race session and draw it to a canvas."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["webgpu"]
-# The backends are cargo-feature builds: exactly one ships per wasm artifact
-# and the JS loader picks between them at load time (see web/build.sh). The
-# chosen build reports its backend through `backend_name`.
+# One wasm bundle per GPU backend; web/loader.js picks one at load time.
 webgpu = ["wgpu/webgpu"]
 webgl2 = ["wgpu/webgl"]
 
 [dependencies]
-runtime = { path = "../runtime" }
-render = { path = "../render" }
 game = { path = "../game" }
-world = { path = "../world" }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4.80"
+render = { path = "../render" }
+runtime = { path = "../runtime" }
+glam.workspace = true
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
-# `default-features = false`: wgpu's defaults carry the `webgpu` feature, which
-# cargo would unify into BOTH wasm bundles. The backend feature arrives through
-# this crate's own `webgpu`/`webgl2` feature below; `wgsl` is required to parse
-# the WGSL shader sources.
-wgpu = { version = "25.0.0", default-features = false, features = ["wgsl"] }
+wgpu = { version = "25", default-features = false, features = ["wgsl"] }

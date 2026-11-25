@@ -1,220 +1,121 @@
-//! 2D orthographic camera: pixel-space (as the `world` projector emits it)
-//! to clip-space, as pure math with no device involved.
+//! View camera with a reversed, infinite-far depth projection.
 
-use world::Billboard;
+use glam::{Mat4, Vec3, Vec4};
 
-use crate::batch::SpriteBatch;
-use crate::instance::SpriteInstance;
-
-/// Orthographic camera over a pixel-space viewport with y pointing down —
-/// the same convention the `world` crate's projector uses, so projected
-/// coordinates feed straight in.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OrthoCamera {
-    pub width: f32,
-    pub height: f32,
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub pos: Vec3,
+    pub target: Vec3,
+    pub up: Vec3,
+    /// Vertical field of view in radians.
+    pub fov_y: f32,
+    pub near: f32,
 }
 
-impl OrthoCamera {
-    /// Panics on a zero-sized viewport; a camera with no output surface has
-    /// no meaningful projection, and the caller builds the camera from real
-    /// surface dimensions.
-    pub fn new(width: f32, height: f32) -> Self {
-        assert!(width > 0.0 && height > 0.0, "viewport must be non-empty");
-        Self { width, height }
-    }
-
-    /// Column-major 4x4 clip matrix for `wgpu` (mat4x4 columns are the inner
-    /// arrays). Maps pixel x right to clip x right, flips pixel y down to
-    /// clip y up, and keeps depth in 0..1.
-    pub fn clip_matrix(&self) -> [[f32; 4]; 4] {
-        [
-            [2.0 / self.width, 0.0, 0.0, 0.0],
-            [0.0, -2.0 / self.height, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0, 1.0],
-        ]
-    }
-
-    /// Transforms one screen-space point to clip space — the same mapping
-    /// [`clip_matrix`](Self::clip_matrix) applies, exposed as a function for
-    /// callers that reason in points rather than matrices.
-    pub fn point_to_clip(&self, x: f32, y: f32) -> [f32; 2] {
-        [2.0 * x / self.width - 1.0, 1.0 - 2.0 * y / self.height]
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            pos: Vec3::new(0.0, 10.0, -20.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov_y: 1.1,
+            near: 0.25,
+        }
     }
 }
 
-/// Builds a screen-space instance from the `world` projector's billboard
-/// output. The billboard reports the road-contact bottom edge; the sprite is
-/// centred on that rect, which is what the instanced quad shader expects.
-pub fn instance_from_billboard(billboard: Billboard, style: SpriteStyle) -> SpriteInstance {
-    SpriteInstance {
-        position: [
-            billboard.center_x,
-            billboard.bottom_y - billboard.height * 0.5,
-        ],
-        scale: [billboard.width, billboard.height],
-        rotation: 0.0,
-        uv_rect: style.uv_rect,
-        tint: style.tint,
+impl Camera {
+    pub fn view(&self) -> Mat4 {
+        Mat4::look_at_rh(self.pos, self.target, self.up)
+    }
+
+    /// Reversed-Z: depth 1 at the near plane, 0 at infinity.
+    pub fn proj(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_infinite_reverse_rh(self.fov_y, aspect, self.near)
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        self.proj(aspect) * self.view()
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        (self.target - self.pos).normalize_or(Vec3::Z)
     }
 }
 
-/// Where a sprite sits on the road — the four inputs to
-/// `world::Projector::billboard`, bundled so callers pass one named value
-/// instead of four loose floats.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RoadPlacement {
-    /// Distance along the road from the camera plane.
-    pub distance: f32,
-    /// Lateral offset across the road, in world units.
-    pub lateral: f32,
-    /// Sprite width in world units (projected to screen width).
-    pub world_width: f32,
-    /// Sprite height in world units (projected to screen height).
-    pub world_height: f32,
-    /// Screen-space roll of the quad, in radians (positive tips the top of
-    /// the sprite right). The rider's visual bank; everything else uses 0.0.
-    pub roll: f32,
+/// Five clip planes (no far plane: the projection is infinite).
+#[derive(Debug, Clone, Copy)]
+pub struct Frustum {
+    planes: [Vec4; 5],
 }
 
-/// Atlas region and tint for one sprite — the two appearance inputs shared by
-/// every push helper, bundled to keep signatures short.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SpriteStyle {
-    /// Atlas UV rect `[u0, v0, u1, v1]` from [`uv_rect`](crate::uv_rect).
-    pub uv_rect: [f32; 4],
-    /// Linear RGBA multiply, 0..1.
-    pub tint: [f32; 4],
-}
+impl Frustum {
+    pub fn from_view_proj(m: Mat4) -> Self {
+        let r0 = m.row(0);
+        let r1 = m.row(1);
+        let r2 = m.row(2);
+        let r3 = m.row(3);
+        let mut planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 - r2];
+        for p in &mut planes {
+            let l = p.truncate().length();
+            if l > 0.0 {
+                *p /= l;
+            }
+        }
+        Self { planes }
+    }
 
-/// Projects a road-space sprite through the `world` crate's projector and
-/// pushes the resulting instance onto the batch in one step.
-///
-/// Returns `false` without touching the batch when the point falls behind the
-/// near plane (the projector culls it) — caller decides whether that is an
-/// error or an expected off-screen case.
-pub fn push_projected(
-    batch: &mut SpriteBatch,
-    projector: &world::Projector<'_>,
-    placement: RoadPlacement,
-    style: SpriteStyle,
-) -> bool {
-    match projector.billboard(
-        placement.distance,
-        placement.lateral,
-        placement.world_width,
-        placement.world_height,
-    ) {
-        Some(billboard) => batch.push(instance_rolled(billboard, style, placement.roll)),
-        None => false,
+    /// Orthographic shadow frustum: all six planes are proper.
+    pub fn from_ortho(m: Mat4) -> [Vec4; 6] {
+        let r0 = m.row(0);
+        let r1 = m.row(1);
+        let r2 = m.row(2);
+        let r3 = m.row(3);
+        let mut planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+        for p in &mut planes {
+            let l = p.truncate().length();
+            if l > 0.0 {
+                *p /= l;
+            }
+        }
+        planes
+    }
+
+    pub fn aabb_visible(&self, lo: Vec3, hi: Vec3) -> bool {
+        aabb_in_planes(&self.planes, lo, hi)
     }
 }
 
-/// Builds a screen-space instance rotated about the sprite's ground-contact
-/// point rather than its centre, so a banked rider keeps its wheel on the
-/// road. `roll` is radians, positive tipping the top of the sprite right —
-/// the shader's rotation convention under screen-space y-down. Zero roll
-/// builds the plain billboard instance.
-pub fn instance_rolled(billboard: Billboard, style: SpriteStyle, roll: f32) -> SpriteInstance {
-    let base = instance_from_billboard(billboard, style);
-    if roll == 0.0 {
-        return base;
+pub fn aabb_in_planes(planes: &[Vec4], lo: Vec3, hi: Vec3) -> bool {
+    for p in planes {
+        let n = p.truncate();
+        // Farthest corner along the plane normal.
+        let v = Vec3::new(
+            if n.x >= 0.0 { hi.x } else { lo.x },
+            if n.y >= 0.0 { hi.y } else { lo.y },
+            if n.z >= 0.0 { hi.z } else { lo.z },
+        );
+        if n.dot(v) + p.w < 0.0 {
+            return false;
+        }
     }
-    let half_height = billboard.height * 0.5;
-    let (s, c) = roll.sin_cos();
-    SpriteInstance {
-        // Rotating the quad about its bottom edge: the centre swings
-        // sideways by h/2·sin(roll) and drops by h/2·(1 − cos(roll)).
-        position: [
-            base.position[0] + half_height * s,
-            base.position[1] + half_height * (1.0 - c),
-        ],
-        rotation: base.rotation + roll,
-        ..base
-    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use world::Viewport;
-
-    const STYLE: SpriteStyle = SpriteStyle {
-        uv_rect: [0.0, 0.0, 1.0, 1.0],
-        tint: [1.0, 1.0, 1.0, 1.0],
-    };
-
-    fn billboard() -> world::Billboard {
-        world::Billboard {
-            center_x: 100.0,
-            bottom_y: 200.0,
-            width: 40.0,
-            height: 80.0,
-        }
-    }
 
     #[test]
-    fn zero_roll_is_the_plain_billboard() {
-        let plain = instance_rolled(billboard(), STYLE, 0.0);
-        let base = instance_from_billboard(billboard(), STYLE);
-        assert_eq!(plain, base);
-        assert_eq!(plain.rotation, 0.0);
-    }
-
-    #[test]
-    fn roll_tips_right_and_keeps_the_ground_contact() {
-        let roll = 0.3_f32;
-        let plain = instance_from_billboard(billboard(), STYLE);
-        let rolled = instance_rolled(billboard(), STYLE, roll);
-        assert_eq!(rolled.rotation, roll);
-
-        // The centre swings right and rides lower — the top of the sprite
-        // tips right while the pivot stays at the road-contact bottom edge.
-        assert!(rolled.position[0] > plain.position[0]);
-        assert!(rolled.position[1] > plain.position[1]);
-
-        // The pivot is preserved exactly: rotating the centre back about
-        // the bottom edge lands on it for both axes' magnitudes.
-        let half_height = billboard().height * 0.5;
-        let pivot_x = rolled.position[0] - half_height * roll.sin();
-        assert!((pivot_x - billboard().center_x).abs() < 1e-4);
-    }
-
-    #[test]
-    fn push_projected_carries_roll_into_the_batch() {
-        let mut batch = SpriteBatch::with_capacity(16);
-        // Any in-front placement works: a straight road keeps it on screen.
-        let geometry = world::RoadGeometry::new(Vec::new(), Vec::new(), 12.0);
-        let camera = world::Camera {
-            distance: 0.0,
-            height: 1.9,
-            lateral: 0.0,
-            focal: 300.0,
-            horizon_y_px: 180.0,
-            viewport: Viewport {
-                width: 800.0,
-                height: 450.0,
-            },
+    fn frustum_culls_behind_and_keeps_ahead() {
+        let cam = Camera {
+            pos: Vec3::ZERO,
+            target: Vec3::new(0.0, 0.0, -1.0),
+            ..Default::default()
         };
-        let projector = world::Projector::new(&geometry, camera);
-        let pushed = push_projected(
-            &mut batch,
-            &projector,
-            RoadPlacement {
-                distance: 10.0,
-                lateral: 0.0,
-                world_width: 1.0,
-                world_height: 1.7,
-                roll: -0.25,
-            },
-            STYLE,
-        );
-        assert!(pushed, "on-screen placement pushes");
-        assert_eq!(
-            batch.instances()[0].rotation,
-            -0.25,
-            "roll lands on the instance"
-        );
+        let f = Frustum::from_view_proj(cam.view_proj(16.0 / 9.0));
+        assert!(f.aabb_visible(Vec3::new(-1.0, -1.0, -11.0), Vec3::new(1.0, 1.0, -9.0)));
+        assert!(!f.aabb_visible(Vec3::new(-1.0, -1.0, 9.0), Vec3::new(1.0, 1.0, 11.0)));
+        assert!(!f.aabb_visible(Vec3::new(200.0, -1.0, -11.0), Vec3::new(201.0, 1.0, -9.0)));
     }
 }

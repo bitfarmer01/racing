@@ -1,1061 +1,626 @@
-//! The per-bike control state machine: accelerate, brake, coast, crash, and
-//! the off-road modifier.
+//! Motorcycle physics.
 //!
-//! [`step_bike`] is a pure function from one tick's intent plus the current
-//! snapshot to the next snapshot. The race driver owns everything the state
-//! machine does not: position integration, collisions, and scoring.
-//!
-//! All speeds are meters per second; positions are meters.
+//! Arcade model on the ground plane with a real grip budget: steering asks
+//! for a yaw rate, the tyres can only deliver `grip / speed` of it, so a
+//! corner taken too fast washes wide and the rider has to brake for it.
+//! Sideways velocity bleeds off at the tyres' rate, which gives a short,
+//! readable slide (and tyre smoke) whenever the bike is pushed past grip.
+//! Height follows the ground with gravity, so crests lift the bike briefly.
 
-use crate::input::{Intent, Steer, Throttle};
+use glam::{Vec2, Vec3};
 
-/// Top speed on tarmac, in meters per second (~216 km/h).
-pub const MAX_SPEED: f32 = 60.0;
-/// Reference low-speed launch pull, in meters per second squared. The
-/// gearbox's first gear peaks above it ([`GEAR_PEAK_PULLS`]); rivals'
-/// rubber-band pacing still keys off this figure, so its meaning as the
-/// low-speed launch pull is kept stable.
-pub const ACCEL: f32 = 18.0;
-/// Brake deceleration, in meters per second squared.
-pub const BRAKE_DECEL: f32 = 35.0;
-/// Engine-braking drag while coasting, in meters per second squared.
-pub const COAST_DRAG: f32 = 6.0;
-/// Top speed off the tarmac, in meters per second.
-pub const OFFROAD_MAX_SPEED: f32 = 18.0;
-/// Extra drag applied while off-road above [`OFFROAD_MAX_SPEED`], in meters
-/// per second squared.
-pub const OFFROAD_DRAG: f32 = 14.0;
-/// Heading rotation rate at full steering authority, in radians per
-/// second: how fast the bike's velocity vector swings when the steerer
-/// holds input. Its own unit on purpose — the old `STEER_RATE` doubled as
-/// both this and a lateral speed in m/s, which let steering bypass
-/// heading entirely.
-pub const HEADING_RATE: f32 = 0.9;
-/// Full-lock heading, in radians: the angle the bike's velocity makes with
-/// the road centreline at full steering authority. Lateral speed follows
-/// from it as `speed · tan(FULL_LOCK_HEADING)` — about 2.7 m/s at 30 m/s,
-/// so a centre-to-edge crossing takes ~2.4 s, clear of the audit target.
-pub const FULL_LOCK_HEADING: f32 = 0.09;
-/// Steering-feel target, in seconds of held full steer to cross from the
-/// road centre to the road edge at 30 m/s (~108 km/h). The audit's
-/// starting proposal, tuned to and asserted by the tests.
-pub const CENTRE_TO_EDGE_TARGET_SECS: f32 = 2.0;
-/// Seconds of held steering to reach full lateral authority. A tap nudges,
-/// a hold bites: the ramp eases steering in so the all-or-nothing jolt of
-/// the fixed rate disappears.
-pub const STEER_RAMP_SECS: f32 = 0.2;
-/// Forward speed at which steering reaches full authority, in m/s. Below it
-/// the bike is upright and barely steers, so a stopped bike cannot wiggle.
-pub const MIN_STEER_SPEED: f32 = 8.0;
-/// Full visual bank of the rider, in radians (~24°): the lean the state
-/// machine targets at full steering authority. Cosmetic — steering moves
-/// the bike; the lean shows it.
-pub const LEAN_MAX: f32 = 0.42;
-/// How fast the rider banks toward the target lean, in radians per second.
-/// Fast enough to be visibly leaning within two 60 Hz frames.
-pub const LEAN_RATE: f32 = 6.0;
-/// Cornering force: taking a curve at speed throws the bike outward at
-/// `speed² · curvature · CORNER_FORCE` m/s before the grip limit applies.
-/// [`CORNER_DRIFT_FRACTION`] caps how much of that raw force survives as
-/// outward drift.
-pub const CORNER_FORCE: f32 = 0.44;
-/// The grip limit on corner drift, as a fraction of full-steer lateral
-/// authority: at the maximum bend a flat-out bike drifts outward at most
-/// this share of what full steering can push inward, so steering into a
-/// bend always beats the road with margin. Small on purpose: a hands-off
-/// rider must be able to hold a bend (the audit's recovery probe rides 45 s
-/// on throttle alone), so the drift is the residual a rider leans against —
-/// not a force field that wins.
-pub const CORNER_DRIFT_FRACTION: f32 = 0.05;
-/// Visual bank into a corner, as a fraction of [`LEAN_MAX`]: how far the
-/// rider leans for the cornering force at full lock, independent of the
-/// drift fraction above (the bank is presentation; the drift is physics).
-pub const CORNER_LEAN_FRACTION: f32 = 0.6;
-/// Speed of the launch-to-top-gear shift point, in m/s (~119 km/h): full
-/// throttle reaches it in about three seconds, then the pull eases off.
-pub const LAUNCH_SPEED: f32 = 33.0;
-/// Launch acceleration remaining at the shift point, in m/s². Above it the
-/// pull is `SHIFT_ACCEL · (1 - speed / MAX_SPEED) / (1 - LAUNCH_SPEED /
-/// MAX_SPEED)` — a long tail that brings top speed in down the road, not
-/// off the line.
-pub const SHIFT_ACCEL: f32 = 5.0;
-/// Gear band tops, in m/s: gear `g` (1-based) pulls across
-/// `[GEAR_BAND_TOPS[g-2], GEAR_BAND_TOPS[g-1])` (gear 1 starts at 0) and
-/// top gear's band ends at [`MAX_SPEED`], so top speed never moves with
-/// the gearbox. The off-road cap ([`OFFROAD_MAX_SPEED`] = 18 m/s) keeps
-/// dirt riding inside gears 1–2, and crash recovery at ≤ half top speed
-/// re-enters in gears 1–3.
-pub const GEAR_BAND_TOPS: [f32; 6] = [14.0, 22.0, 30.0, 39.0, 49.0, MAX_SPEED];
-/// Peak wheel pull of gears 1–5 at their band floors, in m/s². Top gear is
-/// not in the table: it carries the old top-speed tail ([`SHIFT_ACCEL`]-shaped,
-/// → 0 at [`MAX_SPEED`]) so end-of-run pacing is untouched by the gearbox.
-pub const GEAR_PEAK_PULLS: [f32; 5] = [20.0, 16.5, 13.5, 10.5, 7.5];
-/// Redline, in RPM (Ninja H2/S-inspired inline-4, matching the audio
-/// design intent).
-pub const REDLINE_RPM: f32 = 14_000.0;
-/// Displayed engine speed at a band floor, as a fraction of redline: each
-/// gear's RPM sweeps ~40% → 100% across its band, so a shift drops the
-/// needle the way a real box does.
-pub const RPM_FLOOR_FRACTION: f32 = 0.4;
-/// How hard the bike scrubs speed while sliding in a crash, in meters per
-/// second squared.
-pub const CRASH_DRAG: f32 = 25.0;
-/// Duration of a crash, in seconds, before the rider picks the bike up.
-pub const CRASH_DURATION_SECS: f32 = 2.0;
-/// Going off-road above this speed is a crash, in meters per second.
-pub const OFFROAD_CRASH_SPEED: f32 = 30.0;
-/// Depth past the road edge, in meters, beyond which an off-road ride is a
-/// crash at any speed. Below [`OFFROAD_CRASH_SPEED`] the dirt is rideable,
-/// but nothing bounds the excursion: a hairpin overshoot at 18–30 m/s could
-/// carry the rider arbitrarily far off-world. Past this limit the sim calls
-/// it a crash, and recovery pulls the rider back to the tarmac — braking
-/// stays the skill way through a hairpin, but a flat-out overshoot never
-/// leaves the player lost off-world.
-pub const OFFROAD_EXCURSION_LIMIT_M: f32 = 5.0;
+use crate::track::{Track, TrackPos, RUNOFF};
 
-/// Control state of one bike.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Control {
-    /// No throttle: engine braking only.
-    #[default]
-    Coast,
-    /// Throttle on.
-    Accelerate,
-    /// Brake on.
-    Brake,
-    /// Sliding: no control until the crash timer expires.
-    Crashed,
+pub const GRAVITY: f32 = 9.81;
+/// Top speed on tarmac, m/s (~245 km/h).
+pub const TOP_SPEED: f32 = 68.0;
+/// Extra top speed while boosting.
+pub const BOOST_TOP_SPEED: f32 = 82.0;
+pub const OFFROAD_TOP_SPEED: f32 = 30.0;
+/// Peak engine acceleration from a standstill, m/s².
+pub const ENGINE_ACCEL: f32 = 13.5;
+pub const BOOST_ACCEL: f32 = 9.0;
+pub const BRAKE_DECEL: f32 = 30.0;
+pub const REVERSE_SPEED: f32 = 6.0;
+/// Lateral grip on tarmac and grass, m/s².
+pub const GRIP_ROAD: f32 = 17.0;
+pub const GRIP_GRASS: f32 = 9.5;
+/// Low-speed steering yaw-rate limit, rad/s.
+pub const MAX_LOW_SPEED_YAW: f32 = 2.4;
+/// Wall impact speed (normal component) that throws the rider off.
+pub const WALL_CRASH_SPEED: f32 = 17.0;
+pub const CRASH_SECS: f32 = 2.4;
+pub const GHOST_SECS: f32 = 2.0;
+pub const WHEEL_RADIUS: f32 = 0.32;
+/// Boost meter drain per second while boosting.
+pub const BOOST_DRAIN: f32 = 0.30;
+pub const BOOST_REFILL: f32 = 0.035;
+pub const GEAR_TOPS: [f32; 6] = [14.0, 24.0, 34.0, 45.0, 57.0, BOOST_TOP_SPEED];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Controls {
+    /// 0..1
+    pub throttle: f32,
+    /// 0..1
+    pub brake: f32,
+    /// -1 (left) .. 1 (right)
+    pub steer: f32,
+    pub boost: bool,
+    pub attack: bool,
 }
 
-/// Snapshot of everything the state machine owns for one bike.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BikeSnapshot {
-    /// Current gear, 1-based. Derived from speed every tick: the
-    /// automatic box is a pure function of speed, so a crash recovered at
-    /// low speed re-enters in the band that covers the recovery speed
-    /// (gears 1–3 at the half-top-speed recovery bound).
-    pub gear: u8,
-    /// Engine speed within the gear's band, in `[0, 1]` — the HUD
-    /// multiplies it out to a percent of [`REDLINE_RPM`].
-    pub rpm: f32,
-    /// Forward speed, in meters per second.
-    pub speed: f32,
-    /// Lateral position across the road, in meters (negative is left).
-    pub lateral: f32,
-    /// Current control state.
-    pub control: Control,
-    /// Seconds remaining before a crashed rider is back up; unused otherwise.
-    pub crash_timer: f32,
-    /// Visual bank angle, in radians (positive tips right on screen).
-    /// Follows the steering intent and the corner's bend; carried so the
-    /// renderer can roll the sprite quad without re-deriving the lean.
-    pub lean: f32,
-    /// Signed seconds of held steering (sign = direction): the accumulator
-    /// behind the steering ramp. Reset by releasing or reversing input.
-    pub steer_hold: f32,
-    /// Heading of the bike, in radians: the angle its velocity makes with
-    /// the road centreline (positive points right of straight ahead).
-    /// Steering rotates it; lateral motion follows it. Carried so the
-    /// renderer and camera lean with where the bike is pointed.
-    pub heading: f32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Road,
+    Grass,
 }
 
-// Manual `Default` so a stationary bike sits in gear 1 at the band floor
-// (a `0` gear would read as a false neutral on the HUD).
-impl Default for BikeSnapshot {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RiderState {
+    Riding,
+    /// Thrown off; counts up to `CRASH_SECS`, then respawns.
+    Crashed {
+        t: f32,
+    },
+}
+
+/// Per-bike performance knobs (rivals differ slightly).
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    pub power: f32,
+    pub grip: f32,
+    pub top_speed: f32,
+}
+
+impl Default for Tuning {
     fn default() -> Self {
         Self {
-            speed: 0.0,
-            lateral: 0.0,
-            control: Control::Coast,
-            crash_timer: 0.0,
+            power: 1.0,
+            grip: 1.0,
+            top_speed: 1.0,
+        }
+    }
+}
+
+/// What happened to a bike this tick, for effects and sound.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickEffects {
+    /// Normal speed of a barrier contact this tick (0 = none).
+    pub wall_hit: f32,
+    pub crashed: bool,
+    pub landed: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bike {
+    pub pos: Vec3,
+    pub vel: Vec2,
+    pub vy: f32,
+    pub heading: f32,
+    pub yaw_rate: f32,
+    pub lean: f32,
+    pub pitch: f32,
+    pub steer: f32,
+    pub throttle: f32,
+    pub brake: f32,
+    pub on_ground: bool,
+    pub surface: Surface,
+    pub wheel_angle: f32,
+    pub slip: f32,
+    pub rpm: f32,
+    pub gear: u8,
+    pub boost: f32,
+    pub boosting: bool,
+    pub drafting: bool,
+    pub state: RiderState,
+    pub ghost: f32,
+    pub track_pos: TrackPos,
+    pub tuning: Tuning,
+    /// Rider thrown clear during a crash: offset from the bike and spin.
+    pub rider_offset: Vec3,
+    pub rider_vel: Vec3,
+    pub rider_spin: f32,
+}
+
+impl Bike {
+    pub fn new(track: &Track, s: f32, lateral: f32, tuning: Tuning) -> Self {
+        let f = track.frame_at(s);
+        let p = track.point_at(s, lateral);
+        let tp = track.locate(Vec2::new(p.x, p.z));
+        Self {
+            pos: p,
+            vel: Vec2::ZERO,
+            vy: 0.0,
+            heading: f.heading(),
+            yaw_rate: 0.0,
             lean: 0.0,
-            steer_hold: 0.0,
-            heading: 0.0,
-            gear: 1,
+            pitch: 0.0,
+            steer: 0.0,
+            throttle: 0.0,
+            brake: 0.0,
+            on_ground: true,
+            surface: Surface::Road,
+            wheel_angle: 0.0,
+            slip: 0.0,
             rpm: 0.0,
+            gear: 1,
+            boost: 0.35,
+            boosting: false,
+            drafting: false,
+            state: RiderState::Riding,
+            ghost: 0.0,
+            track_pos: tp,
+            tuning,
+            rider_offset: Vec3::ZERO,
+            rider_vel: Vec3::ZERO,
+            rider_spin: 0.0,
         }
     }
-}
 
-impl BikeSnapshot {
-    /// A stationary, upright bike on the centreline.
-    pub fn at_rest() -> Self {
-        Self::default()
+    pub fn fwd(&self) -> Vec2 {
+        Vec2::new(self.heading.cos(), self.heading.sin())
     }
 
-    /// Whether the bike is currently off the tarmac: beyond `half_width`
-    /// meters from the road centre.
-    pub fn is_off_road(&self, half_width: f32) -> bool {
-        self.lateral.abs() > half_width
+    pub fn right(&self) -> Vec2 {
+        Vec2::new(-self.heading.sin(), self.heading.cos())
     }
-}
 
-/// The 1-based gear whose band covers `speed`: the automatic box upshifts
-/// the moment full throttle carries the engine past a band top (redline)
-/// and downshifts the moment braking or coasting drops it below a band
-/// floor — both fall out of re-deriving the gear from speed each tick.
-pub fn gear_for(speed: f32) -> u8 {
-    let mut gear: u8 = 1;
-    while gear < 6 && speed >= GEAR_BAND_TOPS[usize::from(gear) - 1] {
-        gear += 1;
+    pub fn speed(&self) -> f32 {
+        self.vel.length()
     }
-    gear
-}
 
-/// Normalized engine speed within the current gear's band, in `[0, 1]`.
-pub fn band_fraction(speed: f32) -> f32 {
-    let gear = usize::from(gear_for(speed));
-    let floor = if gear == 1 {
-        0.0
-    } else {
-        GEAR_BAND_TOPS[gear - 2]
-    };
-    ((speed - floor) / (GEAR_BAND_TOPS[gear - 1] - floor)).clamp(0.0, 1.0)
-}
+    pub fn forward_speed(&self) -> f32 {
+        self.vel.dot(self.fwd())
+    }
 
-/// Wheel pull at `speed`, in m/s²: the current gear's peak pull shaped by
-/// the torque curve; top gear carries the pre-gearbox top-speed tail so
-/// top speed and end-of-run pacing never moved with the gearbox.
-pub fn wheel_pull(speed: f32) -> f32 {
-    let gear = usize::from(gear_for(speed));
-    let pull = if gear == 6 {
-        SHIFT_ACCEL * (1.0 - speed / MAX_SPEED) / (1.0 - LAUNCH_SPEED / MAX_SPEED)
-    } else {
-        GEAR_PEAK_PULLS[gear - 1] * torque_factor(band_fraction(speed))
-    };
-    pull.max(0.0)
-}
+    pub fn is_riding(&self) -> bool {
+        matches!(self.state, RiderState::Riding)
+    }
 
-/// Torque curve across a rev band: flat to 35% of the band, then a
-/// quadratic fall to 55% of peak at redline.
-fn torque_factor(x: f32) -> f32 {
-    let droop = ((x - 0.35) / 0.65).max(0.0);
-    1.0 - 0.45 * droop * droop
-}
+    /// Bike-bike collisions and attacks skip ghosts and fallen riders.
+    pub fn is_solid(&self) -> bool {
+        self.is_riding() && self.ghost <= 0.0
+    }
 
-/// Displayed engine speed as a percent of [`REDLINE_RPM`] for a band
-/// fraction: each gear sweeps ~40% → 100% of redline across its band.
-pub fn rpm_percent(band: f32) -> f32 {
-    (RPM_FLOOR_FRACTION + (1.0 - RPM_FLOOR_FRACTION) * band.clamp(0.0, 1.0)) * 100.0
-}
+    pub fn pos2(&self) -> Vec2 {
+        Vec2::new(self.pos.x, self.pos.z)
+    }
 
-/// Steering feel, so a test can vary one factor at a time: [`step_bike`]
-/// always rides [`SteerTuning::NOMINAL`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SteerTuning {
-    /// Heading rotation rate at full authority, in radians per second.
-    pub heading_rate: f32,
-    /// Full-lock heading, in radians.
-    pub full_lock: f32,
-}
-
-impl SteerTuning {
-    /// The shipped feel: [`HEADING_RATE`] and [`FULL_LOCK_HEADING`].
-    pub const NOMINAL: Self = Self {
-        heading_rate: HEADING_RATE,
-        full_lock: FULL_LOCK_HEADING,
-    };
-}
-
-/// Advance one bike by one tick of `dt` seconds under `intent`.
-///
-/// Pure: no pool access, no RNG, no clock. Crashed riders cannot steer and
-/// only scrub speed; a crash timer at or below zero hands control back on
-/// coast. Off-road riders accelerate no faster than tarmac but bleed down to
-/// [`OFFROAD_MAX_SPEED`]. `corner_curvature` is the road curvature under the
-/// bike (1/meters; RoadGeometry is authoritative — negative curvature is a
-/// left bend and the centreline shifts negative): speed throws the bike
-/// outward, capped by the grip limit — steering into a bend always beats
-/// the road.
-pub fn step_bike(
-    bike: BikeSnapshot,
-    intent: Intent,
-    off_road: bool,
-    corner_curvature: f32,
-    dt: f32,
-) -> BikeSnapshot {
-    step_bike_tuned(
-        bike,
-        intent,
-        off_road,
-        corner_curvature,
-        dt,
-        SteerTuning::NOMINAL,
-    )
-}
-
-/// [`step_bike`] with explicit steering feel — the seam that lets a test
-/// vary only the heading rate and watch lateral motion follow.
-pub fn step_bike_tuned(
-    mut bike: BikeSnapshot,
-    intent: Intent,
-    off_road: bool,
-    corner_curvature: f32,
-    dt: f32,
-    tuning: SteerTuning,
-) -> BikeSnapshot {
-    if bike.control == Control::Crashed {
-        bike.crash_timer = (bike.crash_timer - dt).max(0.0);
-        bike.speed = (bike.speed - CRASH_DRAG * dt).max(0.0);
-        // The crash pose is already sideways; settle the visual bank flat.
-        bike.lean += (-bike.lean).clamp(-LEAN_RATE * dt, LEAN_RATE * dt);
-        if bike.crash_timer == 0.0 {
-            bike.control = Control::Coast;
+    /// Throws the rider off.
+    pub fn crash(&mut self) {
+        if !self.is_riding() {
+            return;
         }
-        // The gearbox follows the scrubbing speed, so a rider recovered
-        // at ≤ half top speed re-enters in gears 1–3 and the HUD never
-        // shows a stale rev band through the slide.
-        bike.gear = gear_for(bike.speed);
-        bike.rpm = band_fraction(bike.speed);
-        return bike;
+        self.state = RiderState::Crashed { t: 0.0 };
+        self.boosting = false;
+        let v = self.vel;
+        self.rider_offset = Vec3::new(0.0, 0.9, 0.0);
+        self.rider_vel = Vec3::new(v.x * 0.9, 3.5, v.y * 0.9);
+        self.rider_spin = 0.0;
     }
 
-    bike.control = match intent.throttle {
-        Throttle::Accelerate => Control::Accelerate,
-        Throttle::Brake => Control::Brake,
-        Throttle::Coast => Control::Coast,
-    };
-
-    let speed_cap = if off_road {
-        OFFROAD_MAX_SPEED
-    } else {
-        MAX_SPEED
-    };
-    bike.speed = match bike.control {
-        Control::Accelerate => {
-            // The gearbox: per-gear peak pull shaped by the torque curve,
-            // upshifting at each band top; top gear carries the old
-            // top-speed tail, so the last stretch of top speed arrives
-            // down the road exactly as before.
-            let pull = wheel_pull(bike.speed);
-            let next = bike.speed + pull * dt;
-            if off_road && next > speed_cap {
-                // Too fast for the dirt: heavy drag pulls the bike back down.
-                (bike.speed - OFFROAD_DRAG * dt).max(speed_cap)
-            } else {
-                next.min(speed_cap)
+    pub fn step(&mut self, track: &Track, c: &Controls, dt: f32) -> TickEffects {
+        let mut fx = TickEffects::default();
+        self.ghost = (self.ghost - dt).max(0.0);
+        match self.state {
+            RiderState::Riding => self.ride(track, c, dt, &mut fx),
+            RiderState::Crashed { t } => {
+                self.tumble(track, dt);
+                let t = t + dt;
+                if t >= CRASH_SECS {
+                    self.respawn(track);
+                } else {
+                    self.state = RiderState::Crashed { t };
+                }
             }
         }
-        Control::Brake => (bike.speed - BRAKE_DECEL * dt).max(0.0),
-        _ => (bike.speed - COAST_DRAG * dt).max(0.0),
-    };
-
-    // Steering authority scales with speed (the bike must be moving to
-    // lean) and ramps in over held input: a tap nudges, a hold bites.
-    let steer_scale = (bike.speed / MIN_STEER_SPEED).min(1.0);
-    let steer_dir = match intent.steer {
-        Steer::Left => -1.0,
-        Steer::Right => 1.0,
-        Steer::None => 0.0,
-    };
-    if steer_dir == 0.0 || bike.steer_hold.signum() != steer_dir {
-        bike.steer_hold = 0.0;
+        fx
     }
-    bike.steer_hold = (bike.steer_hold + steer_dir * dt).clamp(-STEER_RAMP_SECS, STEER_RAMP_SECS);
-    let steer_ramp = (bike.steer_hold.abs() / STEER_RAMP_SECS).min(1.0);
 
-    // Corner drift under the grip limit. RoadGeometry is authoritative: a
-    // bend's centreline shifts in the same direction as its curvature sign
-    // (negative curvature is a left bend and the centre moves to negative
-    // lateral), so the outside of a bend lies OPPOSITE the centreline's
-    // change — and that is where speed throws the bike: the drift runs
-    // against the centreline's shift, by at most CORNER_DRIFT_FRACTION of
-    // what full steering can pull back at this speed. A bend is a line you
-    // hold by leaning in earlier or shedding speed, never a force field
-    // that wins.
-    let drift_authority = CORNER_DRIFT_FRACTION * bike.speed * tuning.full_lock.tan() * steer_scale;
-    let corner_drift = -(bike.speed * bike.speed * corner_curvature * CORNER_FORCE)
-        .clamp(-drift_authority, drift_authority);
+    fn ride(&mut self, track: &Track, c: &Controls, dt: f32, fx: &mut TickEffects) {
+        // Steering arrives already shaped (the shell eases keyboard input).
+        self.steer = c.steer.clamp(-1.0, 1.0);
+        self.throttle = c.throttle.clamp(0.0, 1.0);
+        self.brake = c.brake.clamp(0.0, 1.0);
 
-    // Heading drives the line (the Wave 7 model): steering commands a
-    // heading up to `full_lock` radians off the centreline, the velocity
-    // vector rotates toward it rate-limited at `heading_rate`, and lateral
-    // velocity is the across-road component of speed — lateral motion
-    // FOLLOWS heading, it is not a parallel sideways shove. With no input
-    // the command returns to zero and the bike straightens at the same
-    // rate; corner drift yaws the bike outward with it.
-    let commanded = steer_dir * tuning.full_lock * steer_ramp * steer_scale;
-    bike.heading +=
-        (commanded - bike.heading).clamp(-tuning.heading_rate * dt, tuning.heading_rate * dt);
-    let lateral_velocity = bike.speed * bike.heading.tan() + corner_drift;
-    bike.lateral += lateral_velocity * dt;
+        let fwd = self.fwd();
+        let right = self.right();
+        let mut v_long = self.vel.dot(fwd);
+        let mut v_lat = self.vel.dot(right);
+        let speed = self.vel.length();
 
-    // Visual bank: aim at the steering input plus the corner's inward lean,
-    // rate-limited so the bank reads as a motion, not a flip. The steering
-    // term is the player's heading change — the rider banks with where the
-    // bike is pointed. The corner term comes second, capped at the grip
-    // limit: a rider coasting through a bend banks into it by at most the
-    // drift fraction. Negative curvature is a left bend (RoadGeometry is
-    // authoritative), and into a left bend is a leftward (negative) lean.
-    let steer_lean = steer_ramp
-        * steer_scale
-        * match intent.steer {
-            Steer::Left => -1.0,
-            Steer::Right => 1.0,
-            Steer::None => 0.0,
+        self.surface = if self.track_pos.lateral.abs() <= track.half_width + 0.4 {
+            Surface::Road
+        } else {
+            Surface::Grass
         };
-    let corner_lean = corner_curvature.signum()
-        * ((bike.speed * bike.speed * corner_curvature.abs() * CORNER_FORCE)
-            / (bike.speed * tuning.full_lock.tan()).max(1.0))
-        .clamp(0.0, CORNER_LEAN_FRACTION);
-    let target_lean = (steer_lean + corner_lean).clamp(-1.0, 1.0) * LEAN_MAX;
-    bike.lean += (target_lean - bike.lean).clamp(-LEAN_RATE * dt, LEAN_RATE * dt);
+        let on_road = self.surface == Surface::Road;
 
-    // The readout rides the same tick as the physics: gear and rev band
-    // re-derive from the post-step speed, so the HUD never runs ahead.
-    bike.gear = gear_for(bike.speed);
-    bike.rpm = band_fraction(bike.speed);
+        // Boost: needs meter and the ground under the wheels.
+        self.boosting = c.boost && self.boost > 0.02 && self.on_ground && v_long > 2.0;
+        if self.boosting {
+            self.boost = (self.boost - BOOST_DRAIN * dt).max(0.0);
+        } else {
+            self.boost = (self.boost + BOOST_REFILL * dt).min(1.0);
+        }
 
-    bike
-}
+        // Longitudinal.
+        let top = if self.boosting {
+            BOOST_TOP_SPEED
+        } else if on_road {
+            TOP_SPEED
+        } else {
+            OFFROAD_TOP_SPEED
+        } * self.tuning.top_speed;
+        let traction = if self.on_ground { 1.0 } else { 0.0 };
+        let mut a = 0.0;
+        if v_long < top {
+            let frac = (v_long.max(0.0) / top).min(1.0);
+            let pull = ENGINE_ACCEL
+                * self.tuning.power
+                * (1.0 - frac.powf(2.4))
+                * (0.55 + 0.45 * (1.0 - frac));
+            a += self.throttle * pull;
+            if self.drafting {
+                a += 1.6 * self.throttle;
+            }
+        } else {
+            // Above the cap (boost ended, ran onto grass): ease down.
+            a -= (v_long - top) * if on_road { 0.6 } else { 2.0 };
+        }
+        if self.boosting {
+            a += BOOST_ACCEL;
+        }
+        if self.brake > 0.0 {
+            if v_long > 0.5 {
+                a -= self.brake * BRAKE_DECEL;
+            } else if self.throttle < 0.1 && v_long > -REVERSE_SPEED {
+                a -= self.brake * 5.0;
+            }
+        }
+        // Rolling resistance and air drag; grass is draggy.
+        a -= v_long.signum() * (0.35 + 0.00035 * v_long * v_long);
+        if !on_road {
+            a -= v_long.signum() * 3.5 * (v_long.abs() / 10.0).min(1.0);
+        }
+        // Gravity along the slope.
+        a -= GRAVITY * self.pitch.sin();
+        v_long += a * traction * dt;
+        if self.brake > 0.0 && self.throttle < 0.1 && v_long.abs() < 0.3 && a < 0.0 {
+            v_long = v_long.min(0.0);
+        }
 
-/// The crash trigger, evaluated by the race driver after the lateral move:
-/// running off the tarmac above [`OFFROAD_CRASH_SPEED`] is a crash, and so
-/// is riding deeper than [`OFFROAD_EXCURSION_LIMIT_M`] past the edge at any
-/// speed — the depth bound that keeps every excursion recoverable.
-pub fn should_crash(bike: &BikeSnapshot, half_width: f32) -> bool {
-    if bike.control == Control::Crashed || !bike.is_off_road(half_width) {
-        return false;
+        // Steering: the tyres deliver at most grip/speed of yaw rate.
+        let grip = if on_road { GRIP_ROAD } else { GRIP_GRASS } * self.tuning.grip;
+        let low = MAX_LOW_SPEED_YAW * (speed / 5.0).min(1.0);
+        let max_yaw = low.min(grip / speed.max(1.0));
+        let dir = if v_long < -0.5 { -1.0 } else { 1.0 };
+        let want = self.steer * max_yaw * dir;
+        let response = if self.on_ground { 10.0 } else { 1.5 };
+        self.yaw_rate += (want - self.yaw_rate) * (1.0 - (-response * dt).exp());
+        self.heading += self.yaw_rate * dt;
+
+        // Re-express the velocity in the new heading: the turn leaves some
+        // of it sideways, which the tyres then scrub away.
+        let fwd2 = self.fwd();
+        let right2 = self.right();
+        let vel = fwd * v_long + right * v_lat;
+        v_long = vel.dot(fwd2);
+        v_lat = vel.dot(right2);
+        let lat_grip = if !self.on_ground {
+            0.3
+        } else if on_road {
+            7.5 * self.tuning.grip
+        } else {
+            3.0
+        };
+        let before = v_lat;
+        v_lat *= (-lat_grip * dt).exp();
+        // Hard braking with lots of lean unsettles the rear.
+        let lost = (before - v_lat).abs();
+        v_long -= v_long.signum() * lost * 0.15;
+        self.slip = (v_lat.abs() / 3.0
+            + if self.brake > 0.6 && speed > 20.0 {
+                0.35
+            } else {
+                0.0
+            })
+        .min(1.0);
+        self.vel = fwd2 * v_long + right2 * v_lat;
+
+        // Move and resolve the barrier.
+        let prev_ground = self.ground(track);
+        self.pos.x += self.vel.x * dt;
+        self.pos.z += self.vel.y * dt;
+        self.relocate(track);
+        let limit = track.half_width + RUNOFF;
+        if self.track_pos.lateral.abs() > limit {
+            let f = track.frame_at(self.track_pos.s);
+            let side = self.track_pos.lateral.signum();
+            let n = f.right * side;
+            let push = self.track_pos.lateral.abs() - limit;
+            self.pos.x -= n.x * push;
+            self.pos.z -= n.y * push;
+            let vn = self.vel.dot(n);
+            if vn > 0.0 {
+                fx.wall_hit = vn;
+                self.vel -= n * vn * 1.35;
+                self.vel *= 0.9;
+                // Glance off: turn the nose back along the barrier.
+                let along = f.heading();
+                let diff = wrap_angle(along - self.heading);
+                let toward = if diff.abs() < std::f32::consts::FRAC_PI_2 {
+                    diff
+                } else {
+                    wrap_angle(diff + std::f32::consts::PI)
+                };
+                self.heading += toward * 0.35;
+                if vn > WALL_CRASH_SPEED {
+                    self.crash();
+                    fx.crashed = true;
+                }
+            }
+            self.relocate(track);
+        }
+
+        // Vertical: gravity, with the ground pushing back.
+        // Close to the ground the suspension keeps the tyres planted (an
+        // arcade 2.5 g of pull), so only a real kicker launches the bike.
+        let ground = self.ground(track);
+        // Ground speed from position differences, capped at a steep road's
+        // grade so stepping up a kerb or shoulder can't launch the bike.
+        let horiz = self.vel.length();
+        let cap = horiz * 0.1 + 0.5;
+        let ground_vy = ((ground - prev_ground) / dt).clamp(-cap - 30.0, cap);
+        let gap = self.pos.y - ground;
+        let pull = if gap < 0.8 { GRAVITY * 2.5 } else { GRAVITY };
+        self.vy -= pull * dt;
+        self.pos.y += self.vy * dt;
+        if self.pos.y <= ground {
+            if !self.on_ground && self.vy < -4.0 {
+                fx.landed = -self.vy;
+            }
+            self.pos.y = ground;
+            self.vy = ground_vy.max(self.vy);
+            self.vy = self.vy.min(ground_vy.max(0.0) + 0.5);
+            self.on_ground = true;
+        } else {
+            self.on_ground = self.pos.y - ground < 0.25;
+        }
+
+        // Pose.
+        let ahead = self.ground_at_offset(track, 0.8);
+        let behind = self.ground_at_offset(track, -0.8);
+        let slope = ((ahead - behind) / 1.6).atan();
+        let target_pitch = if self.on_ground {
+            slope
+        } else {
+            self.pitch * 0.98
+        };
+        self.pitch += (target_pitch - self.pitch) * (1.0 - (-12.0 * dt).exp());
+        let lean_target = (v_long.max(0.0) * self.yaw_rate / GRAVITY)
+            .atan()
+            .clamp(-0.95, 0.95);
+        self.lean += (lean_target - self.lean) * (1.0 - (-9.0 * dt).exp());
+        self.wheel_angle = (self.wheel_angle + v_long / WHEEL_RADIUS * dt) % std::f32::consts::TAU;
+        self.update_engine(v_long);
     }
-    bike.speed > OFFROAD_CRASH_SPEED || bike.lateral.abs() > half_width + OFFROAD_EXCURSION_LIMIT_M
+
+    fn update_engine(&mut self, v_long: f32) {
+        let v = v_long.abs();
+        let mut gear = 0;
+        while gear < GEAR_TOPS.len() - 1 && v > GEAR_TOPS[gear] * 0.97 {
+            gear += 1;
+        }
+        let lo = if gear == 0 {
+            0.0
+        } else {
+            GEAR_TOPS[gear - 1] * 0.97
+        };
+        let hi = GEAR_TOPS[gear];
+        let band = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let floor = if gear == 0 { 0.18 } else { 0.55 };
+        let target =
+            1_600.0 + (floor + (1.0 - floor) * band) * 12_000.0 * (0.6 + 0.4 * self.throttle);
+        self.rpm += (target - self.rpm) * 0.25;
+        self.gear = gear as u8 + 1;
+    }
+
+    fn tumble(&mut self, track: &Track, dt: f32) {
+        // The bike slides on its side and grinds to a halt.
+        let speed = self.vel.length();
+        let decel = 7.0 * dt;
+        if speed > decel {
+            self.vel *= (speed - decel) / speed;
+        } else {
+            self.vel = Vec2::ZERO;
+        }
+        self.pos.x += self.vel.x * dt;
+        self.pos.z += self.vel.y * dt;
+        self.relocate(track);
+        let limit = track.half_width + RUNOFF - 0.5;
+        if self.track_pos.lateral.abs() > limit {
+            let f = track.frame_at(self.track_pos.s);
+            let n = f.right * self.track_pos.lateral.signum();
+            let push = self.track_pos.lateral.abs() - limit;
+            self.pos.x -= n.x * push;
+            self.pos.z -= n.y * push;
+            let vn = self.vel.dot(n);
+            if vn > 0.0 {
+                self.vel -= n * vn * 1.2;
+            }
+            self.relocate(track);
+        }
+        self.pos.y = self.ground(track);
+        let side = if self.lean >= 0.0 { 1.0 } else { -1.0 };
+        self.lean += (side * 1.42 - self.lean) * (1.0 - (-6.0 * dt).exp());
+        self.yaw_rate *= 0.97;
+        self.heading += self.yaw_rate * dt + speed * 0.004 * side * dt * 10.0;
+        self.slip = (speed / 20.0).min(1.0);
+        self.boosting = false;
+
+        // The rider flies, bounces and rolls.
+        self.rider_vel.y -= GRAVITY * dt;
+        self.rider_offset += (self.rider_vel - Vec3::new(self.vel.x, 0.0, self.vel.y)) * dt;
+        let rider_world_y = self.pos.y + self.rider_offset.y;
+        let rx = self.pos.x + self.rider_offset.x;
+        let rz = self.pos.z + self.rider_offset.z;
+        let g = track.ground_height(rx, rz);
+        if rider_world_y < g + 0.25 {
+            self.rider_offset.y = g + 0.25 - self.pos.y;
+            if self.rider_vel.y < 0.0 {
+                self.rider_vel.y *= -0.35;
+            }
+            let h = Vec2::new(self.rider_vel.x, self.rider_vel.z) * (1.0 - 4.0 * dt).max(0.0);
+            self.rider_vel.x = h.x;
+            self.rider_vel.z = h.y;
+        }
+        self.rider_spin += Vec2::new(self.rider_vel.x, self.rider_vel.z).length() * dt * 1.6;
+    }
+
+    /// Back on the bike: centred-ish on the road, facing the right way.
+    pub fn respawn(&mut self, track: &Track) {
+        let s = self.track_pos.s;
+        let lat = self
+            .track_pos
+            .lateral
+            .clamp(-track.half_width + 1.5, track.half_width - 1.5);
+        let f = track.frame_at(s);
+        self.pos = track.point_at(s, lat);
+        self.heading = f.heading();
+        self.vel = f.fwd * 6.0;
+        self.vy = 0.0;
+        self.yaw_rate = 0.0;
+        self.lean = 0.0;
+        self.pitch = 0.0;
+        self.steer = 0.0;
+        self.state = RiderState::Riding;
+        self.ghost = GHOST_SECS;
+        self.rider_offset = Vec3::ZERO;
+        self.rider_vel = Vec3::ZERO;
+        self.rider_spin = 0.0;
+        self.slip = 0.0;
+        self.relocate(track);
+    }
+
+    pub fn relocate(&mut self, track: &Track) {
+        self.track_pos = track.locate_near(self.pos2(), self.track_pos.index, 14);
+    }
+
+    fn ground(&self, track: &Track) -> f32 {
+        track.ground_at(self.pos.x, self.pos.z, &self.track_pos)
+    }
+
+    fn ground_at_offset(&self, track: &Track, d: f32) -> f32 {
+        let f = self.fwd();
+        let (x, z) = (self.pos.x + f.x * d, self.pos.z + f.y * d);
+        let tp = track.locate_near(Vec2::new(x, z), self.track_pos.index, 3);
+        track.ground_at(x, z, &tp)
+    }
 }
 
-/// Put a bike into a crash.
-pub fn crash(bike: &mut BikeSnapshot) {
-    bike.control = Control::Crashed;
-    bike.crash_timer = CRASH_DURATION_SECS;
+pub fn wrap_angle(a: f32) -> f32 {
+    let t = std::f32::consts::TAU;
+    let mut a = a % t;
+    if a > std::f32::consts::PI {
+        a -= t;
+    } else if a < -std::f32::consts::PI {
+        a += t;
+    }
+    a
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::GameInput;
-    use world::{CurveSegment, RoadGeometry};
+    use crate::tracks::catalog;
 
-    /// Drain a list of input events into one intent, the way a tick does.
-    fn intent_of(events: &[GameInput]) -> Intent {
-        let mut intent = Intent::default();
-        for event in events {
-            intent.absorb(*event);
+    const DT: f32 = 1.0 / 120.0;
+
+    fn straight_test(track: &Track) -> Bike {
+        // Start of each catalogue circuit is a straight.
+        Bike::new(track, 2.0, 0.0, Tuning::default())
+    }
+
+    #[test]
+    fn full_throttle_reaches_highway_speed_quickly() {
+        let track = Track::build(catalog()[0]);
+        let mut b = straight_test(&track);
+        let c = Controls {
+            throttle: 1.0,
+            ..Controls::default()
+        };
+        let mut t = 0.0;
+        while b.speed() < 27.8 && t < 10.0 {
+            b.step(&track, &c, DT);
+            t += DT;
         }
-        intent
-    }
-
-    fn stepped(bike: BikeSnapshot, events: &[GameInput], off_road: bool) -> BikeSnapshot {
-        step_bike(
-            bike,
-            intent_of(events),
-            off_road,
-            0.0,
-            sim::clock::TICK_DURATION_SECS as f32,
-        )
+        // 0-100 km/h in ~3 s feels sporty without being twitchy.
+        assert!((2.0..4.0).contains(&t), "0-100 took {t}");
     }
 
     #[test]
-    fn accelerating_from_rest_gains_speed_and_caps_at_max() {
-        let bike = stepped(BikeSnapshot::at_rest(), &[GameInput::Accelerate], false);
-        assert!(bike.control == Control::Accelerate);
-        assert!(bike.speed > 0.0);
-
-        // Already at the cap: throttle cannot exceed it.
-        let capped = stepped(
-            BikeSnapshot {
-                speed: MAX_SPEED,
-                ..BikeSnapshot::at_rest()
-            },
-            &[GameInput::Accelerate],
-            false,
-        );
-        assert_eq!(capped.speed, MAX_SPEED);
-    }
-
-    #[test]
-    fn braking_slows_and_never_reverses() {
-        let bike = stepped(
-            BikeSnapshot {
-                speed: 20.0,
-                ..BikeSnapshot::at_rest()
-            },
-            &[GameInput::Brake],
-            false,
-        );
-        assert_eq!(bike.control, Control::Brake);
-        assert!(bike.speed < 20.0);
-
-        // A stopped bike under brake stays stopped, never negative.
-        let stopped = stepped(BikeSnapshot::at_rest(), &[GameInput::Brake], false);
-        assert_eq!(stopped.speed, 0.0);
-    }
-
-    #[test]
-    fn coasting_bleeds_speed_toward_zero() {
-        let bike = stepped(
-            BikeSnapshot {
-                speed: 30.0,
-                ..BikeSnapshot::at_rest()
-            },
-            &[],
-            false,
-        );
-        assert_eq!(bike.control, Control::Coast);
-        assert!(
-            (bike.speed - (30.0 - COAST_DRAG * sim::clock::TICK_DURATION_SECS as f32)).abs() < 1e-5
-        );
-
-        // Coasting past zero clamps at rest.
-        assert_eq!(stepped(BikeSnapshot::at_rest(), &[], false).speed, 0.0);
-    }
-
-    #[test]
-    fn steering_moves_lateral_both_ways() {
-        // Steering needs speed: the bike must be moving to lean.
-        let rolling = BikeSnapshot {
-            speed: 20.0,
-            ..BikeSnapshot::at_rest()
+    fn braking_stops_hard() {
+        let track = Track::build(catalog()[0]);
+        let mut b = straight_test(&track);
+        b.vel = b.fwd() * 40.0;
+        let c = Controls {
+            brake: 1.0,
+            ..Controls::default()
         };
-        let left = stepped(rolling, &[GameInput::SteerLeft], false);
-        let right = stepped(rolling, &[GameInput::SteerRight], false);
-        assert!(left.lateral < 0.0);
-        assert!(right.lateral > 0.0);
-        assert!(
-            (left.lateral + right.lateral).abs() < 1e-6,
-            "symmetric rates"
-        );
+        let mut t = 0.0;
+        while b.forward_speed() > 0.5 && t < 10.0 {
+            b.step(&track, &c, DT);
+            t += DT;
+        }
+        assert!(t < 2.0, "stopping from 144 km/h took {t}");
     }
 
     #[test]
-    fn off_road_throttle_bleeds_speed_down_to_the_dirt_cap() {
-        // Full speed on tarmac, then off-road with throttle held.
-        let mut bike = BikeSnapshot {
-            speed: MAX_SPEED,
-            ..BikeSnapshot::at_rest()
+    fn steering_is_grip_limited() {
+        let track = Track::build(catalog()[0]);
+        let mut b = straight_test(&track);
+        b.vel = b.fwd() * 50.0;
+        let c = Controls {
+            throttle: 1.0,
+            steer: 1.0,
+            ..Controls::default()
         };
-        let half_width = 6.0;
-        // Place the bike off-road without going through the crash check:
-        // the state machine itself only reacts to the off_road flag.
-        bike.lateral = half_width + 1.0;
-        let before = bike.speed;
-        bike = stepped(bike, &[GameInput::Accelerate], true);
-        assert!(bike.speed < before, "off-road drag scrubs speed");
-        assert!(
-            bike.speed >= OFFROAD_MAX_SPEED - 0.5,
-            "drag stops at the dirt cap"
-        );
+        for _ in 0..60 {
+            b.step(&track, &c, DT);
+        }
+        let lateral_accel = b.yaw_rate * b.forward_speed();
+        assert!(lateral_accel <= GRIP_ROAD * 1.05, "{lateral_accel}");
+        assert!(b.yaw_rate > 0.0, "steer right turns right");
+        assert!(b.lean > 0.3, "leans into the turn: {}", b.lean);
     }
 
     #[test]
-    fn crashed_bikes_scrub_speed_and_cannot_steer() {
-        let mut bike = BikeSnapshot {
-            speed: 25.0,
-            lateral: 8.0,
-            control: Control::Crashed,
-            crash_timer: 1.0,
-            lean: 0.0,
-            steer_hold: 0.0,
-            heading: 0.0,
-            gear: 1,
-            rpm: 0.0,
+    fn barrier_contains_the_bike() {
+        let track = Track::build(catalog()[0]);
+        let mut b = straight_test(&track);
+        let c = Controls {
+            throttle: 1.0,
+            steer: -1.0,
+            ..Controls::default()
         };
-        let speed_before = bike.speed;
-        bike = stepped(bike, &[GameInput::SteerRight, GameInput::Accelerate], true);
-        assert_eq!(bike.control, Control::Crashed, "still crashed mid-timer");
-        assert!(bike.speed < speed_before, "sliding scrubs speed");
-        assert!(
-            (bike.lateral - 8.0).abs() < 1e-6,
-            "no steering while crashed"
-        );
-    }
-
-    #[test]
-    fn crash_timer_expires_back_to_coast() {
-        let mut bike = BikeSnapshot {
-            speed: 10.0,
-            lateral: 0.0,
-            control: Control::Crashed,
-            crash_timer: sim::clock::TICK_DURATION_SECS as f32,
-            lean: 0.0,
-            steer_hold: 0.0,
-            heading: 0.0,
-            gear: 1,
-            rpm: 0.0,
-        };
-        bike = stepped(bike, &[], false);
-        assert_eq!(bike.control, Control::Coast, "timer expired this tick");
-        assert_eq!(bike.crash_timer, 0.0);
-    }
-
-    #[test]
-    fn cornering_force_pushes_outward_and_grows_with_speed() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let at_speed = |speed: f32, curvature: f32| {
-            step_bike(
-                BikeSnapshot {
-                    speed,
-                    ..BikeSnapshot::at_rest()
-                },
-                Intent::default(),
-                false,
-                curvature,
-                dt,
-            )
-        };
-        // Right-hand curve (positive curvature; RoadGeometry shifts the
-        // centre positive) throws a fast bike left — outward, opposite the
-        // centreline's change.
-        let fast = at_speed(50.0, 0.005);
-        assert!(fast.lateral < 0.0, "right curve throws the bike left");
-        // The same curve at walking pace barely moves the bike.
-        let slow = at_speed(5.0, 0.005);
-        assert!(
-            slow.lateral.abs() < fast.lateral.abs() * 0.1,
-            "slow is stable"
-        );
-        // Mirror symmetry: a left-hand curve pushes right.
-        let mirrored = at_speed(50.0, -0.005);
-        assert!((mirrored.lateral + fast.lateral).abs() < 1e-6);
-    }
-
-    #[test]
-    fn steering_banks_the_rider_and_releasing_unbanks_it() {
-        let rolling = BikeSnapshot {
-            speed: 30.0,
-            ..BikeSnapshot::at_rest()
-        };
-        // Held left steer at 60 Hz: the ramp is full after STEER_RAMP_SECS
-        // (12 ticks), and the bank is visibly deep by then.
-        let left = (0..12).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerLeft], false)
-        });
-        assert!(left.lean < -0.2, "banked left within the ramp");
-
-        let right = (0..12).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerRight], false)
-        });
-        assert!((left.lean + right.lean).abs() < 1e-5, "symmetric bank");
-
-        // Full authority never exceeds the cap, and coasting settles flat.
-        let held = (0..30).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerRight], false)
-        });
-        assert!((held.lean - LEAN_MAX).abs() < 1e-4, "bank caps at LEAN_MAX");
-        let settled = (0..30).fold(held, |bike, _| stepped(bike, &[], false));
-        assert!(settled.lean.abs() < 1e-4, "no input settles the rider up");
-    }
-
-    #[test]
-    fn steering_rotates_heading_with_matching_sign() {
-        let rolling = BikeSnapshot {
-            speed: 30.0,
-            ..BikeSnapshot::at_rest()
-        };
-        let right = (0..12).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerRight], false)
-        });
-        let left = (0..12).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerLeft], false)
-        });
-        assert!(right.heading > 0.0, "steering right points the bike right");
-        assert!(left.heading < 0.0, "steering left points the bike left");
-        assert!(
-            (right.heading + left.heading).abs() < 1e-6,
-            "symmetric heading rotation"
-        );
-    }
-
-    #[test]
-    fn steering_into_the_max_bend_beats_corner_drift_at_every_speed() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        // Maximum-curvature bend (k = -0.005, a left-hand bend: the inside
-        // is negative lateral). Full left steer held through it must keep
-        // the bike moving toward the inside at every speed — the road never
-        // wins.
-        for speed in [5.0, 8.0, 16.0, 30.0, 45.0, MAX_SPEED] {
-            let bike = BikeSnapshot {
-                speed,
-                ..BikeSnapshot::at_rest()
-            };
-            let held = (0..14).fold(bike, |bike, _| {
-                step_bike(bike, intent_of(&[GameInput::SteerLeft]), false, -0.005, dt)
-            });
-            let next = step_bike(held, intent_of(&[GameInput::SteerLeft]), false, -0.005, dt);
-            let margin = held.lateral - next.lateral;
-            assert!(
-                margin > 0.0,
-                "speed {speed}: full steer holds the line toward the inside (margin {margin})"
-            );
+        for _ in 0..1200 {
+            b.step(&track, &c, DT);
+            assert!(b.track_pos.lateral.abs() <= track.half_width + RUNOFF + 0.5);
         }
     }
 
     #[test]
-    fn corner_drift_is_capped_below_full_steering_authority() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        // Flat out through the maximum bend (k = +0.005, a right-hand
-        // bend), hands off: the grip limit caps the outward drift —
-        // negative lateral, opposite the centreline's positive shift — at
-        // 60% of what full steering could pull back.
-        let bike = BikeSnapshot {
-            speed: MAX_SPEED,
-            ..BikeSnapshot::at_rest()
-        };
-        let drifted = step_bike(bike, Intent::default(), false, 0.005, dt);
-        let drift = drifted.lateral - bike.lateral;
-        let authority = CORNER_DRIFT_FRACTION * MAX_SPEED * FULL_LOCK_HEADING.tan() * dt;
-        assert!(
-            drift < 0.0 && drift >= -authority - 1e-6,
-            "grip limit caps drift at the fraction of steer authority ({drift})"
-        );
-    }
-
-    #[test]
-    fn steering_ramps_in_and_bites_when_held() {
-        let rolling = BikeSnapshot {
-            speed: 30.0,
-            ..BikeSnapshot::at_rest()
-        };
-        // The first tick's lateral motion is the ramped heading command
-        // turned into across-road speed — a tap nudges, it does not snap.
-        // The coast tick scrubs a little speed first; match it.
-        let first = stepped(rolling, &[GameInput::SteerRight], false);
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let ramp = (dt / STEER_RAMP_SECS).min(1.0);
-        let coasted = 30.0 - COAST_DRAG * dt;
-        let expected = coasted * (FULL_LOCK_HEADING * ramp).tan() * dt;
-        assert!((first.lateral - expected).abs() < 1e-6, "ramped first tick");
-
-        // Held long enough, the ramp is full: per-tick motion reaches the
-        // full-lock across-road speed, speed · tan(full lock).
-        let held = (0..12).fold(rolling, |bike, _| {
-            stepped(bike, &[GameInput::SteerRight], false)
-        });
-        let next = stepped(held, &[GameInput::SteerRight], false);
-        let coasted = held.speed - COAST_DRAG * dt;
-        let expected = coasted * FULL_LOCK_HEADING.tan() * dt;
-        assert!(
-            (next.lateral - held.lateral - expected).abs() < 1e-4,
-            "full authority after the ramp"
-        );
-    }
-
-    #[test]
-    fn a_stopped_bike_neither_banks_nor_wiggles() {
-        let bike = stepped(BikeSnapshot::at_rest(), &[GameInput::SteerRight], false);
-        assert!(bike.lateral.abs() < 0.01, "no lean-move at zero speed");
-        assert!(bike.lean.abs() < 0.01, "no bank at zero speed");
-    }
-
-    #[test]
-    fn coasting_through_a_corner_banks_into_the_bend() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let fast = BikeSnapshot {
-            speed: 50.0,
-            ..BikeSnapshot::at_rest()
-        };
-        // Positive curvature is a right bend (RoadGeometry: the centre
-        // shifts positive); the rider banks right — into it — with no input.
-        let banked = step_bike(fast, Intent::default(), false, 0.005, dt);
-        assert!(banked.lean > 0.05, "corner leans the rider inward");
-    }
-
-    #[test]
-    fn crashed_riders_settle_their_bank() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let down = BikeSnapshot {
-            speed: 25.0,
-            lateral: 0.0,
-            lean: 0.3,
-            control: Control::Crashed,
-            crash_timer: 1.0,
-            steer_hold: 0.0,
-            heading: 0.0,
-            gear: 1,
-            rpm: 0.0,
-        };
-        let bike = step_bike(down, Intent::default(), false, 0.0, dt);
-        assert!(bike.lean.abs() < 0.3, "crash settles the bank");
-    }
-
-    #[test]
-    fn crash_trigger_and_recovery_round_trip() {
-        let half_width = 6.0;
-        let fast = BikeSnapshot {
-            speed: 40.0,
-            lateral: half_width + 1.0,
-            ..BikeSnapshot::at_rest()
-        };
-        assert!(should_crash(&fast, half_width));
-
-        let slow = BikeSnapshot {
-            speed: 10.0,
-            ..fast
-        };
-        assert!(
-            !should_crash(&slow, half_width),
-            "low-speed dirt is survivable"
-        );
-
-        let mut crashed = fast;
-        crash(&mut crashed);
-        assert_eq!(crashed.control, Control::Crashed);
-        assert_eq!(crashed.crash_timer, CRASH_DURATION_SECS);
-    }
-
-    #[test]
-    fn a_deep_excursion_crashes_at_dirt_speeds_where_the_speed_cap_left_it_unbounded() {
-        let half_width = 6.0;
-        // The 18-30 m/s window: the dirt is rideable, so a shallow
-        // excursion survives...
-        let shallow = BikeSnapshot {
-            speed: 25.0,
-            lateral: half_width + 2.0,
-            ..BikeSnapshot::at_rest()
-        };
-        assert!(
-            !should_crash(&shallow, half_width),
-            "a shallow dirt ride below the crash speed stays legal"
-        );
-        // ...but the excursion is bounded: deeper than the limit at any
-        // speed is a crash, so recovery pulls the rider back to the tarmac
-        // instead of leaving them lost off-world (the hairpin overshoot
-        // used to run the lateral unbounded through this window).
-        let deep = BikeSnapshot {
-            speed: 25.0,
-            lateral: half_width + OFFROAD_EXCURSION_LIMIT_M + 0.5,
-            ..BikeSnapshot::at_rest()
-        };
-        assert!(
-            should_crash(&deep, half_width),
-            "a deep excursion must crash at dirt speed"
-        );
-        // The depth bound is not a speed rule: it applies at walking pace.
-        let slow_deep = BikeSnapshot { speed: 5.0, ..deep };
-        assert!(should_crash(&slow_deep, half_width));
-        // And an already-crashed bike does not re-trigger.
-        let mut down = deep;
-        crash(&mut down);
-        assert!(
-            !should_crash(&down, half_width),
-            "a crashed bike cannot re-crash"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Wave 7 audit — items 2, 4, 5. Red-first: these describe the
-    // steering model the tick must gain; they fail until it ships.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn drift_runs_opposite_to_the_centreline_shift() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        // RoadGeometry is authoritative: a segment with positive curvature
-        // shifts the road centre toward positive lateral, so an unsteered
-        // bike must drift the opposite way — toward the outside.
-        let right = RoadGeometry::new(
-            vec![CurveSegment {
-                start: 0.0,
-                length: 400.0,
-                curvature: 0.005,
-            }],
-            Vec::new(),
-            12.0,
-        );
-        assert!(
-            right.center_offset(300.0) > right.center_offset(100.0),
-            "centre shifts positive along the segment"
-        );
-        let bike = BikeSnapshot {
-            speed: 50.0,
-            ..BikeSnapshot::at_rest()
-        };
-        let drifted = (0..60).fold(bike, |b, _| {
-            step_bike(b, Intent::default(), false, 0.005, dt)
-        });
-        assert!(
-            drifted.lateral < bike.lateral,
-            "drift ran opposite the centreline shift ({})",
-            drifted.lateral
-        );
-
-        // Mirrored segment: the centre shifts negative, drift runs positive.
-        let left = RoadGeometry::new(
-            vec![CurveSegment {
-                start: 0.0,
-                length: 400.0,
-                curvature: -0.005,
-            }],
-            Vec::new(),
-            12.0,
-        );
-        assert!(left.center_offset(300.0) < left.center_offset(100.0));
-        let drifted = (0..60).fold(bike, |b, _| {
-            step_bike(b, Intent::default(), false, -0.005, dt)
-        });
-        assert!(
-            drifted.lateral > bike.lateral,
-            "mirror: drift ran the other way ({})",
-            drifted.lateral
-        );
-    }
-
-    #[test]
-    fn lateral_motion_follows_the_heading_rate() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        // Two rides identical but for the heading-rate constant, already
-        // holding full ramp: during the approach to full lock the lateral
-        // motion must differ — lateral velocity follows heading, it is not
-        // a direct push.
-        let run = |heading_rate: f32| {
-            let tuning = SteerTuning {
-                heading_rate,
-                ..SteerTuning::NOMINAL
-            };
-            let bike = BikeSnapshot {
-                speed: 30.0,
-                steer_hold: STEER_RAMP_SECS,
-                ..BikeSnapshot::at_rest()
-            };
-            (0..20).fold(bike, |b, _| {
-                step_bike_tuned(
-                    b,
-                    intent_of(&[GameInput::SteerRight]),
-                    false,
-                    0.0,
-                    dt,
-                    tuning,
-                )
-            })
-        };
-        let nominal = run(HEADING_RATE);
-        let lazy = run(HEADING_RATE * 0.4);
-        assert!(
-            nominal.lateral > lazy.lateral * 1.2,
-            "a slower heading rate must move less lateral ({}) vs ({})",
-            nominal.lateral,
-            lazy.lateral
-        );
-    }
-
-    #[test]
-    fn centre_to_edge_at_full_steer_takes_at_least_the_target_time() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        // Reference measurement speed: ~108 km/h, a typical race pace.
-        let bike = BikeSnapshot {
-            speed: 30.0,
-            ..BikeSnapshot::at_rest()
-        };
-        let mut ticks = 0usize;
-        let mut bike = bike;
-        while bike.lateral.abs() < 6.0 {
-            bike = step_bike(bike, intent_of(&[GameInput::SteerRight]), false, 0.0, dt);
-            ticks += 1;
-            assert!(ticks < 600, "the bike never reached the road edge");
+    fn crashed_rider_respawns_on_the_road() {
+        let track = Track::build(catalog()[1]);
+        let mut b = straight_test(&track);
+        b.vel = b.fwd() * 30.0;
+        b.crash();
+        for _ in 0..((CRASH_SECS / DT) as usize + 2) {
+            b.step(&track, &Controls::default(), DT);
         }
-        let secs = ticks as f32 * dt;
-        assert!(
-            secs >= CENTRE_TO_EDGE_TARGET_SECS,
-            "centre-to-edge {secs:.2} s is short of the {CENTRE_TO_EDGE_TARGET_SECS:?} s target"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Wave 8.2 spec — drivetrain (.obvious/specs/wave8-drivetrain.md).
-    // Red-first: these describe the gearbox the tick must gain; they
-    // fail on the current single-ratio thrust until it ships.
-    // ------------------------------------------------------------------
-
-    /// Full-throttle run from rest: speed after each of `ticks` ticks at
-    /// the 60 Hz sim rate.
-    fn full_throttle_run(ticks: usize) -> Vec<f32> {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let mut bike = BikeSnapshot::at_rest();
-        let mut speeds = vec![bike.speed];
-        for _ in 0..ticks {
-            bike = step_bike(bike, intent_of(&[GameInput::Accelerate]), false, 0.0, dt);
-            speeds.push(bike.speed);
-        }
-        speeds
-    }
-
-    /// Per-tick acceleration along a run, in m/s².
-    fn accel_profile(speeds: &[f32]) -> Vec<f32> {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        speeds.windows(2).map(|w| (w[1] - w[0]) / dt).collect()
-    }
-
-    /// Speed at each gear shift the profile shows. A shift is a sharp
-    /// recovery: the pull sags at least 25% off its running peak through
-    /// the top of a rev band, then jumps at least 25% above the sag
-    /// floor. The single-ratio thrust only ever tapers, so it detects
-    /// nothing.
-    fn shift_speeds(speeds: &[f32], accel: &[f32]) -> Vec<f32> {
-        const SAG_FRACTION: f32 = 0.25;
-        const RECOVERY_FRACTION: f32 = 1.25;
-        let mut shifts = Vec::new();
-        let mut band_peak = accel.first().copied().unwrap_or(0.0);
-        let mut sag_floor = f32::INFINITY;
-        let mut sagged = false;
-        for (i, &a) in accel.iter().enumerate() {
-            band_peak = band_peak.max(a);
-            if !sagged {
-                if a < band_peak * (1.0 - SAG_FRACTION) {
-                    sagged = true;
-                    sag_floor = a;
-                }
-            } else {
-                sag_floor = sag_floor.min(a);
-                if a > sag_floor * RECOVERY_FRACTION {
-                    shifts.push(speeds[i + 1]);
-                    band_peak = a;
-                    sagged = false;
-                }
-            }
-        }
-        shifts
-    }
-
-    #[test]
-    fn full_throttle_acceleration_rises_through_distinct_gear_bands() {
-        // 20 s of held throttle: past every shift and into the tail.
-        let speeds = full_throttle_run(1_200);
-        let shifts = shift_speeds(&speeds, &accel_profile(&speeds));
-        assert!(
-            shifts.len() >= 2,
-            "a multi-gear drivetrain recovers the pull at each shift; the \
-             single-ratio thrust only tapers (shifts at {shifts:?})"
-        );
-    }
-
-    #[test]
-    fn gear_shifts_occur_at_speed_boundaries_not_at_the_extremes() {
-        let speeds = full_throttle_run(1_200);
-        let shifts = shift_speeds(&speeds, &accel_profile(&speeds));
-        assert!(
-            !shifts.is_empty(),
-            "the gearbox shifts up through its rev bands; nothing shifts \
-             on the single-ratio thrust"
-        );
-        for &speed in &shifts {
-            assert!(
-                (12.0..=50.0).contains(&speed),
-                "shift at {speed} m/s is outside the road range: no shift \
-                 at a crawl, and top gear owns the top end"
-            );
-        }
-    }
-
-    #[test]
-    fn full_throttle_reaches_100_kmh_within_the_gearbox_launch_target() {
-        let dt = sim::clock::TICK_DURATION_SECS as f32;
-        let speeds = full_throttle_run(600);
-        let hit = speeds
-            .iter()
-            .position(|&s| s >= 100.0 / 3.6)
-            .expect("a full-throttle run reaches 100 km/h");
-        let secs = hit as f32 * dt;
-        assert!(
-            secs < 2.2,
-            "0-100 km/h in {secs:.2} s misses the 2.2 s gearbox launch \
-             target — first gear must out-pull the single-ratio launch"
-        );
+        assert!(b.is_riding());
+        assert!(b.ghost > 0.0);
+        assert!(b.track_pos.lateral.abs() < track.half_width);
     }
 }

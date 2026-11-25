@@ -1,29 +1,15 @@
-//! wgpu sprite-batch renderer: instanced atlas sprites, an orthographic
-//! camera over the `world` projector's output, and quality-tier plumbing.
+//! The 3D renderer.
 //!
-//! Layering per the architecture blueprint: every decision (batch building,
-//! UV mapping, transforms, culling, tier selection) is a pure function in the
-//! device-free modules; `gpu` is the only module that touches a device and is
-//! untested on GPU-less hosts by design.
+//! Frame: sun shadow map -> HDR forward pass (terrain, road, props, bikes,
+//! water, sky, particles) -> bloom chain -> tonemap/grade -> FXAA to the
+//! surface. Everything runs on WebGL2-class hardware (no storage buffers,
+//! no compute) so the same code ships to WebGPU and WebGL2.
 
-#![forbid(unsafe_code)]
-
-pub mod atlas;
-pub mod batch;
 pub mod camera;
-pub mod gpu;
-pub mod instance;
-pub mod sampling;
-pub mod tier;
+pub mod mesh;
+pub mod models;
+pub mod renderer;
+pub mod world;
 
-pub use atlas::{
-    check_atlas_budget, uv_rect, uv_rect_inset, AtlasDims, AtlasTooLarge, MAX_ATLAS_BYTES,
-};
-pub use batch::SpriteBatch;
-pub use camera::{
-    instance_from_billboard, instance_rolled, push_projected, OrthoCamera, RoadPlacement,
-    SpriteStyle,
-};
-pub use gpu::{AtlasUpload, GpuRenderer, RenderError, RoadVertex, ROAD_SHADER, SPRITE_SHADER};
-pub use instance::SpriteInstance;
-pub use tier::{Backend, Effects, QualityTier};
+pub use camera::Camera;
+pub use renderer::{BikeDraw, FrameInput, Particle, ParticleKind, Renderer, Settings};

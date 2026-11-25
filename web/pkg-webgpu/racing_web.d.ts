@@ -1,153 +1,119 @@
 /* tslint:disable */
 /* eslint-disable */
 
-/**
- * The booted game: one race, its frame-composition buffers, and the GPU
- * renderer presenting to the loader's canvas. Held across frames so the
- * steady-state loop allocates nothing.
- *
- * wasm-only, and not by choice: wgpu's `SurfaceTarget::Canvas` exists only
- * on wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
- * `not(native)`), so this type cannot compile on host targets. The wasm32
- * checks in the workspace gate compile the real code.
- */
-export class BrowserGame {
+export class Game {
     private constructor();
     free(): void;
     [Symbol.dispose](): void;
+    adapter(): string;
     /**
-     * Advances the race one 60 Hz tick under the loader's input flags and
-     * draws the composed frame. Steady state: no allocation after warmup —
-     * the batch and road mesh refill through `advance_game_frame`.
+     * Background demo: the player bike drives itself.
      */
-    advance_frame(accelerate: boolean, brake: boolean, steer_left: boolean, steer_right: boolean, punch: boolean, kick: boolean): void;
+    attract(): void;
+    backend(): string;
     /**
-     * How many bikes are racing, for the HUD's `pos / total` display.
+     * Every bike as x,z pairs, player first.
      */
-    bike_count(): number;
+    bike_points(): Float32Array;
     /**
-     * Boots the demo race on `canvas`: packs the placeholder atlas, selects
-     * the quality tier from the loader's capability facts, and brings up the
-     * GPU pipeline (warm behind the loading screen per the blueprint).
-     *
-     * `low_end_device` comes from the loader's device heuristics;
-     * `has_webgpu` is compile-time — this build either carries the WebGPU
-     * backend or it does not, and the loader already chose the build to
-     * match its adapter probe.
-     *
-     * The canvas is sized before this call; its current `width`/`height`
-     * become the swap-chain size.
-     *
-     * Async factory rather than an async constructor: wasm-bindgen has
-     * deprecated async constructors (invalid TS bindings).
+     * Creates the GPU context on `canvas` (sized by the caller) and
+     * loads `slug` in attract mode.
      */
-    static boot(canvas: HTMLCanvasElement, low_end_device: boolean): Promise<BrowserGame>;
+    static boot(canvas: HTMLCanvasElement, slug: string): Promise<Game>;
+    cycle_camera(): number;
     /**
-     * Seconds left on the green-light countdown, for the HUD.
+     * Advances `dt` seconds of play and draws. Returns the cues raised,
+     * as (code, a, b) triples.
      */
-    countdown_secs(): number;
+    frame(dt: number, throttle: number, brake: number, steer: number, analog_steer: boolean, boost: boolean, attack: boolean): Float32Array;
+    hdr_format(): string;
     /**
-     * Whether the lights are still red.
+     * HUD snapshot; layout in `pack_hud`.
      */
-    is_counting_down(): boolean;
+    hud(): Float32Array;
     /**
-     * Whether the player has finished every lap.
+     * The canvas backing store changed size.
      */
-    is_finished(): boolean;
+    resize(w: number, h: number): void;
+    set_paused(paused: boolean): void;
     /**
-     * Current race lap index, for the loader's HUD.
+     * Internal render resolution as a fraction of the canvas (0.35..1).
      */
-    lap_index(): number;
+    set_render_scale(s: number): void;
     /**
-     * Length of one lap in meters, for the HUD's progress display.
+     * Loads `slug` (if different) as an attract-mode demo.
      */
-    lap_length(): number;
+    show(slug: string): void;
     /**
-     * Progress through the player's current lap, in `[0, 1)`, for the HUD's
-     * progress bar.
+     * Standings as `name|time|finished` lines, leader first.
      */
-    lap_progress(): number;
+    standings(): string;
     /**
-     * Current player distance along the track, in meters, for the HUD.
+     * Starts a race the player drives, on `slug`.
      */
-    player_distance(): number;
+    start_race(slug: string): void;
     /**
-     * The player's combat stamina bar, 0..1, for the HUD strip.
+     * Draw calls, triangles and visible props in the last frame.
      */
-    player_stamina(): number;
+    stats(): Float32Array;
     /**
-     * The player's race position, 1-based, for the HUD.
+     * Current track's slug.
      */
-    race_position(): number;
+    track(): string;
     /**
-     * Back to the grid: a fresh race with the same track. Inputs and camera
-     * state rebuild through the normal per-frame path.
+     * Centreline as x,z pairs for the minimap.
      */
-    restart(): void;
-    /**
-     * The rider's state as a bitmask for the HUD badge: 1 = crashed,
-     * 2 = off-road, 4 = braking. A stable u32 rather than a string keeps
-     * the per-frame HUD read allocation-free; the loader maps bits to
-     * labels and colors. Off-road is derived here the same way the bike
-     * state machine draws the line: lateral distance beyond the road's
-     * half width.
-     */
-    rider_state(): number;
-    /**
-     * Player speed in km/h, for the HUD.
-     */
-    speed_kmh(): number;
-    /**
-     * Laps needed to finish, for the HUD's `lap x of N` display.
-     */
-    total_laps(): number;
+    track_outline(): Float32Array;
 }
 
 /**
- * Which backend this build was compiled for, as the loader picked it.
+ * Which GPU backend this bundle was built for.
  */
 export function backend_name(): string;
 
-/**
- * Installs the panic hook once: panics surface in the browser console
- * instead of vanishing behind a frozen loading screen.
- */
 export function start(): void;
+
+/**
+ * The track list as `slug|name|laps|blurb` lines, for the track picker.
+ */
+export function track_list(): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly __wbg_browsergame_free: (a: number, b: number) => void;
-    readonly backend_name: (a: number) => void;
-    readonly browsergame_advance_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-    readonly browsergame_bike_count: (a: number) => number;
-    readonly browsergame_boot: (a: any, b: number) => any;
-    readonly browsergame_countdown_secs: (a: number) => number;
-    readonly browsergame_is_counting_down: (a: number) => number;
-    readonly browsergame_is_finished: (a: number) => number;
-    readonly browsergame_lap_index: (a: number) => number;
-    readonly browsergame_lap_length: (a: number) => number;
-    readonly browsergame_lap_progress: (a: number) => number;
-    readonly browsergame_player_distance: (a: number) => number;
-    readonly browsergame_player_stamina: (a: number) => number;
-    readonly browsergame_race_position: (a: number) => number;
-    readonly browsergame_restart: (a: number) => void;
-    readonly browsergame_rider_state: (a: number) => number;
-    readonly browsergame_speed_kmh: (a: number) => number;
-    readonly browsergame_total_laps: (a: number) => number;
+    readonly __wbg_game_free: (a: number, b: number) => void;
+    readonly backend_name: () => [number, number];
+    readonly game_adapter: (a: number) => [number, number];
+    readonly game_attract: (a: number) => void;
+    readonly game_backend: (a: number) => [number, number];
+    readonly game_bike_points: (a: number) => [number, number];
+    readonly game_boot: (a: any, b: number, c: number) => any;
+    readonly game_cycle_camera: (a: number) => number;
+    readonly game_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
+    readonly game_hdr_format: (a: number) => [number, number];
+    readonly game_hud: (a: number) => [number, number];
+    readonly game_resize: (a: number, b: number, c: number) => void;
+    readonly game_set_paused: (a: number, b: number) => void;
+    readonly game_set_render_scale: (a: number, b: number) => void;
+    readonly game_show: (a: number, b: number, c: number) => void;
+    readonly game_standings: (a: number) => [number, number];
+    readonly game_start_race: (a: number, b: number, c: number) => void;
+    readonly game_stats: (a: number) => [number, number];
+    readonly game_track: (a: number) => [number, number];
+    readonly game_track_outline: (a: number) => [number, number];
     readonly start: () => void;
-    readonly __wasm_bindgen_func_elem_1951: (a: number, b: number, c: number, d: any) => void;
-    readonly __wasm_bindgen_func_elem_1953: (a: number, b: number, c: any, d: any) => void;
-    readonly __wbindgen_export: (a: number, b: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_export3: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export4: (a: number) => void;
-    readonly __wbindgen_export5: () => number;
+    readonly track_list: () => [number, number];
+    readonly wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_export6: (a: number, b: number) => void;
-    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export7: (a: number) => void;
+    readonly __wbindgen_destroy_closure: (a: number, b: number) => void;
+    readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

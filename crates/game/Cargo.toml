@@ -1,10 +1,10 @@
 [package]
 name = "game"
-version = "0.1.0"
-edition = "2021"
-description = "Gameplay layer: bike state machine, race loop, pursuit AI, collisions, scoring"
+version.workspace = true
+edition.workspace = true
+description = "Gameplay: 3D circuits, terrain, motorcycle physics, rival AI, combat and the race loop"
 publish = false
 
 [dependencies]
 sim = { path = "../sim" }
-world = { path = "../world" }
+glam = { workspace = true }

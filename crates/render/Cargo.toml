@@ -2,16 +2,16 @@
 name = "render"
 version.workspace = true
 edition.workspace = true
-description = "wgpu sprite-batch renderer for the racing runtime"
+description = "wgpu 3D renderer: terrain, road, props, bikes, sky, shadows, HDR bloom"
 
 [dependencies]
-# `default-features = false` keeps wgpu's `webgpu` feature out of the
-# dependency graph: cargo unifies features per target, so one default-features
-# dependency would re-enable the browser-WebGPU backend even in the web
-# crate's webgl2 bundle, where it races the WebGL2 binding for the canvas
-# (the recorded NoAdapter / empty-canvas bring-up failure — see web's bring_up).
-# The native backends listed here match wgpu's defaults minus `webgpu`, so the
-# offscreen frame-proof still finds a (software) adapter on GPU-less hosts.
+game = { path = "../game" }
+glam.workspace = true
+bytemuck.workspace = true
+# `default-features = false` keeps wgpu's `webgpu` feature out of the graph:
+# cargo unifies features per target, so a default-features wgpu would
+# re-enable browser WebGPU inside the WebGL2 bundle, where it races the GL
+# binding for the canvas. The web crate adds the one browser backend it ships.
 wgpu = { version = "25.0.0", default-features = false, features = [
     "wgsl",
     "gles",
@@ -19,11 +19,3 @@ wgpu = { version = "25.0.0", default-features = false, features = [
     "metal",
     "dx12",
 ] }
-bytemuck = { version = "1", features = ["derive"] }
-world = { path = "../world" }
-assets = { path = "../assets" }
-
-# Boot-log line to the browser console (gpu.rs `log_boot`, item 14). wasm32
-# only: native test hosts take the stderr arm.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["console"] }

@@ -5,7 +5,7 @@
 //! a handle to a removed-and-recycled slot is rejected instead of silently
 //! addressing the slot's new occupant.
 //!
-//! Sized for the Road Rash-scale actor population: [`MAX_BIKES`] concurrent
+//! Sized for a full grid of riders: [`MAX_BIKES`] concurrent
 //! bikes, never felt as a cap.
 
 /// Maximum concurrent bikes the pool can hold.

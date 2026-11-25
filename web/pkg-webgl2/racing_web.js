@@ -1,226 +1,261 @@
 /* @ts-self-types="./racing_web.d.ts" */
 
-/**
- * The booted game: one race, its frame-composition buffers, and the GPU
- * renderer presenting to the loader's canvas. Held across frames so the
- * steady-state loop allocates nothing.
- *
- * wasm-only, and not by choice: wgpu's `SurfaceTarget::Canvas` exists only
- * on wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
- * `not(native)`), so this type cannot compile on host targets. The wasm32
- * checks in the workspace gate compile the real code.
- */
-export class BrowserGame {
+export class Game {
     static __wrap(ptr) {
-        const obj = Object.create(BrowserGame.prototype);
+        const obj = Object.create(Game.prototype);
         obj.__wbg_ptr = ptr;
-        BrowserGameFinalization.register(obj, obj.__wbg_ptr, obj);
+        GameFinalization.register(obj, obj.__wbg_ptr, obj);
         return obj;
     }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        BrowserGameFinalization.unregister(this);
+        GameFinalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg_browsergame_free(ptr, 0);
+        wasm.__wbg_game_free(ptr, 0);
     }
     /**
-     * Advances the race one 60 Hz tick under the loader's input flags and
-     * draws the composed frame. Steady state: no allocation after warmup —
-     * the batch and road mesh refill through `advance_game_frame`.
-     * @param {boolean} accelerate
-     * @param {boolean} brake
-     * @param {boolean} steer_left
-     * @param {boolean} steer_right
-     * @param {boolean} punch
-     * @param {boolean} kick
+     * @returns {string}
      */
-    advance_frame(accelerate, brake, steer_left, steer_right, punch, kick) {
+    adapter() {
+        let deferred1_0;
+        let deferred1_1;
         try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
-            wasm.browsergame_advance_frame(retptr, this.__wbg_ptr, accelerate, brake, steer_left, steer_right, punch, kick);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            if (r1) {
-                throw takeFromExternrefTable0(r0);
-            }
+            const ret = wasm.game_adapter(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
         } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
     /**
-     * How many bikes are racing, for the HUD's `pos / total` display.
-     * @returns {number}
+     * Background demo: the player bike drives itself.
      */
-    bike_count() {
-        const ret = wasm.browsergame_bike_count(this.__wbg_ptr);
-        return ret >>> 0;
+    attract() {
+        wasm.game_attract(this.__wbg_ptr);
     }
     /**
-     * Boots the demo race on `canvas`: packs the placeholder atlas, selects
-     * the quality tier from the loader's capability facts, and brings up the
-     * GPU pipeline (warm behind the loading screen per the blueprint).
-     *
-     * `low_end_device` comes from the loader's device heuristics;
-     * `has_webgpu` is compile-time — this build either carries the WebGPU
-     * backend or it does not, and the loader already chose the build to
-     * match its adapter probe.
-     *
-     * The canvas is sized before this call; its current `width`/`height`
-     * become the swap-chain size.
-     *
-     * Async factory rather than an async constructor: wasm-bindgen has
-     * deprecated async constructors (invalid TS bindings).
+     * @returns {string}
+     */
+    backend() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.game_backend(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Every bike as x,z pairs, player first.
+     * @returns {Float32Array}
+     */
+    bike_points() {
+        const ret = wasm.game_bike_points(this.__wbg_ptr);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * Creates the GPU context on `canvas` (sized by the caller) and
+     * loads `slug` in attract mode.
      * @param {HTMLCanvasElement} canvas
-     * @param {boolean} low_end_device
-     * @returns {Promise<BrowserGame>}
+     * @param {string} slug
+     * @returns {Promise<Game>}
      */
-    static boot(canvas, low_end_device) {
-        const ret = wasm.browsergame_boot(canvas, low_end_device);
+    static boot(canvas, slug) {
+        const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.game_boot(canvas, ptr0, len0);
         return ret;
     }
     /**
-     * Seconds left on the green-light countdown, for the HUD.
      * @returns {number}
      */
-    countdown_secs() {
-        const ret = wasm.browsergame_countdown_secs(this.__wbg_ptr);
+    cycle_camera() {
+        const ret = wasm.game_cycle_camera(this.__wbg_ptr);
         return ret >>> 0;
     }
     /**
-     * Whether the lights are still red.
-     * @returns {boolean}
+     * Advances `dt` seconds of play and draws. Returns the cues raised,
+     * as (code, a, b) triples.
+     * @param {number} dt
+     * @param {number} throttle
+     * @param {number} brake
+     * @param {number} steer
+     * @param {boolean} analog_steer
+     * @param {boolean} boost
+     * @param {boolean} attack
+     * @returns {Float32Array}
      */
-    is_counting_down() {
-        const ret = wasm.browsergame_is_counting_down(this.__wbg_ptr);
-        return ret !== 0;
+    frame(dt, throttle, brake, steer, analog_steer, boost, attack) {
+        const ret = wasm.game_frame(this.__wbg_ptr, dt, throttle, brake, steer, analog_steer, boost, attack);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
-     * Whether the player has finished every lap.
-     * @returns {boolean}
+     * @returns {string}
      */
-    is_finished() {
-        const ret = wasm.browsergame_is_finished(this.__wbg_ptr);
-        return ret !== 0;
+    hdr_format() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.game_hdr_format(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
-     * Current race lap index, for the loader's HUD.
-     * @returns {number}
+     * HUD snapshot; layout in `pack_hud`.
+     * @returns {Float32Array}
      */
-    lap_index() {
-        const ret = wasm.browsergame_lap_index(this.__wbg_ptr);
-        return ret >>> 0;
+    hud() {
+        const ret = wasm.game_hud(this.__wbg_ptr);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
-     * Length of one lap in meters, for the HUD's progress display.
-     * @returns {number}
+     * The canvas backing store changed size.
+     * @param {number} w
+     * @param {number} h
      */
-    lap_length() {
-        const ret = wasm.browsergame_lap_length(this.__wbg_ptr);
-        return ret;
+    resize(w, h) {
+        wasm.game_resize(this.__wbg_ptr, w, h);
     }
     /**
-     * Progress through the player's current lap, in `[0, 1)`, for the HUD's
-     * progress bar.
-     * @returns {number}
+     * @param {boolean} paused
      */
-    lap_progress() {
-        const ret = wasm.browsergame_lap_progress(this.__wbg_ptr);
-        return ret;
+    set_paused(paused) {
+        wasm.game_set_paused(this.__wbg_ptr, paused);
     }
     /**
-     * Current player distance along the track, in meters, for the HUD.
-     * @returns {number}
+     * Internal render resolution as a fraction of the canvas (0.35..1).
+     * @param {number} s
      */
-    player_distance() {
-        const ret = wasm.browsergame_player_distance(this.__wbg_ptr);
-        return ret;
+    set_render_scale(s) {
+        wasm.game_set_render_scale(this.__wbg_ptr, s);
     }
     /**
-     * The player's combat stamina bar, 0..1, for the HUD strip.
-     * @returns {number}
+     * Loads `slug` (if different) as an attract-mode demo.
+     * @param {string} slug
      */
-    player_stamina() {
-        const ret = wasm.browsergame_player_stamina(this.__wbg_ptr);
-        return ret;
+    show(slug) {
+        const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.game_show(this.__wbg_ptr, ptr0, len0);
     }
     /**
-     * The player's race position, 1-based, for the HUD.
-     * @returns {number}
+     * Standings as `name|time|finished` lines, leader first.
+     * @returns {string}
      */
-    race_position() {
-        const ret = wasm.browsergame_race_position(this.__wbg_ptr);
-        return ret >>> 0;
+    standings() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.game_standings(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
-     * Back to the grid: a fresh race with the same track. Inputs and camera
-     * state rebuild through the normal per-frame path.
+     * Starts a race the player drives, on `slug`.
+     * @param {string} slug
      */
-    restart() {
-        wasm.browsergame_restart(this.__wbg_ptr);
+    start_race(slug) {
+        const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.game_start_race(this.__wbg_ptr, ptr0, len0);
     }
     /**
-     * The rider's state as a bitmask for the HUD badge: 1 = crashed,
-     * 2 = off-road, 4 = braking. A stable u32 rather than a string keeps
-     * the per-frame HUD read allocation-free; the loader maps bits to
-     * labels and colors. Off-road is derived here the same way the bike
-     * state machine draws the line: lateral distance beyond the road's
-     * half width.
-     * @returns {number}
+     * Draw calls, triangles and visible props in the last frame.
+     * @returns {Float32Array}
      */
-    rider_state() {
-        const ret = wasm.browsergame_rider_state(this.__wbg_ptr);
-        return ret >>> 0;
+    stats() {
+        const ret = wasm.game_stats(this.__wbg_ptr);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
-     * Player speed in km/h, for the HUD.
-     * @returns {number}
+     * Current track's slug.
+     * @returns {string}
      */
-    speed_kmh() {
-        const ret = wasm.browsergame_speed_kmh(this.__wbg_ptr);
-        return ret >>> 0;
+    track() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.game_track(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
-     * Laps needed to finish, for the HUD's `lap x of N` display.
-     * @returns {number}
+     * Centreline as x,z pairs for the minimap.
+     * @returns {Float32Array}
      */
-    total_laps() {
-        const ret = wasm.browsergame_total_laps(this.__wbg_ptr);
-        return ret >>> 0;
+    track_outline() {
+        const ret = wasm.game_track_outline(this.__wbg_ptr);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
 }
-if (Symbol.dispose) BrowserGame.prototype[Symbol.dispose] = BrowserGame.prototype.free;
+if (Symbol.dispose) Game.prototype[Symbol.dispose] = Game.prototype.free;
 
 /**
- * Which backend this build was compiled for, as the loader picked it.
+ * Which GPU backend this bundle was built for.
  * @returns {string}
  */
 export function backend_name() {
     let deferred1_0;
     let deferred1_1;
     try {
-        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
-        wasm.backend_name(retptr);
-        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-        deferred1_0 = r0;
-        deferred1_1 = r1;
-        return getStringFromWasm0(r0, r1);
+        const ret = wasm.backend_name();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
     } finally {
-        wasm.__wbindgen_add_to_stack_pointer(16);
-        wasm.__wbindgen_export3(deferred1_0, deferred1_1, 1);
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
     }
 }
 
-/**
- * Installs the panic hook once: panics surface in the browser console
- * instead of vanishing behind a frozen loading screen.
- */
 export function start() {
     wasm.start();
+}
+
+/**
+ * The track list as `slug|name|laps|blurb` lines, for the track picker.
+ * @returns {string}
+ */
+export function track_list() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.track_list();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
 }
 function __wbg_get_imports() {
     const import0 = {
@@ -236,7 +271,7 @@ function __wbg_get_imports() {
         },
         __wbg___wbindgen_debug_string_f249a2a76caa9a55: function(arg0, arg1) {
             const ret = debugString(arg1);
-            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
@@ -258,7 +293,7 @@ function __wbg_get_imports() {
         __wbg___wbindgen_string_get_7ce8eee7fd327545: function(arg0, arg1) {
             const obj = arg1;
             const ret = typeof(obj) === 'string' ? obj : undefined;
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
@@ -358,10 +393,6 @@ function __wbg_get_imports() {
         },
         __wbg_blitFramebuffer_d17b7bddf5e86dbc: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10) {
             arg0.blitFramebuffer(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9 >>> 0, arg10 >>> 0);
-        },
-        __wbg_browsergame_new: function(arg0) {
-            const ret = BrowserGame.__wrap(arg0);
-            return ret;
         },
         __wbg_bufferData_2fb8740d60478bf0: function(arg0, arg1, arg2, arg3) {
             arg0.bufferData(arg1 >>> 0, arg2, arg3 >>> 0);
@@ -657,7 +688,7 @@ function __wbg_get_imports() {
                 deferred0_1 = arg1;
                 console.error(getStringFromWasm0(arg0, arg1));
             } finally {
-                wasm.__wbindgen_export3(deferred0_0, deferred0_1, 1);
+                wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
             }
         },
         __wbg_fenceSync_53f6f24f4bb43d24: function(arg0, arg1, arg2) {
@@ -694,6 +725,10 @@ function __wbg_get_imports() {
         __wbg_frontFace_8bbd77ca3b8f90a6: function(arg0, arg1) {
             arg0.frontFace(arg1 >>> 0);
         },
+        __wbg_game_new: function(arg0) {
+            const ret = Game.__wrap(arg0);
+            return ret;
+        },
         __wbg_getBufferSubData_4a9f8244f0e59e63: function(arg0, arg1, arg2, arg3) {
             arg0.getBufferSubData(arg1 >>> 0, arg2, arg3);
         },
@@ -723,14 +758,14 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_getProgramInfoLog_01799fd7b07b7f3c: function(arg0, arg1, arg2) {
             const ret = arg1.getProgramInfoLog(arg2);
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
         },
         __wbg_getProgramInfoLog_92d61551e1ab39ea: function(arg0, arg1, arg2) {
             const ret = arg1.getProgramInfoLog(arg2);
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
@@ -749,14 +784,14 @@ function __wbg_get_imports() {
         },
         __wbg_getShaderInfoLog_3cfe5b3e097d0f2d: function(arg0, arg1, arg2) {
             const ret = arg1.getShaderInfoLog(arg2);
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
         },
         __wbg_getShaderInfoLog_8758e8aea7960121: function(arg0, arg1, arg2) {
             const ret = arg1.getShaderInfoLog(arg2);
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
@@ -852,9 +887,6 @@ function __wbg_get_imports() {
         __wbg_linkProgram_dee7cda98bacb12f: function(arg0, arg1) {
             arg0.linkProgram(arg1);
         },
-        __wbg_log_ff86bbb34c295e21: function(arg0) {
-            console.log(arg0);
-        },
         __wbg_new_37eb45aaf5eeb820: function() {
             const ret = new Array();
             return ret;
@@ -874,7 +906,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_8586(a, state0.b, arg0, arg1);
+                        return wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -980,7 +1012,7 @@ function __wbg_get_imports() {
         },
         __wbg_stack_575c4e0918581b9c: function(arg0, arg1) {
             const ret = arg1.stack;
-            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
             getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
@@ -1238,8 +1270,8 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1398, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_8584);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1321, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0) {
@@ -1302,37 +1334,30 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_8586(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_8586(arg0, arg1, arg2, arg3);
-}
-
-function __wasm_bindgen_func_elem_8584(arg0, arg1, arg2) {
-    try {
-        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
-        wasm.__wasm_bindgen_func_elem_8584(retptr, arg0, arg1, arg2);
-        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-        if (r1) {
-            throw takeFromExternrefTable0(r0);
-        }
-    } finally {
-        wasm.__wbindgen_add_to_stack_pointer(16);
+function wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_(arg0, arg1, arg2) {
+    const ret = wasm.wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___wasm_bindgen_fdf1da2e33ce5bc3___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_fdf1da2e33ce5bc3___JsError___true_(arg0, arg1, arg2);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
     }
 }
 
-const BrowserGameFinalization = (typeof FinalizationRegistry === 'undefined')
+function wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_(arg0, arg1, arg2, arg3) {
+    wasm.wasm_bindgen_fdf1da2e33ce5bc3___convert__closures_____invoke___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined___js_sys_fdd07d1817e7878c___Function_fn_wasm_bindgen_fdf1da2e33ce5bc3___JsValue_____wasm_bindgen_fdf1da2e33ce5bc3___sys__Undefined_______true_(arg0, arg1, arg2, arg3);
+}
+
+const GameFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_browsergame_free(ptr, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_game_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
-    const idx = wasm.__wbindgen_export5();
+    const idx = wasm.__externref_table_alloc();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
 }
 
 const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(state => wasm.__wbindgen_export6(state.a, state.b));
+    : new FinalizationRegistry(state => wasm.__wbindgen_destroy_closure(state.a, state.b));
 
 function debugString(val) {
     switch (typeof val) {
@@ -1501,7 +1526,7 @@ function handleError(f, args) {
         return f.apply(this, args);
     } catch (e) {
         const idx = addToExternrefTable0(e);
-        wasm.__wbindgen_export4(idx);
+        wasm.__wbindgen_exn_store(idx);
     }
 }
 
@@ -1528,7 +1553,7 @@ function makeMutClosure(arg0, arg1, f) {
     };
     real._wbg_cb_unref = () => {
         if (--state.cnt === 0) {
-            wasm.__wbindgen_export6(state.a, state.b);
+            wasm.__wbindgen_destroy_closure(state.a, state.b);
             state.a = 0;
             CLOSURE_DTORS.unregister(state);
         }
@@ -1576,7 +1601,7 @@ function passStringToWasm0(arg, malloc, realloc) {
 
 function takeFromExternrefTable0(idx) {
     const value = wasm.__wbindgen_externrefs.get(idx);
-    wasm.__wbindgen_export7(idx);
+    wasm.__externref_table_dealloc(idx);
     return value;
 }
 
