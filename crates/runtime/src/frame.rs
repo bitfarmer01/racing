@@ -720,12 +720,33 @@ pub fn advance_game_frame(
     });
 }
 
-/// The steady-state per-frame path (items 13/15): pre-owned batch, road
-/// mesh, and draw list, plus the tick clock and the last two ticks' bike
-/// poses that between-tick interpolation needs. [`Self::advance`] feeds one
-/// rendered frame's delta, runs the due 60 Hz ticks, and composes with the
-/// clock's leftover alpha — no allocation after warmup, and every rendered
-/// frame moves.
+/// The drivetrain readout for the HUD strip: the gear number and engine
+/// speed rendered beside the speed figure. A readout, not a control —
+/// the automatic box shifts itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HudReadout {
+    /// Current gear, 1-based.
+    pub gear: u8,
+    /// Engine speed as a percent of redline.
+    pub rpm_percent: f32,
+}
+
+/// Reads the player's drivetrain state off the race — the same snapshot
+/// the sim stepped this tick, so the readout never runs ahead of the
+/// physics. The browser shell renders `gear` and `rpm_percent` next to
+/// the km/h figure.
+pub fn hud_readout(race: &Race) -> HudReadout {
+    HudReadout {
+        gear: race.player_gear(),
+        rpm_percent: race.player_rpm_percent(),
+    }
+}
+
+/// Composes one rendered frame off a [`Race`]: the sprite batch, the road
+/// mesh, and the interpolated player pose that between-tick interpolation
+/// needs. [`Self::advance`] feeds one rendered frame's delta, runs the due
+/// 60 Hz ticks, and composes with the clock's leftover alpha — no
+/// allocation after warmup, and every rendered frame moves.
 pub struct GameSession {
     batch: SpriteBatch,
     road: RoadMesh,

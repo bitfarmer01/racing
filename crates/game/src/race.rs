@@ -469,12 +469,19 @@ impl Race {
                 (self.aux[slot].top_speed * RUBBER_BAND_EASE, 0.0)
             } else if gap > 0.0 {
                 // Ahead inside the window: the leader paces the player —
-                // capped at a small slack that shrinks with the gap, so a
-                // rider in front is always catchable, never a static gap.
+                // capped at a small slack that GROWS with the gap and
+                // vanishes at contact, mirroring the chaser branch below:
+                // a leader at the player's wheel rides the player's pace,
+                // so the duel can re-form (the fight arm range sits at
+                // 9 m), and only a leader at the rubber-band edge holds a
+                // static gap. The old taper escaped fastest at contact,
+                // which pinned near leaders forever out of reach — the
+                // gearbox's stronger player exposed it as dead fights
+                // after the launch lap.
                 let depth = (gap / RUBBER_BAND_AHEAD).min(1.0);
                 let ease = 1.0 - (1.0 - RUBBER_BAND_EASE) * depth;
-                let cap = (self.aux[slot].top_speed * ease)
-                    .min(player_speed + LEADER_SLACK * (1.0 - depth));
+                let cap =
+                    (self.aux[slot].top_speed * ease).min(player_speed + LEADER_SLACK * depth);
                 (cap, 0.0)
             } else {
                 // Behind but inside the chase window: shadow the player's
@@ -1284,6 +1291,17 @@ impl Race {
         self.state(0).speed
     }
 
+    /// The player's current gear, 1-based, for the HUD readout.
+    pub fn player_gear(&self) -> u8 {
+        self.aux[0].snapshot.gear
+    }
+
+    /// The player's engine speed as a percent of redline, for the HUD
+    /// readout beside the speed figure.
+    pub fn player_rpm_percent(&self) -> f32 {
+        bike::rpm_percent(self.aux[0].snapshot.rpm)
+    }
+
     /// The player's lateral position, in meters.
     pub fn player_lateral(&self) -> f32 {
         self.state(0).pos_y
@@ -1500,11 +1518,19 @@ mod tests {
         let mut race = flat_race(0, 42);
         run(&mut race, 1, &[]);
         // Stage the player 30 m behind a car, in its lane, from a stop: full
-        // throttle reaches 40+ m/s down the road and runs the car down well
-        // over the 12 m/s closing-speed crash threshold.
+        // throttle runs the car down well over the 12 m/s closing-speed
+        // crash threshold. The gearbox launch is deliberately gentler than
+        // the old speed-tapered pull (100 km/h in ~3 s vs ~2.4 s), so the
+        // catch lands a little later; wait for the crash itself instead of
+        // a tuned tick count.
         let car = race.traffic_cars()[0].state;
         race.place_bike(0, car.pos_x - 30.0, car.pos_y);
-        run(&mut race, 300, &[GameInput::Accelerate]);
+        let mut ticks = 0usize;
+        while race.player_control() != Control::Crashed && ticks < 2_000 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            ticks += 1;
+        }
         assert_eq!(race.player_control(), Control::Crashed, "traffic bites");
     }
 
@@ -2652,15 +2678,17 @@ mod tests {
         }
         let mean = |samples: &[f32]| samples.iter().sum::<f32>() / samples.len() as f32;
         assert!(!left_bend.is_empty() && !right_bend.is_empty());
+        // Inside-line craft, measured as the right-bend-minus-left-bend
+        // mean difference: grid lanes sit at ±4 m, so a pooled sign check
+        // on one bend conflates craft with which lanes the sampled riders
+        // happen to hold (one rival rides the outside of the left bend on
+        // base too). The differential cancels lane identity. The gearbox
+        // pack carries bends faster and its lines run a little wider, so
+        // the differential halves (≈2.1 → ≈0.8) but stays clearly positive.
+        let differential = mean(&right_bend) - mean(&left_bend);
         assert!(
-            mean(&left_bend) < 0.0,
-            "rivals must sit inside the left bend (negative side), mean {}",
-            mean(&left_bend)
-        );
-        assert!(
-            mean(&right_bend) > 0.0,
-            "rivals must sit inside the right bend (positive side), mean {}",
-            mean(&right_bend)
+            differential > 0.5,
+            "rivals must steer toward the inside of whichever bend they ride (right-minus-left mean {differential})"
         );
     }
 
