@@ -71,6 +71,9 @@ pub const CRASH_CLOSING_SPEED: f32 = 12.0;
 pub const SIDE_CRASH_SPEED: f32 = 28.0;
 /// Lateral gap under which side-by-side contact counts as heavy, in meters.
 pub const SIDE_CRASH_GAP: f32 = 0.6;
+/// Meters inside the road edge where a recovered rider is placed: at
+/// least this far in from the lip, so a picked-up bike has road to ride.
+pub const RECOVERY_LANE_MARGIN: f32 = 3.0;
 /// Green-light countdown length: 3 seconds at 60 Hz.
 pub const COUNTDOWN_TICKS: u32 = 180;
 /// Slow vehicles sharing the road.
@@ -186,6 +189,16 @@ struct RiderAux {
     /// Accumulated instability from landed hits; past the dismount threshold
     /// the rider goes down through the crash flow.
     instability: f32,
+    /// Ticks left on a pending attack wind-up; 0 when not winding up.
+    windup_ticks: u32,
+    /// Spawn slot a pending wind-up is aimed at; None when not winding up.
+    windup_target: Option<usize>,
+    /// Combat dismounts this rider has already taken; past
+    /// [`combat::DISMOUNT_CAP`] hits can no longer dismount them.
+    dismounts: u32,
+    /// Seconds left in a pace-match engagement: a rival in punch reach of
+    /// the player holds the player's speed for this long.
+    shadow_secs: f32,
 }
 
 impl Default for RiderAux {
@@ -197,6 +210,10 @@ impl Default for RiderAux {
             aggression: 1.0,
             combat: Combat::default(),
             instability: 0.0,
+            windup_ticks: 0,
+            windup_target: None,
+            dismounts: 0,
+            shadow_secs: 0.0,
         }
     }
 }
@@ -961,6 +978,7 @@ pub const HAZARD_SCRUB: f32 = 0.93;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use world::CurveSegment;
 
     const TRACK: f32 = 500.0;
     const LAPS: u32 = 3;
@@ -1504,10 +1522,11 @@ mod tests {
             1.0,
             "no target, no cost — the stamina bar is untouched"
         );
+        // Every press plays the swing pose, whiff included (item 8).
         assert_eq!(
             race.bike_attack_pose(0),
-            None,
-            "no target, no swing — no pose either"
+            Some(Attack::Punch),
+            "a whiff still shows the swing"
         );
         assert_ne!(
             race.player_control(),
@@ -1698,5 +1717,307 @@ mod tests {
             (bike::CRASH_DURATION_SECS / TICK_DURATION_SECS as f32).ceil() as usize + 10;
         run(&mut race, recovery_ticks, &[]);
         assert_eq!(race.player_control(), Control::Coast, "recovered");
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 7 audit — sim probes (items 1–8). Each probe builds the demo
+    // race: seed 0x5EED_C0DE, a 2 000 m lap from the two curve segments of
+    // runtime's `track_geometry`, and pushes inputs each tick while
+    // reading the Race's public getters.
+    // ------------------------------------------------------------------
+
+    /// The demo course's two curve segments, mirrored from runtime's
+    /// `track_geometry` (the game crate cannot depend on runtime): a long
+    /// gentle left (negative curvature per the geometry-authoritative
+    /// convention — `center_offset` is −15 m at 300 m) and a shorter,
+    /// tighter right. Elevation does not enter the sim.
+    fn demo_geometry() -> RoadGeometry {
+        RoadGeometry::new(
+            vec![
+                CurveSegment {
+                    start: 200.0,
+                    length: 700.0,
+                    curvature: -0.003,
+                },
+                CurveSegment {
+                    start: 1200.0,
+                    length: 400.0,
+                    curvature: 0.005,
+                },
+            ],
+            Vec::new(),
+            12.0,
+        )
+    }
+
+    /// The demo race probe: seed 0x5EED_C0DE, 2 000 m laps, three laps.
+    fn probe_race(rivals: usize) -> Race {
+        Race::new(RaceConfig {
+            rivals,
+            track_length: 2_000.0,
+            total_laps: 3,
+            seed: 0x5EED_C0DE,
+            geometry: demo_geometry(),
+        })
+    }
+
+    /// Runs `ticks` of throttle-only input through the race.
+    fn throttle(race: &mut Race, ticks: usize) {
+        for _ in 0..ticks {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+    }
+
+    /// Whether the rider in `slot` sits in punch reach of the player.
+    fn rival_in_reach(race: &Race, slot: usize) -> bool {
+        let player = race.bike_states().next().expect("player");
+        let rival = race.bike_states().nth(slot).expect("rival");
+        combat::in_reach(
+            Attack::Punch,
+            rival.pos_x - player.pos_x,
+            rival.pos_y - player.pos_y,
+        )
+    }
+
+    #[test]
+    fn a_rival_hit_lands_only_after_the_windup_ticks() {
+        let mut race = staged_fight(1, 42);
+        // Ride adjacent until the rival's wind-up pose appears.
+        let mut seen_pose = false;
+        for _ in 0..600 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            if race.bike_attack_pose(1) == Some(Attack::Punch) {
+                seen_pose = true;
+                break;
+            }
+        }
+        assert!(seen_pose, "the rival shows the wind-up pose");
+
+        // Through the wind-up the target's stamina is untouched — the hit
+        // has not landed yet.
+        for windup_tick in 1..combat::WINDUP_TICKS {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            assert_eq!(
+                race.player_stamina(),
+                1.0,
+                "stamina drained {windup_tick} ticks into the wind-up"
+            );
+        }
+        // ...then the hit lands.
+        race.push_input(GameInput::Accelerate);
+        race.tick();
+        assert!(
+            race.player_stamina() < 1.0,
+            "the hit lands WINDUP_TICKS after the pose starts"
+        );
+    }
+
+    #[test]
+    fn a_windup_hit_is_cancelled_when_the_target_leaves_reach() {
+        let mut race = staged_fight(1, 42);
+        let mut seen_pose = false;
+        for _ in 0..600 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            if race.bike_attack_pose(1) == Some(Attack::Punch) {
+                seen_pose = true;
+                break;
+            }
+        }
+        assert!(seen_pose, "the rival shows the wind-up pose");
+
+        // The player bolts out of reach mid-wind-up: the swing whiffs.
+        race.place_bike(0, race.player_distance() + 30.0, 0.0);
+        throttle(&mut race, combat::WINDUP_TICKS as usize + 30);
+        assert_eq!(
+            race.player_stamina(),
+            1.0,
+            "the cancelled wind-up never landed"
+        );
+        assert_ne!(
+            race.player_control(),
+            Control::Crashed,
+            "a cancelled wind-up takes no one down"
+        );
+    }
+
+    #[test]
+    fn throttle_only_through_the_first_bend_drifts_outward() {
+        let mut race = probe_race(3);
+        race.clear_traffic();
+        // Roll to just inside the first bend (200 m, curvature −0.003:
+        // a left bend — the centre shifts negative, the outside is right).
+        while race.player_distance() < 205.0 {
+            throttle(&mut race, 1);
+        }
+        let entry = race.player_lateral();
+        // Throttle only, deeper into the bend.
+        while race.player_distance() < 295.0 {
+            throttle(&mut race, 1);
+        }
+        let deep = race.player_lateral();
+        assert!(
+            deep > entry + 0.3,
+            "lateral must move outward (positive) through the bend ({entry} -> {deep})"
+        );
+        assert!(
+            deep > 0.0,
+            "outward on a left bend is the right-hand side ({deep})"
+        );
+    }
+
+    #[test]
+    fn rivals_take_the_visual_inside_of_each_bend() {
+        let mut race = probe_race(3);
+        // Sample upright rivals deep in each bend over a full race.
+        let mut left_bend: Vec<f32> = Vec::new();
+        let mut right_bend: Vec<f32> = Vec::new();
+        while !race.is_finished() && race.tick_index() < 20_000 {
+            throttle(&mut race, 1);
+            for slot in 1..race.bike_count() {
+                if race.bike_control(slot) == Control::Crashed {
+                    continue;
+                }
+                let (x, y) = {
+                    let s = race.bike_states().nth(slot).expect("rival");
+                    (s.pos_x, s.pos_y)
+                };
+                let d = x.rem_euclid(2_000.0);
+                // Bend 1 (a left bend): inside is the negative side.
+                if (300.0..800.0).contains(&d) {
+                    left_bend.push(y);
+                }
+                // Bend 2 (a right bend): inside is the positive side.
+                if (1_300.0..1_500.0).contains(&d) {
+                    right_bend.push(y);
+                }
+            }
+        }
+        let mean = |samples: &[f32]| samples.iter().sum::<f32>() / samples.len() as f32;
+        assert!(!left_bend.is_empty() && !right_bend.is_empty());
+        assert!(
+            mean(&left_bend) < 0.0,
+            "rivals must sit inside the left bend (negative side), mean {}",
+            mean(&left_bend)
+        );
+        assert!(
+            mean(&right_bend) > 0.0,
+            "rivals must sit inside the right bend (positive side), mean {}",
+            mean(&right_bend)
+        );
+    }
+
+    #[test]
+    fn a_recovered_rider_stays_on_the_tarmac() {
+        let mut race = probe_race(3);
+        // Throttle only for 45 s. After the first crash recovery, the
+        // player must be on the tarmac for at least 90% of ticks.
+        let mut was_crashed = false;
+        let mut recovered = false;
+        let mut on = 0usize;
+        let mut total = 0usize;
+        for _ in 0..(45 * 60) {
+            throttle(&mut race, 1);
+            let crashed = race.player_control() == Control::Crashed;
+            let recovered_now = was_crashed && !crashed;
+            was_crashed = crashed;
+            if recovered {
+                total += 1;
+                if race.player_lateral().abs() <= 6.0 {
+                    on += 1;
+                }
+            }
+            if recovered_now {
+                recovered = true;
+            }
+        }
+        assert!(recovered, "the probe saw at least one crash recovery");
+        let share = on as f32 / total as f32;
+        assert!(
+            share >= 0.9,
+            "on-tarmac share after first recovery: {on}/{total} = {share:.3}"
+        );
+    }
+
+    #[test]
+    fn rivals_hold_punch_reach_for_the_player_to_join() {
+        // A field above four riders, a centre-holding rider who never
+        // attacks: throttle only.
+        let mut race = probe_race(6);
+        let mut open = [0usize; MAX_BIKES];
+        let mut open_lap = [0u32; MAX_BIKES];
+        let mut windows: Vec<(u32, usize)> = Vec::new(); // (lap, ticks)
+        while !race.is_finished() && race.tick_index() < 20_000 {
+            throttle(&mut race, 1);
+            let lap = race.lap_index().min(2);
+            for slot in 1..race.bike_count() {
+                let in_reach = race.bike_control(slot) != Control::Crashed
+                    && race.player_control() != Control::Crashed
+                    && rival_in_reach(&race, slot);
+                if in_reach {
+                    if open[slot] == 0 {
+                        open_lap[slot] = lap;
+                    }
+                    open[slot] += 1;
+                } else if open[slot] > 0 {
+                    windows.push((open_lap[slot], open[slot]));
+                    open[slot] = 0;
+                }
+            }
+        }
+        for slot in 1..race.bike_count() {
+            if open[slot] > 0 {
+                windows.push((open_lap[slot], open[slot]));
+            }
+        }
+        assert!(
+            race.is_finished(),
+            "the probe race completes inside the tick budget"
+        );
+        let mut lens: Vec<usize> = windows.iter().map(|&(_, len)| len).collect();
+        lens.sort_unstable();
+        let median = lens[lens.len() / 2];
+        assert!(
+            median >= 120,
+            "median punch-reach window is {median} ticks; the spec asks for 2 s"
+        );
+        for lap in 0..3u32 {
+            let count = windows.iter().filter(|&&(l, _)| l == lap).count();
+            assert!(count >= 3, "lap {lap}: only {count} reach windows");
+        }
+    }
+
+    #[test]
+    fn a_peaceful_field_does_not_tear_itself_down() {
+        // Centre-holding rider who never attacks: throttle only, full race.
+        let mut race = probe_race(6);
+        let mut prev: Vec<Control> = (0..race.bike_count())
+            .map(|s| race.bike_control(s))
+            .collect();
+        let mut player_crashes = 0;
+        let mut rival_crashes = 0;
+        while !race.is_finished() && race.tick_index() < 20_000 {
+            throttle(&mut race, 1);
+            for slot in 0..race.bike_count() {
+                let now = race.bike_control(slot);
+                if now == Control::Crashed && prev[slot] != Control::Crashed {
+                    if slot == 0 {
+                        player_crashes += 1;
+                    } else {
+                        rival_crashes += 1;
+                    }
+                }
+                prev[slot] = now;
+            }
+        }
+        assert!(
+            race.is_finished(),
+            "the probe race completes inside the tick budget"
+        );
+        assert!(rival_crashes < 6, "rival crashes: {rival_crashes}");
+        assert!(player_crashes <= 1, "player crashes: {player_crashes}");
     }
 }

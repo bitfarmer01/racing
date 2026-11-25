@@ -24,8 +24,25 @@ pub const OFFROAD_MAX_SPEED: f32 = 18.0;
 /// Extra drag applied while off-road above [`OFFROAD_MAX_SPEED`], in meters
 /// per second squared.
 pub const OFFROAD_DRAG: f32 = 14.0;
-/// Lateral speed while leaning, in meters per second.
+/// Lateral speed while leaning, in meters per second. (Audit item 4: this
+/// constant is the dual-unit offender — m/s here, rad/s at the clamp — and
+/// the fix splits it into [`HEADING_RATE`] and [`FULL_LOCK_HEADING`].)
 pub const STEER_RATE: f32 = 5.0;
+/// Heading rotation rate at full steering authority, in radians per
+/// second: how fast the bike's velocity vector swings when the steerer
+/// holds input. Its own unit on purpose — the old `STEER_RATE` doubled as
+/// both this and a lateral speed in m/s, which let steering bypass
+/// heading entirely.
+pub const HEADING_RATE: f32 = 0.9;
+/// Full-lock heading, in radians: the angle the bike's velocity makes with
+/// the road centreline at full steering authority. Lateral speed follows
+/// from it as `speed · tan(FULL_LOCK_HEADING)` — about 2.7 m/s at 30 m/s,
+/// so a centre-to-edge crossing takes ~2.4 s, clear of the audit target.
+pub const FULL_LOCK_HEADING: f32 = 0.09;
+/// Steering-feel target, in seconds of held full steer to cross from the
+/// road centre to the road edge at 30 m/s (~108 km/h). The audit's
+/// starting proposal, tuned to and asserted by the tests.
+pub const CENTRE_TO_EDGE_TARGET_SECS: f32 = 2.0;
 /// Seconds of held steering to reach full lateral authority. A tap nudges,
 /// a hold bites: the ramp eases steering in so the all-or-nothing jolt of
 /// the fixed rate disappears.
@@ -117,6 +134,24 @@ impl BikeSnapshot {
     pub fn is_off_road(&self, half_width: f32) -> bool {
         self.lateral.abs() > half_width
     }
+}
+
+/// Steering feel, so a test can vary one factor at a time: [`step_bike`]
+/// always rides [`SteerTuning::NOMINAL`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SteerTuning {
+    /// Heading rotation rate at full authority, in radians per second.
+    pub heading_rate: f32,
+    /// Full-lock heading, in radians.
+    pub full_lock: f32,
+}
+
+impl SteerTuning {
+    /// The shipped feel: [`HEADING_RATE`] and [`FULL_LOCK_HEADING`].
+    pub const NOMINAL: Self = Self {
+        heading_rate: HEADING_RATE,
+        full_lock: FULL_LOCK_HEADING,
+    };
 }
 
 /// Advance one bike by one tick of `dt` seconds under `intent`.
@@ -233,6 +268,20 @@ pub fn step_bike(
     bike
 }
 
+/// [`step_bike`] with explicit steering feel — the seam that lets a test
+/// vary only the heading rate and watch lateral motion follow.
+pub fn step_bike_tuned(
+    bike: BikeSnapshot,
+    intent: Intent,
+    off_road: bool,
+    corner_curvature: f32,
+    dt: f32,
+    tuning: SteerTuning,
+) -> BikeSnapshot {
+    let _ = tuning;
+    step_bike(bike, intent, off_road, corner_curvature, dt)
+}
+
 /// The crash trigger, evaluated by the race driver after the lateral move:
 /// running off the tarmac above [`OFFROAD_CRASH_SPEED`] is a crash.
 pub fn should_crash(bike: &BikeSnapshot, half_width: f32) -> bool {
@@ -251,6 +300,7 @@ pub fn crash(bike: &mut BikeSnapshot) {
 mod tests {
     use super::*;
     use crate::input::GameInput;
+    use world::{CurveSegment, RoadGeometry};
 
     /// Drain a list of input events into one intent, the way a tick does.
     fn intent_of(events: &[GameInput]) -> Intent {
@@ -601,5 +651,121 @@ mod tests {
         crash(&mut crashed);
         assert_eq!(crashed.control, Control::Crashed);
         assert_eq!(crashed.crash_timer, CRASH_DURATION_SECS);
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 7 audit — items 2, 4, 5. Red-first: these describe the
+    // steering model the tick must gain; they fail until it ships.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn drift_runs_opposite_to_the_centreline_shift() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        // RoadGeometry is authoritative: a segment with positive curvature
+        // shifts the road centre toward positive lateral, so an unsteered
+        // bike must drift the opposite way — toward the outside.
+        let right = RoadGeometry::new(
+            vec![CurveSegment {
+                start: 0.0,
+                length: 400.0,
+                curvature: 0.005,
+            }],
+            Vec::new(),
+            12.0,
+        );
+        assert!(
+            right.center_offset(300.0) > right.center_offset(100.0),
+            "centre shifts positive along the segment"
+        );
+        let bike = BikeSnapshot {
+            speed: 50.0,
+            ..BikeSnapshot::at_rest()
+        };
+        let drifted = (0..60).fold(bike, |b, _| {
+            step_bike(b, Intent::default(), false, 0.005, dt)
+        });
+        assert!(
+            drifted.lateral < bike.lateral,
+            "drift ran opposite the centreline shift ({})",
+            drifted.lateral
+        );
+
+        // Mirrored segment: the centre shifts negative, drift runs positive.
+        let left = RoadGeometry::new(
+            vec![CurveSegment {
+                start: 0.0,
+                length: 400.0,
+                curvature: -0.005,
+            }],
+            Vec::new(),
+            12.0,
+        );
+        assert!(left.center_offset(300.0) < left.center_offset(100.0));
+        let drifted = (0..60).fold(bike, |b, _| {
+            step_bike(b, Intent::default(), false, -0.005, dt)
+        });
+        assert!(
+            drifted.lateral > bike.lateral,
+            "mirror: drift ran the other way ({})",
+            drifted.lateral
+        );
+    }
+
+    #[test]
+    fn lateral_motion_follows_the_heading_rate() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        // Two rides identical but for the heading-rate constant: during
+        // the approach to full lock the lateral motion must differ —
+        // lateral velocity follows heading, it is not a direct push.
+        let run = |heading_rate: f32| {
+            let tuning = SteerTuning {
+                heading_rate,
+                ..SteerTuning::NOMINAL
+            };
+            let bike = BikeSnapshot {
+                speed: 30.0,
+                ..BikeSnapshot::at_rest()
+            };
+            (0..8).fold(bike, |b, _| {
+                step_bike_tuned(
+                    b,
+                    intent_of(&[GameInput::SteerRight]),
+                    false,
+                    0.0,
+                    dt,
+                    tuning,
+                )
+            })
+        };
+        let nominal = run(HEADING_RATE);
+        let lazy = run(HEADING_RATE * 0.4);
+        assert!(
+            nominal.lateral > lazy.lateral * 1.2,
+            "a slower heading rate must move less lateral ({}) vs ({})",
+            nominal.lateral,
+            lazy.lateral
+        );
+    }
+
+    #[test]
+    fn centre_to_edge_at_full_steer_takes_at_least_the_target_time() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        // Reference measurement speed: ~108 km/h, a typical race pace.
+        let bike = BikeSnapshot {
+            speed: 30.0,
+            ..BikeSnapshot::at_rest()
+        };
+        let mut ticks = 0usize;
+        let mut bike = bike;
+        while bike.lateral.abs() < 6.0 {
+            bike = step_bike(bike, intent_of(&[GameInput::SteerRight]), false, 0.0, dt);
+            ticks += 1;
+            assert!(ticks < 600, "the bike never reached the road edge");
+        }
+        let secs = ticks as f32 * dt;
+        assert!(
+            secs >= CENTRE_TO_EDGE_TARGET_SECS,
+            "centre-to-edge {secs:.2} s is short of the {CENTRE_TO_EDGE_TARGET_SECS:?} s target"
+        );
     }
 }

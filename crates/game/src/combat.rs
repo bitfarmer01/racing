@@ -94,6 +94,17 @@ pub const PUNCH_COST: f32 = 0.35;
 pub const KICK_COST: f32 = 0.25;
 /// Stamina a landed hit drains from the target.
 pub const HIT_STAMINA_DRAIN: f32 = 0.4;
+/// Ticks between a rival's wind-up pose starting and the hit landing: the
+/// telegraph. Long enough that the swing pose (same duration) is clearly
+/// visible before damage applies.
+pub const WINDUP_TICKS: u32 = 18;
+/// Seconds a rival in punch reach of the player holds the player's pace,
+/// so a fight stays joined long enough for the player to take part.
+pub const PACE_MATCH_SECS: f32 = 3.0;
+/// How many times a rider can be dismounted by hits in one race. Past the
+/// cap, instability and drains still hurt, but the rider stays in the
+/// saddle — a race is not a pile-up.
+pub const DISMOUNT_CAP: u32 = 1;
 /// Stamina regenerated per second while a rider neither attacks nor is hit.
 pub const STAMINA_REGEN: f32 = 0.1;
 /// Lateral shove a landed kick delivers, in meters.
