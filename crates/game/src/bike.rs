@@ -85,6 +85,14 @@ pub const CRASH_DRAG: f32 = 25.0;
 pub const CRASH_DURATION_SECS: f32 = 2.0;
 /// Going off-road above this speed is a crash, in meters per second.
 pub const OFFROAD_CRASH_SPEED: f32 = 30.0;
+/// Depth past the road edge, in meters, beyond which an off-road ride is a
+/// crash at any speed. Below [`OFFROAD_CRASH_SPEED`] the dirt is rideable,
+/// but nothing bounds the excursion: a hairpin overshoot at 18–30 m/s could
+/// carry the rider arbitrarily far off-world. Past this limit the sim calls
+/// it a crash, and recovery pulls the rider back to the tarmac — braking
+/// stays the skill way through a hairpin, but a flat-out overshoot never
+/// leaves the player lost off-world.
+pub const OFFROAD_EXCURSION_LIMIT_M: f32 = 5.0;
 
 /// Control state of one bike.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -302,11 +310,14 @@ pub fn step_bike_tuned(
 }
 
 /// The crash trigger, evaluated by the race driver after the lateral move:
-/// running off the tarmac above [`OFFROAD_CRASH_SPEED`] is a crash.
+/// running off the tarmac above [`OFFROAD_CRASH_SPEED`] is a crash, and so
+/// is riding deeper than [`OFFROAD_EXCURSION_LIMIT_M`] past the edge at any
+/// speed — the depth bound that keeps every excursion recoverable.
 pub fn should_crash(bike: &BikeSnapshot, half_width: f32) -> bool {
-    bike.control != Control::Crashed
-        && bike.is_off_road(half_width)
-        && bike.speed > OFFROAD_CRASH_SPEED
+    if bike.control == Control::Crashed || !bike.is_off_road(half_width) {
+        return false;
+    }
+    bike.speed > OFFROAD_CRASH_SPEED || bike.lateral.abs() > half_width + OFFROAD_EXCURSION_LIMIT_M
 }
 
 /// Put a bike into a crash.
@@ -680,6 +691,45 @@ mod tests {
         crash(&mut crashed);
         assert_eq!(crashed.control, Control::Crashed);
         assert_eq!(crashed.crash_timer, CRASH_DURATION_SECS);
+    }
+
+    #[test]
+    fn a_deep_excursion_crashes_at_dirt_speeds_where_the_speed_cap_left_it_unbounded() {
+        let half_width = 6.0;
+        // The 18-30 m/s window: the dirt is rideable, so a shallow
+        // excursion survives...
+        let shallow = BikeSnapshot {
+            speed: 25.0,
+            lateral: half_width + 2.0,
+            ..BikeSnapshot::at_rest()
+        };
+        assert!(
+            !should_crash(&shallow, half_width),
+            "a shallow dirt ride below the crash speed stays legal"
+        );
+        // ...but the excursion is bounded: deeper than the limit at any
+        // speed is a crash, so recovery pulls the rider back to the tarmac
+        // instead of leaving them lost off-world (the hairpin overshoot
+        // used to run the lateral unbounded through this window).
+        let deep = BikeSnapshot {
+            speed: 25.0,
+            lateral: half_width + OFFROAD_EXCURSION_LIMIT_M + 0.5,
+            ..BikeSnapshot::at_rest()
+        };
+        assert!(
+            should_crash(&deep, half_width),
+            "a deep excursion must crash at dirt speed"
+        );
+        // The depth bound is not a speed rule: it applies at walking pace.
+        let slow_deep = BikeSnapshot { speed: 5.0, ..deep };
+        assert!(should_crash(&slow_deep, half_width));
+        // And an already-crashed bike does not re-trigger.
+        let mut down = deep;
+        crash(&mut down);
+        assert!(
+            !should_crash(&down, half_width),
+            "a crashed bike cannot re-crash"
+        );
     }
 
     // ------------------------------------------------------------------
