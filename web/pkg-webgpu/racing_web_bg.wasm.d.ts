@@ -1,0 +1,34 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_browsergame_free: (a: number, b: number) => void;
+export const backend_name: (a: number) => void;
+export const browsergame_advance_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+export const browsergame_bike_count: (a: number) => number;
+export const browsergame_boot: (a: any, b: number) => any;
+export const browsergame_countdown_secs: (a: number) => number;
+export const browsergame_is_counting_down: (a: number) => number;
+export const browsergame_is_finished: (a: number) => number;
+export const browsergame_lap_index: (a: number) => number;
+export const browsergame_lap_length: (a: number) => number;
+export const browsergame_lap_progress: (a: number) => number;
+export const browsergame_player_distance: (a: number) => number;
+export const browsergame_player_stamina: (a: number) => number;
+export const browsergame_race_position: (a: number) => number;
+export const browsergame_restart: (a: number) => void;
+export const browsergame_rider_state: (a: number) => number;
+export const browsergame_speed_kmh: (a: number) => number;
+export const browsergame_total_laps: (a: number) => number;
+export const start: () => void;
+export const __wasm_bindgen_func_elem_1951: (a: number, b: number, c: number, d: any) => void;
+export const __wasm_bindgen_func_elem_1953: (a: number, b: number, c: any, d: any) => void;
+export const __wbindgen_export: (a: number, b: number) => number;
+export const __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_export3: (a: number, b: number, c: number) => void;
+export const __wbindgen_export4: (a: number) => void;
+export const __wbindgen_export5: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_export6: (a: number, b: number) => void;
+export const __wbindgen_add_to_stack_pointer: (a: number) => number;
+export const __wbindgen_export7: (a: number) => void;
+export const __wbindgen_start: () => void;
