@@ -70,3 +70,57 @@ impl AtlasDims {
         uv_rect_inset(rect, self.width, self.height, inset_px)
     }
 }
+
+/// The stated byte budget for the packed atlas (item 16-test), RGBA8 at 4
+/// bytes per pixel. The packer's 4096 px dimension cap alone would admit a
+/// 64 MB texture; this budget keeps the uploaded atlas well under that.
+/// Enforced by [`check_atlas_budget`], which the sprites tests run against
+/// the real packed atlas — an over-budget pack fails the suite instead of
+/// shipping.
+pub const MAX_ATLAS_BYTES: usize = 8 * 1024 * 1024;
+
+/// An atlas that exceeds [`MAX_ATLAS_BYTES`]: the packed byte size and the
+/// budget it blew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtlasTooLarge {
+    pub bytes: usize,
+    pub budget: usize,
+}
+
+/// Checks a packed atlas' byte size against the stated budget (item
+/// 16-test): the packer's 4096 px cap alone would allow a 64 MB RGBA8
+/// upload. Returns the RGBA8 size, or the over-budget facts. Pure.
+pub fn check_atlas_budget(dims: AtlasDims) -> Result<usize, AtlasTooLarge> {
+    let bytes = dims.width as usize * dims.height as usize * 4;
+    if bytes > MAX_ATLAS_BYTES {
+        return Err(AtlasTooLarge {
+            bytes,
+            budget: MAX_ATLAS_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_atlas_fails_the_budget_check() {
+        // 4096 px square — the packer's own dimension cap — is 64 MB of
+        // RGBA8: far over the stated budget, so the check must refuse it.
+        let huge = AtlasDims::new(4_096, 4_096);
+        assert_eq!(
+            check_atlas_budget(huge),
+            Err(AtlasTooLarge {
+                bytes: 64 * 1024 * 1024,
+                budget: MAX_ATLAS_BYTES,
+            })
+        );
+        // And a comfortably sized atlas passes with its byte size.
+        assert_eq!(
+            check_atlas_budget(AtlasDims::new(1_024, 1_024)),
+            Ok(4 * 1024 * 1024)
+        );
+    }
+}

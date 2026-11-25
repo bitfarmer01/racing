@@ -16,7 +16,9 @@ pub mod instance;
 pub mod sampling;
 pub mod tier;
 
-pub use atlas::{uv_rect, uv_rect_inset, AtlasDims};
+pub use atlas::{
+    check_atlas_budget, uv_rect, uv_rect_inset, AtlasDims, AtlasTooLarge, MAX_ATLAS_BYTES,
+};
 pub use batch::SpriteBatch;
 pub use camera::{
     instance_from_billboard, instance_rolled, push_projected, OrthoCamera, RoadPlacement,

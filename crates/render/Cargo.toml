@@ -22,3 +22,8 @@ wgpu = { version = "25.0.0", default-features = false, features = [
 bytemuck = { version = "1", features = ["derive"] }
 world = { path = "../world" }
 assets = { path = "../assets" }
+
+# Boot-log line to the browser console (gpu.rs `log_boot`, item 14). wasm32
+# only: native test hosts take the stderr arm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["console"] }

@@ -235,10 +235,6 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array!
     4 => Float32x4,
 ];
 
-/// Samples per pixel on the frame attachment. 4x kills road-edge
-/// stair-stepping at a cost every WebGL2 adapter (and SwiftShader) supports.
-const MSAA_SAMPLE_COUNT: u32 = 4;
-
 /// A warmed-up GPU renderer: surface, one sprite pipeline, one road pipeline,
 /// atlas texture, and fixed-capacity instance/road-vertex buffers. Built once
 /// at load (pipelines warm behind the loading screen per the blueprint), then
@@ -267,6 +263,12 @@ pub struct GpuRenderer {
     msaa_texture: wgpu::Texture,
     msaa_view: wgpu::TextureView,
     msaa_key: (u32, u32, wgpu::TextureFormat),
+    /// MSAA sample count for the attachment: the tier's choice (item 14).
+    sample_count: u32,
+    /// The tier the renderer was built for — the source of the sample count
+    /// and backing scale above, and of the instance cap.
+    #[allow(dead_code)]
+    tier: QualityTier,
 }
 
 impl GpuRenderer {
@@ -376,6 +378,12 @@ impl GpuRenderer {
         });
 
         let capacity = tier.max_instances();
+        // Item 14: the tier drives the backing size and the MSAA sample
+        // count. Log both at boot so a tier regression is visible in the
+        // console where the game runs.
+        let sample_count = tier.msaa_sample_count();
+        let backing = tier.scaled_size(size.0, size.1);
+        log_boot(tier, size, backing, sample_count);
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render.instances"),
             // The whole batch is one `write_buffer` per frame; the buffer is
@@ -426,7 +434,7 @@ impl GpuRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
+                count: sample_count,
                 ..wgpu::MultisampleState::default()
             },
             multiview: None,
@@ -497,7 +505,7 @@ impl GpuRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
+                count: sample_count,
                 ..wgpu::MultisampleState::default()
             },
             multiview: None,
@@ -508,8 +516,11 @@ impl GpuRenderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: capabilities.formats[0],
-            width: size.0.max(1),
-            height: size.1.max(1),
+            // Item 14: render at the tier's resolution scale — the canvas
+            // presents upscaled, trading softness for frame rate on the
+            // weak tiers.
+            width: backing.0.max(1),
+            height: backing.1.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: capabilities.alpha_modes[0],
             view_formats: vec![],
@@ -534,7 +545,7 @@ impl GpuRenderer {
         });
 
         let msaa_key = (config.width, config.height, config.format);
-        let (msaa_texture, msaa_view) = create_msaa_target(&device, msaa_key, MSAA_SAMPLE_COUNT);
+        let (msaa_texture, msaa_view) = create_msaa_target(&device, msaa_key, sample_count);
 
         Ok(Self {
             surface,
@@ -554,7 +565,21 @@ impl GpuRenderer {
             msaa_texture,
             msaa_view,
             msaa_key,
+            sample_count,
+            tier,
         })
+    }
+
+    /// The MSAA sample count the frame attachment renders with: the tier's
+    /// choice (item 14) — 1x on the low-end WebGL2 floor, 4x elsewhere.
+    pub fn msaa_sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    /// The backing size the render surface was configured at: the tier's
+    /// resolution scale applied to the canvas size (item 14).
+    pub fn backing_size(&self) -> (u32, u32) {
+        (self.msaa_key.0, self.msaa_key.1)
     }
 
     /// Uploads the road mesh, then draws the frame: one flat-color
@@ -627,9 +652,13 @@ impl GpuRenderer {
             frame.texture.height(),
             frame.texture.format(),
         );
-        if frame_key != self.msaa_key {
+        // At 1x MSAA there is no resolve step: wgpu rejects a resolve pair
+        // whose source and destination are both single-sample, so the low-end
+        // tier renders straight into the frame texture (item 14).
+        let multisampled = self.sample_count > 1;
+        if multisampled && frame_key != self.msaa_key {
             let (texture, msaa_view) =
-                create_msaa_target(&self.device, frame_key, MSAA_SAMPLE_COUNT);
+                create_msaa_target(&self.device, frame_key, self.sample_count);
             self.msaa_texture = texture;
             self.msaa_view = msaa_view;
             self.msaa_key = frame_key;
@@ -643,13 +672,20 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render.frame_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    resolve_target: Some(&view),
+                    // Multisampled tiers render into the MSAA buffer and
+                    // resolve into the frame; the 1x tier targets the frame
+                    // view directly and must keep its contents.
+                    view: if multisampled { &self.msaa_view } else { &view },
+                    resolve_target: if multisampled { Some(&view) } else { None },
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(BACKDROP_CLEAR),
                         // Resolved into the frame already; the multisample
                         // buffer itself is dead on store.
-                        store: wgpu::StoreOp::Discard,
+                        store: if multisampled {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -675,6 +711,18 @@ impl GpuRenderer {
         frame.present();
         Ok(())
     }
+}
+
+/// Logs the boot-time tier facts — tier, canvas size, backing size, MSAA
+/// sample count (item 14) — to the browser console on wasm and to stderr on
+/// the native test hosts. Never fails bring-up.
+fn log_boot(tier: QualityTier, canvas: (u32, u32), backing: (u32, u32), msaa: u32) {
+    let line =
+        format!("render boot: tier={tier:?} canvas={canvas:?} backing={backing:?} msaa={msaa}x");
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::log_1(&line.into());
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{line}");
 }
 
 /// Builds the draw pattern for a road mesh of `quads` flat-colored quads:
