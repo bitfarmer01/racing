@@ -4,6 +4,17 @@
 // context is created-or-resumed inside the CLICK TO RIDE engagement (browser
 // autoplay policy refuses audio before a user gesture). No wasm API changes.
 //
+// Wave 8.3 layer model (spec: .obvious/specs/wave8-sound.md): the engine is a
+// two-layer graph modeled on the Kawasaki Ninja H2/S's supercharged inline-4
+// — a sawtooth 'core' (the inline-4 throb) pitched by crankshaft RPM when the
+// drivetrain glue provides it (speed-derived fallback until Wave 8.2 lands),
+// plus a 'supercharger' whine sine locked at harmonic order 8 above the core,
+// its level building with revs and throttle load. The lowpass opens under
+// throttle (load-dependent timbre); event cues fire once per event under a
+// per-name 150 ms refractory and log to diagnostics().cues; the layered mix
+// is held inside the spec's loudness (0.030 RMS) and harshness (0.0009
+// 1–3 kHz band RMS) budgets at every speed.
+//
 // Engine tone shaping (playtest: high-speed engine read as a grating static
 // drone): the old chain was one sawtooth through a FIXED 900 Hz lowpass, so
 // at speed the sawtooth's upper harmonics (760/950 Hz at the ~190 Hz top
@@ -35,13 +46,19 @@ export class RaceAudio {
     this.engineOsc = null;
     this.engineGain = null;
     this.engineLowpass = null;
+    this.whineOsc = null;
+    this.whineGain = null;
     this.engineAnalyser = null;
     this.engineSpectrumBuf = null;
     this.pulseLfo = null;
     this.muted = false;
-    this.prevState = 0;
+    this.prevCrashed = false;
+    this.prevZone = null;
     this.prevStamina = 1;
     this.prevCountdown = null;
+    this.layers = [];
+    this.cues = [];
+    this.lastCueAt = {};
   }
 
   // Called from the first user-gesture engagement (click / keydown on the
@@ -135,6 +152,18 @@ export class RaceAudio {
       .connect(this.engineAnalyser)
       .connect(this.master);
     this.engineOsc.start();
+
+    // Supercharger whine: a sine locked at WHINE_ORDER times the core
+    // frequency — the centrifugal-blower signature riding on top of the
+    // throb. Mixed low into the shared tone stack ahead of the highshelf,
+    // so the harsh-band budget caps it.
+    this.whineOsc = this.ctx.createOscillator();
+    this.whineOsc.type = 'sine';
+    this.whineOsc.frequency.value = RaceAudio.WHINE_ORDER * 40;
+    this.whineGain = this.ctx.createGain();
+    this.whineGain.gain.value = 0;
+    this.whineOsc.connect(this.whineGain).connect(this.engineLowpass);
+    this.whineOsc.start();
   }
 
   // Engine frequency from the HUD's speed: 0 km/h sits at a 40 Hz idle,
@@ -143,17 +172,46 @@ export class RaceAudio {
     return 40 + Math.min(speedKmh, 180) * (150 / 180);
   }
 
+  // Supercharger whine sits at a fixed harmonic order above the core —
+  // order 8 lands the whine around 1–2 kHz at speed (spec allows 6–10).
+  static WHINE_ORDER = 8;
+  // Full throttle opens the lowpass by this much at fixed speed
+  // (load-dependent timbre; the spec requires ≥150 Hz).
+  static THROTTLE_CUTOFF_OPEN = 250;
+  // Per-name cue refractory: an event fires once, never per frame.
+  static CUE_REFRACTORY_SECS = 0.15;
+
+  // Core pitch from crankshaft RPM: 40 Hz idle → 210 Hz at the 12000
+  // redline (spec-locked mapping).
+  static coreFreq(rpm) {
+    return 40 + 170 * (Math.min(rpm, 12000) / 12000);
+  }
+
   // Lowpass cutoff from the same speed: bright at idle, tightening to ~620 Hz
   // at top speed so the grating upper partials roll off as speed rises.
   static engineCutoff(speedKmh) {
     return 1400 - Math.min(speedKmh, 180) * (780 / 180);
   }
 
-  // Engine level from the same speed. Slightly above the old curve (the
-  // tightened filter and shelf cut remove energy) so perceived loudness
-  // stays comparable instead of the fix just reading as "quieter".
+  // Engine level from speed. Retuned for the layered mix: the
+  // throttle-opened filter passes more of the core's upper harmonics, and
+  // the 1–3 kHz harsh-band budget (0.0009 band RMS at 180 km/h full
+  // throttle, measured by the offline harness) is set by the CORE's own
+  // partials there — the whine layer is already buried under the lowpass.
+  // So the core gives back headroom (about half the old curve at top
+  // speed): the budgets, not the old single-layer level, are the locked
+  // constraint the layers share.
   static engineBaseGain(speedKmh) {
-    return 0.046 + (Math.min(speedKmh, 180) / 180) * 0.066;
+    return 0.017 + (Math.min(speedKmh, 180) / 180) * 0.015;
+  }
+
+  // Supercharger whine level: builds with revs (core frequency stands in
+  // for blower speed) and with throttle load — ≥20% louder at full throttle
+  // than coast at fixed rpm. Kept small: the whine lands partly in the
+  // 1–3 kHz harshness band, so its mix is capped by the 0.0009 band budget.
+  static whineLevel(coreFreq, throttle) {
+    const load = throttle === 'accelerate' ? 1.6 : throttle === 'brake' ? 0.7 : 1.0;
+    return 0.0032 * (coreFreq / 210) * load;
   }
 
   // Mean linear magnitude of the engine spectrum in [lo, hi) Hz, from a
@@ -197,54 +255,139 @@ export class RaceAudio {
   // Per-frame update, fed exactly what the loader already reads for the HUD:
   // speedKmh (speed-value), state (rider_state bitmask), stamina
   // (stamina-fill), countingDown/countdownSecs (countdown overlay), paused,
-  // finished. Cue edges:
-  //   - bit 1 (crashed) rising  -> crash noise burst
+  // finished — plus the Wave 8.3 additive inputs rpm (crankshaft RPM from
+  // the 8.2 drivetrain glue; null/absent falls back to the speed-derived
+  // pitch), throttle ('coast' | 'accelerate' | 'brake', mirroring
+  // bike::Control) and zone (HUD zone id). Cue edges — each fires once per
+  // event under a 150 ms per-name refractory, logged in diagnostics().cues:
+  //   - bit 1 (crashed) rising   -> crash noise burst
+  //   - bit 1 (crashed) clearing -> recovery chirp (pick-the-bike-up beat)
   //   - stamina drop > 0.08 in one frame -> hit thud (a landed punch or kick)
+  //   - zone id change between frames -> soft two-note marker
   //   - countdown second change -> red-light beep, green light chirp
-  update({ speedKmh, state, stamina, countingDown, countdownSecs, paused, finished }) {
+  update({ speedKmh, state, stamina, countingDown, countdownSecs, paused, finished, rpm, throttle, zone }) {
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
+    const load = throttle === 'accelerate' || throttle === 'brake' ? throttle : 'coast';
 
-    // Engine tone follows the HUD speed; silent while paused/finished so the
-    // tone stops when the sim does.
-    const freq = RaceAudio.engineFreq(speedKmh);
-    this.engineOsc.frequency.setTargetAtTime(freq, t, 0.05);
-    // The filter closes as speed rises — the high-end softening.
-    const cutoff = RaceAudio.engineCutoff(speedKmh);
+    // Core pitch follows crankshaft RPM when the sim provides it — gear
+    // changes become audible dips — falling back to the speed-derived curve
+    // until the 8.2 glue getter lands.
+    const coreFreq = rpm == null ? RaceAudio.engineFreq(speedKmh) : RaceAudio.coreFreq(rpm);
+    this.engineOsc.frequency.setTargetAtTime(coreFreq, t, 0.05);
+    // The filter closes as speed rises and opens under throttle — the
+    // load-dependent timbre (full throttle ≥150 Hz brighter at fixed speed,
+    // coasting darkens).
+    const cutoff =
+      RaceAudio.engineCutoff(speedKmh) + (load === 'accelerate' ? RaceAudio.THROTTLE_CUTOFF_OPEN : 0);
     this.engineLowpass.frequency.setTargetAtTime(cutoff, t, 0.12);
     // Firing pulses: roughly one per four revolutions, clamped to a band
     // that reads as pulse rather than a second buzz.
     this.pulseLfo.frequency.setTargetAtTime(
-      Math.min(48, Math.max(8, freq / 4)),
+      Math.min(48, Math.max(8, coreFreq / 4)),
       t,
       0.1,
     );
     const running = !paused && !finished && this.ctx.state === 'running';
-    const engineGain = running ? RaceAudio.engineBaseGain(speedKmh) : 0;
-    this.engineGain.gain.setTargetAtTime(engineGain, t, 0.08);
+    const coreGain = running ? RaceAudio.engineBaseGain(speedKmh) : 0;
+    this.engineGain.gain.setTargetAtTime(coreGain, t, 0.08);
 
-    // Crash cue: crashed bit rising edge.
-    if ((state & 1) !== 0 && (this.prevState & 1) === 0) {
-      this.crash();
+    // Supercharger whine: order 8 above the core, building with revs and
+    // throttle load (a centrifugal blower makes boost with revs under
+    // power), silent whenever the engine is silent.
+    const whineFreq = coreFreq * RaceAudio.WHINE_ORDER;
+    this.whineOsc.frequency.setTargetAtTime(whineFreq, t, 0.05);
+    const whineGain = running ? RaceAudio.whineLevel(coreFreq, load) : 0;
+    this.whineGain.gain.setTargetAtTime(whineGain, t, 0.08);
+
+    // Probe surface: the layer levels the tests (and any browser-side
+    // probe) read back from diagnostics().
+    this.layers = [
+      { name: 'core', freq: coreFreq, gain: coreGain },
+      { name: 'supercharger', freq: whineFreq, gain: whineGain },
+    ];
+
+    // Crash cue: crashed bit rising edge. Recovery cue: the same bit
+    // clearing after a crash — the rider picking the bike back up.
+    const crashed = (state & 1) !== 0;
+    if (crashed && !this.prevCrashed) {
+      this.fireCue('crash', () => this.crash());
+    } else if (!crashed && this.prevCrashed) {
+      this.fireCue('recovery', () => this.recovery());
     }
-    this.prevState = state;
+    this.prevCrashed = crashed;
 
     // Hit cue: a sudden stamina drop is what a landed combat hit looks like
     // in the bar the shell already renders.
     if (this.prevStamina - stamina > 0.08) {
-      this.blip(110, 0.12, 'triangle', 0.5);
+      this.fireCue('hit', () => this.blip(110, 0.12, 'triangle', 0.5));
     }
     this.prevStamina = stamina;
+
+    // Zone cue: crossing into a new zone marks the crossing frame, not the
+    // frames spent inside the zone.
+    if (typeof zone === 'string') {
+      if (this.prevZone === null) {
+        this.prevZone = zone; // first frame establishes the starting zone
+      } else if (zone !== this.prevZone) {
+        this.prevZone = zone;
+        this.fireCue('zone', () => this.zoneMarker());
+      }
+    }
 
     // Countdown cue: beep each red-light second, higher chirp on the green.
     if (countingDown) {
       if (this.prevCountdown !== null && countdownSecs !== this.prevCountdown) {
-        this.blip(440, 0.15);
+        this.fireCue('countdown', () => this.blip(440, 0.15));
       }
       this.prevCountdown = countdownSecs;
     } else if (this.prevCountdown !== null) {
-      this.blip(880, 0.3); // green light
+      this.fireCue('green', () => this.blip(880, 0.3)); // green light
       this.prevCountdown = null;
+    }
+  }
+
+  // Fire a named cue exactly once per event: a per-name refractory guards
+  // against double-fires, and every fired cue lands in the ordered
+  // diagnostics().cues log (oldest first).
+  fireCue(name, play) {
+    const now = this.ctx.currentTime;
+    if (now - (this.lastCueAt[name] ?? -Infinity) < RaceAudio.CUE_REFRACTORY_SECS) return;
+    this.lastCueAt[name] = now;
+    this.cues.push({ name, at: now });
+    play();
+  }
+
+  // Recovery chirp: a short rising tone for the pick-the-bike-up beat.
+  recovery() {
+    if (!this.ctx) return;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    const t = this.ctx.currentTime;
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(330, t);
+    osc.frequency.exponentialRampToValueAtTime(880, t + 0.18);
+    g.gain.setValueAtTime(0.25, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(g).connect(this.master);
+    osc.start(t);
+    osc.stop(t + 0.2);
+  }
+
+  // Zone marker: a soft two-note figure — a landable chime, not a horn.
+  zoneMarker() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    for (const [freq, offset] of [[523.25, 0], [783.99, 0.1]]) {
+      const osc = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t + offset);
+      g.gain.setValueAtTime(0.16, t + offset);
+      g.gain.exponentialRampToValueAtTime(0.001, t + offset + 0.12);
+      osc.connect(g).connect(this.master);
+      osc.start(t + offset);
+      osc.stop(t + offset + 0.12);
     }
   }
 
@@ -276,13 +419,16 @@ export class RaceAudio {
   }
 
   // Probe/diagnostic surface: the live engine frequency, filter cutoff,
-  // context state and mute state.
+  // context state, mute state — plus the Wave 8.3 additions, the synthesis
+  // layers ({ name, freq, gain }) and the ordered cue log ({ name, at }).
   diagnostics() {
     return {
       state: this.ctx ? this.ctx.state : 'none',
       engineFreq: this.engineOsc ? this.engineOsc.frequency.value : null,
       engineCutoff: this.engineLowpass ? this.engineLowpass.frequency.value : null,
       muted: this.muted,
+      layers: this.layers.map((layer) => ({ ...layer })),
+      cues: this.cues.slice(),
     };
   }
 }
