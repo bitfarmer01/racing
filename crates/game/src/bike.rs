@@ -11,9 +11,10 @@ use crate::input::{Intent, Steer, Throttle};
 
 /// Top speed on tarmac, in meters per second (~216 km/h).
 pub const MAX_SPEED: f32 = 60.0;
-/// Throttle acceleration at the line, in meters per second squared. The
-/// launch pull tapers to [`SHIFT_ACCEL`] at [`LAUNCH_SPEED`], then the
-/// top-gear tail below takes over.
+/// Reference low-speed launch pull, in meters per second squared. The
+/// gearbox's first gear peaks above it ([`GEAR_PEAK_PULLS`]); rivals'
+/// rubber-band pacing still keys off this figure, so its meaning as the
+/// low-speed launch pull is kept stable.
 pub const ACCEL: f32 = 18.0;
 /// Brake deceleration, in meters per second squared.
 pub const BRAKE_DECEL: f32 = 35.0;
@@ -78,6 +79,24 @@ pub const LAUNCH_SPEED: f32 = 33.0;
 /// MAX_SPEED)` — a long tail that brings top speed in down the road, not
 /// off the line.
 pub const SHIFT_ACCEL: f32 = 5.0;
+/// Gear band tops, in m/s: gear `g` (1-based) pulls across
+/// `[GEAR_BAND_TOPS[g-2], GEAR_BAND_TOPS[g-1])` (gear 1 starts at 0) and
+/// top gear's band ends at [`MAX_SPEED`], so top speed never moves with
+/// the gearbox. The off-road cap ([`OFFROAD_MAX_SPEED`] = 18 m/s) keeps
+/// dirt riding inside gears 1–2, and crash recovery at ≤ half top speed
+/// re-enters in gears 1–3.
+pub const GEAR_BAND_TOPS: [f32; 6] = [14.0, 22.0, 30.0, 39.0, 49.0, MAX_SPEED];
+/// Peak wheel pull of gears 1–5 at their band floors, in m/s². Top gear is
+/// not in the table: it carries the old top-speed tail ([`SHIFT_ACCEL`]-shaped,
+/// → 0 at [`MAX_SPEED`]) so end-of-run pacing is untouched by the gearbox.
+pub const GEAR_PEAK_PULLS: [f32; 5] = [20.0, 16.5, 13.5, 10.5, 7.5];
+/// Redline, in RPM (Ninja H2/S-inspired inline-4, matching the audio
+/// design intent).
+pub const REDLINE_RPM: f32 = 14_000.0;
+/// Displayed engine speed at a band floor, as a fraction of redline: each
+/// gear's RPM sweeps ~40% → 100% across its band, so a shift drops the
+/// needle the way a real box does.
+pub const RPM_FLOOR_FRACTION: f32 = 0.4;
 /// How hard the bike scrubs speed while sliding in a crash, in meters per
 /// second squared.
 pub const CRASH_DRAG: f32 = 25.0;
@@ -109,8 +128,16 @@ pub enum Control {
 }
 
 /// Snapshot of everything the state machine owns for one bike.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BikeSnapshot {
+    /// Current gear, 1-based. Derived from speed every tick: the
+    /// automatic box is a pure function of speed, so a crash recovered at
+    /// low speed re-enters in the band that covers the recovery speed
+    /// (gears 1–3 at the half-top-speed recovery bound).
+    pub gear: u8,
+    /// Engine speed within the gear's band, in `[0, 1]` — the HUD
+    /// multiplies it out to a percent of [`REDLINE_RPM`].
+    pub rpm: f32,
     /// Forward speed, in meters per second.
     pub speed: f32,
     /// Lateral position across the road, in meters (negative is left).
@@ -133,6 +160,24 @@ pub struct BikeSnapshot {
     pub heading: f32,
 }
 
+// Manual `Default` so a stationary bike sits in gear 1 at the band floor
+// (a `0` gear would read as a false neutral on the HUD).
+impl Default for BikeSnapshot {
+    fn default() -> Self {
+        Self {
+            speed: 0.0,
+            lateral: 0.0,
+            control: Control::Coast,
+            crash_timer: 0.0,
+            lean: 0.0,
+            steer_hold: 0.0,
+            heading: 0.0,
+            gear: 1,
+            rpm: 0.0,
+        }
+    }
+}
+
 impl BikeSnapshot {
     /// A stationary, upright bike on the centreline.
     pub fn at_rest() -> Self {
@@ -144,6 +189,55 @@ impl BikeSnapshot {
     pub fn is_off_road(&self, half_width: f32) -> bool {
         self.lateral.abs() > half_width
     }
+}
+
+/// The 1-based gear whose band covers `speed`: the automatic box upshifts
+/// the moment full throttle carries the engine past a band top (redline)
+/// and downshifts the moment braking or coasting drops it below a band
+/// floor — both fall out of re-deriving the gear from speed each tick.
+pub fn gear_for(speed: f32) -> u8 {
+    let mut gear: u8 = 1;
+    while gear < 6 && speed >= GEAR_BAND_TOPS[usize::from(gear) - 1] {
+        gear += 1;
+    }
+    gear
+}
+
+/// Normalized engine speed within the current gear's band, in `[0, 1]`.
+pub fn band_fraction(speed: f32) -> f32 {
+    let gear = usize::from(gear_for(speed));
+    let floor = if gear == 1 {
+        0.0
+    } else {
+        GEAR_BAND_TOPS[gear - 2]
+    };
+    ((speed - floor) / (GEAR_BAND_TOPS[gear - 1] - floor)).clamp(0.0, 1.0)
+}
+
+/// Wheel pull at `speed`, in m/s²: the current gear's peak pull shaped by
+/// the torque curve; top gear carries the pre-gearbox top-speed tail so
+/// top speed and end-of-run pacing never moved with the gearbox.
+pub fn wheel_pull(speed: f32) -> f32 {
+    let gear = usize::from(gear_for(speed));
+    let pull = if gear == 6 {
+        SHIFT_ACCEL * (1.0 - speed / MAX_SPEED) / (1.0 - LAUNCH_SPEED / MAX_SPEED)
+    } else {
+        GEAR_PEAK_PULLS[gear - 1] * torque_factor(band_fraction(speed))
+    };
+    pull.max(0.0)
+}
+
+/// Torque curve across a rev band: flat to 35% of the band, then a
+/// quadratic fall to 55% of peak at redline.
+fn torque_factor(x: f32) -> f32 {
+    let droop = ((x - 0.35) / 0.65).max(0.0);
+    1.0 - 0.45 * droop * droop
+}
+
+/// Displayed engine speed as a percent of [`REDLINE_RPM`] for a band
+/// fraction: each gear sweeps ~40% → 100% of redline across its band.
+pub fn rpm_percent(band: f32) -> f32 {
+    (RPM_FLOOR_FRACTION + (1.0 - RPM_FLOOR_FRACTION) * band.clamp(0.0, 1.0)) * 100.0
 }
 
 /// Steering feel, so a test can vary one factor at a time: [`step_bike`]
@@ -209,6 +303,11 @@ pub fn step_bike_tuned(
         if bike.crash_timer == 0.0 {
             bike.control = Control::Coast;
         }
+        // The gearbox follows the scrubbing speed, so a rider recovered
+        // at ≤ half top speed re-enters in gears 1–3 and the HUD never
+        // shows a stale rev band through the slide.
+        bike.gear = gear_for(bike.speed);
+        bike.rpm = band_fraction(bike.speed);
         return bike;
     }
 
@@ -225,14 +324,11 @@ pub fn step_bike_tuned(
     };
     bike.speed = match bike.control {
         Control::Accelerate => {
-            // Launch pull tapering to the shift point, then a long
-            // top-gear tail: the last stretch of top speed arrives down
-            // the road, not off the line.
-            let pull = if bike.speed < LAUNCH_SPEED {
-                ACCEL + (SHIFT_ACCEL - ACCEL) * (bike.speed / LAUNCH_SPEED)
-            } else {
-                SHIFT_ACCEL * (1.0 - bike.speed / MAX_SPEED) / (1.0 - LAUNCH_SPEED / MAX_SPEED)
-            };
+            // The gearbox: per-gear peak pull shaped by the torque curve,
+            // upshifting at each band top; top gear carries the old
+            // top-speed tail, so the last stretch of top speed arrives
+            // down the road exactly as before.
+            let pull = wheel_pull(bike.speed);
             let next = bike.speed + pull * dt;
             if off_road && next > speed_cap {
                 // Too fast for the dirt: heavy drag pulls the bike back down.
@@ -305,6 +401,11 @@ pub fn step_bike_tuned(
         .clamp(0.0, CORNER_LEAN_FRACTION);
     let target_lean = (steer_lean + corner_lean).clamp(-1.0, 1.0) * LEAN_MAX;
     bike.lean += (target_lean - bike.lean).clamp(-LEAN_RATE * dt, LEAN_RATE * dt);
+
+    // The readout rides the same tick as the physics: gear and rev band
+    // re-derive from the post-step speed, so the HUD never runs ahead.
+    bike.gear = gear_for(bike.speed);
+    bike.rpm = band_fraction(bike.speed);
 
     bike
 }
@@ -453,6 +554,8 @@ mod tests {
             lean: 0.0,
             steer_hold: 0.0,
             heading: 0.0,
+            gear: 1,
+            rpm: 0.0,
         };
         let speed_before = bike.speed;
         bike = stepped(bike, &[GameInput::SteerRight, GameInput::Accelerate], true);
@@ -474,6 +577,8 @@ mod tests {
             lean: 0.0,
             steer_hold: 0.0,
             heading: 0.0,
+            gear: 1,
+            rpm: 0.0,
         };
         bike = stepped(bike, &[], false);
         assert_eq!(bike.control, Control::Coast, "timer expired this tick");
@@ -663,6 +768,8 @@ mod tests {
             crash_timer: 1.0,
             steer_hold: 0.0,
             heading: 0.0,
+            gear: 1,
+            rpm: 0.0,
         };
         let bike = step_bike(down, Intent::default(), false, 0.0, dt);
         assert!(bike.lean.abs() < 0.3, "crash settles the bank");
