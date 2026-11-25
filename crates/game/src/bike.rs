@@ -799,4 +799,106 @@ mod tests {
             "centre-to-edge {secs:.2} s is short of the {CENTRE_TO_EDGE_TARGET_SECS:?} s target"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Wave 8.2 spec — drivetrain (.obvious/specs/wave8-drivetrain.md).
+    // Red-first: these describe the gearbox the tick must gain; they
+    // fail on the current single-ratio thrust until it ships.
+    // ------------------------------------------------------------------
+
+    /// Full-throttle run from rest: speed after each of `ticks` ticks at
+    /// the 60 Hz sim rate.
+    fn full_throttle_run(ticks: usize) -> Vec<f32> {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let mut bike = BikeSnapshot::at_rest();
+        let mut speeds = vec![bike.speed];
+        for _ in 0..ticks {
+            bike = step_bike(bike, intent_of(&[GameInput::Accelerate]), false, 0.0, dt);
+            speeds.push(bike.speed);
+        }
+        speeds
+    }
+
+    /// Per-tick acceleration along a run, in m/s².
+    fn accel_profile(speeds: &[f32]) -> Vec<f32> {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        speeds.windows(2).map(|w| (w[1] - w[0]) / dt).collect()
+    }
+
+    /// Speed at each gear shift the profile shows. A shift is a sharp
+    /// recovery: the pull sags at least 25% off its running peak through
+    /// the top of a rev band, then jumps at least 25% above the sag
+    /// floor. The single-ratio thrust only ever tapers, so it detects
+    /// nothing.
+    fn shift_speeds(speeds: &[f32], accel: &[f32]) -> Vec<f32> {
+        const SAG_FRACTION: f32 = 0.25;
+        const RECOVERY_FRACTION: f32 = 1.25;
+        let mut shifts = Vec::new();
+        let mut band_peak = accel.first().copied().unwrap_or(0.0);
+        let mut sag_floor = f32::INFINITY;
+        let mut sagged = false;
+        for (i, &a) in accel.iter().enumerate() {
+            band_peak = band_peak.max(a);
+            if !sagged {
+                if a < band_peak * (1.0 - SAG_FRACTION) {
+                    sagged = true;
+                    sag_floor = a;
+                }
+            } else {
+                sag_floor = sag_floor.min(a);
+                if a > sag_floor * RECOVERY_FRACTION {
+                    shifts.push(speeds[i + 1]);
+                    band_peak = a;
+                    sagged = false;
+                }
+            }
+        }
+        shifts
+    }
+
+    #[test]
+    fn full_throttle_acceleration_rises_through_distinct_gear_bands() {
+        // 20 s of held throttle: past every shift and into the tail.
+        let speeds = full_throttle_run(1_200);
+        let shifts = shift_speeds(&speeds, &accel_profile(&speeds));
+        assert!(
+            shifts.len() >= 2,
+            "a multi-gear drivetrain recovers the pull at each shift; the \
+             single-ratio thrust only tapers (shifts at {shifts:?})"
+        );
+    }
+
+    #[test]
+    fn gear_shifts_occur_at_speed_boundaries_not_at_the_extremes() {
+        let speeds = full_throttle_run(1_200);
+        let shifts = shift_speeds(&speeds, &accel_profile(&speeds));
+        assert!(
+            !shifts.is_empty(),
+            "the gearbox shifts up through its rev bands; nothing shifts \
+             on the single-ratio thrust"
+        );
+        for &speed in &shifts {
+            assert!(
+                (12.0..=50.0).contains(&speed),
+                "shift at {speed} m/s is outside the road range: no shift \
+                 at a crawl, and top gear owns the top end"
+            );
+        }
+    }
+
+    #[test]
+    fn full_throttle_reaches_100_kmh_within_the_gearbox_launch_target() {
+        let dt = sim::clock::TICK_DURATION_SECS as f32;
+        let speeds = full_throttle_run(600);
+        let hit = speeds
+            .iter()
+            .position(|&s| s >= 100.0 / 3.6)
+            .expect("a full-throttle run reaches 100 km/h");
+        let secs = hit as f32 * dt;
+        assert!(
+            secs < 2.2,
+            "0-100 km/h in {secs:.2} s misses the 2.2 s gearbox launch \
+             target — first gear must out-pull the single-ratio launch"
+        );
+    }
 }
