@@ -5,6 +5,7 @@ use sim::rng::XorShift64;
 
 use crate::ai::Rival;
 use crate::bike::{wrap_angle, Bike, Controls, Tuning};
+use crate::difficulty::Difficulty;
 use crate::track::{Track, TrackDef};
 
 pub const DT: f32 = 1.0 / 120.0;
@@ -19,7 +20,27 @@ pub const SWING_SECS: f32 = 0.42;
 const SWING_HIT_AT: f32 = 0.16;
 const ATTACK_COOLDOWN: f32 = 0.55;
 const HIT_DAMAGE: f32 = 36.0;
+/// Kick: a longer wind-up you can see coming, more reach, more damage.
+pub const KICK_SECS: f32 = 0.62;
+const KICK_HIT_AT: f32 = 0.3;
+const KICK_COOLDOWN: f32 = 1.1;
+const KICK_DAMAGE: f32 = 52.0;
 const BALANCE_REGEN: f32 = 9.0;
+/// Guard: how fast it comes up, how much of a hit it soaks, and how soon
+/// after raising it a hit is parried instead.
+const GUARD_RISE: f32 = 9.0;
+const GUARD_SOAK: f32 = 0.25;
+pub const PARRY_WINDOW: f32 = 0.22;
+const PARRY_PUNISH: f32 = 34.0;
+const PARRY_STUN: f32 = 1.0;
+/// While the guard is up the rider sits up: less drive, no boost.
+const GUARD_THROTTLE: f32 = 0.82;
+/// Throttle on the line that gives a perfect start (revs in the green).
+pub const LAUNCH_SWEET: (f32, f32) = (0.55, 0.82);
+/// Above this the rear tyre lights up at the green.
+pub const LAUNCH_SPIN: f32 = 0.92;
+/// Boost for gaining a place.
+const OVERTAKE_BOOST: f32 = 0.05;
 
 pub const RIVAL_NAMES: [&str; RIVAL_COUNT] =
     ["Vex", "Kato", "Marlow", "Juno", "Brask", "Silva", "Reyes"];
@@ -38,15 +59,50 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EventKind {
-    WallHit { speed: f32 },
-    BikeContact { speed: f32 },
-    Hit { attacker: usize },
+    WallHit {
+        speed: f32,
+    },
+    BikeContact {
+        speed: f32,
+    },
+    /// A strike landed clean on this bike.
+    Hit {
+        attacker: usize,
+        kick: bool,
+    },
+    /// This bike's guard soaked a strike.
+    Blocked {
+        attacker: usize,
+    },
+    /// This bike's guard went up just in time and turned the strike back.
+    Parried {
+        attacker: usize,
+    },
+    /// This bike's rider put `victim` on the ground.
+    KnockOff {
+        victim: usize,
+    },
+    /// This bike left the line: perfectly, or in a cloud of wheelspin.
+    Launch {
+        perfect: bool,
+    },
     Crash,
-    Landed { speed: f32 },
-    LapComplete { lap: u32, time: f32 },
-    Finished { position: usize },
-    Overtake { gained: bool },
-    CountdownBeep { n: u32 },
+    Landed {
+        speed: f32,
+    },
+    LapComplete {
+        lap: u32,
+        time: f32,
+    },
+    Finished {
+        position: usize,
+    },
+    Overtake {
+        gained: bool,
+    },
+    CountdownBeep {
+        n: u32,
+    },
     Go,
 }
 
@@ -54,6 +110,28 @@ pub enum EventKind {
 pub struct Event {
     pub bike: usize,
     pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strike {
+    Punch,
+    Kick,
+}
+
+impl Strike {
+    pub fn secs(self) -> f32 {
+        match self {
+            Strike::Punch => SWING_SECS,
+            Strike::Kick => KICK_SECS,
+        }
+    }
+
+    fn hit_at(self) -> f32 {
+        match self {
+            Strike::Punch => SWING_HIT_AT,
+            Strike::Kick => KICK_HIT_AT,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,10 +147,19 @@ pub struct Racer {
     pub swing: f32,
     pub swing_side: f32,
     pub swing_landed: bool,
+    pub swing_kind: Strike,
     pub attack_cooldown: f32,
+    /// 0..1 guard; `guard_held` counts seconds since it went up.
+    pub guard: f32,
+    pub guard_held: f32,
+    /// Rival guard: seconds until it goes up, then seconds to hold it.
+    pub ai_guard_in: f32,
+    pub ai_guard_hold: f32,
     pub wrong_way: f32,
     pub hits_landed: u32,
     pub knockdowns: u32,
+    pub knockoffs: u32,
+    pub parries: u32,
 }
 
 impl Racer {
@@ -88,10 +175,17 @@ impl Racer {
             swing: 0.0,
             swing_side: 1.0,
             swing_landed: false,
+            swing_kind: Strike::Punch,
             attack_cooldown: 0.0,
+            guard: 0.0,
+            guard_held: 0.0,
+            ai_guard_in: -1.0,
+            ai_guard_hold: 0.0,
             wrong_way: 0.0,
             hits_landed: 0,
             knockdowns: 0,
+            knockoffs: 0,
+            parries: 0,
         }
     }
 
@@ -102,6 +196,15 @@ impl Racer {
 
     pub fn swinging(&self) -> bool {
         self.swing > 0.0
+    }
+
+    /// 0..1 through the current strike, if any.
+    pub fn swing_phase(&self) -> Option<f32> {
+        (self.swing > 0.0).then(|| 1.0 - self.swing / self.swing_kind.secs())
+    }
+
+    pub fn guarding(&self) -> bool {
+        self.guard > 0.5
     }
 }
 
@@ -117,6 +220,11 @@ pub struct Race {
     /// Bike indices by race position (leader first).
     pub order: Vec<usize>,
     pub events: Vec<Event>,
+    pub difficulty: Difficulty,
+    /// Chance a rival raises its guard against a strike it sees coming.
+    pub guard_chance: f32,
+    /// Engine power each bike started with, before catch-up.
+    base_power: Vec<f32>,
     rng: XorShift64,
     last_player_place: usize,
     beeps: u32,
@@ -124,10 +232,18 @@ pub struct Race {
 
 impl Race {
     pub fn new(def: TrackDef, seed: u64) -> Self {
-        Self::with_track(Track::build(def), seed)
+        Self::with_difficulty(def, seed, Difficulty::Normal)
+    }
+
+    pub fn with_difficulty(def: TrackDef, seed: u64, difficulty: Difficulty) -> Self {
+        Self::with_track_and_difficulty(Track::build(def), seed, difficulty)
     }
 
     pub fn with_track(track: Track, seed: u64) -> Self {
+        Self::with_track_and_difficulty(track, seed, Difficulty::Normal)
+    }
+
+    pub fn with_track_and_difficulty(track: Track, seed: u64, difficulty: Difficulty) -> Self {
         let mut rng = XorShift64::new(seed);
         let n = RIVAL_COUNT + 1;
         let mut bikes = Vec::with_capacity(n);
@@ -144,14 +260,20 @@ impl Race {
             } else {
                 // Front of the grid is quicker; every rival differs a little.
                 let quality = 1.0 - row / n as f32;
+                let pace = difficulty.rival_pace();
                 let tuning = Tuning {
-                    power: 0.93 + 0.07 * quality + rng.next_f32_in(-0.02, 0.02),
+                    power: (0.93 + 0.07 * quality + rng.next_f32_in(-0.02, 0.02)) * pace,
                     grip: 0.95 + 0.05 * quality,
-                    top_speed: 0.95 + 0.05 * quality + rng.next_f32_in(-0.01, 0.01),
+                    top_speed: (0.95 + 0.05 * quality + rng.next_f32_in(-0.01, 0.01)) * pace,
                 };
                 let lane = rng.next_f32_in(-0.9, 0.9);
-                let commitment = 0.80 + 0.14 * quality + rng.next_f32_in(-0.02, 0.02);
-                let aggression = rng.next_f32_in(0.25, 0.95);
+                let commitment = (0.80
+                    + 0.14 * quality
+                    + rng.next_f32_in(-0.02, 0.02)
+                    + difficulty.rival_nerve())
+                .clamp(0.7, 0.97);
+                let aggression =
+                    (rng.next_f32_in(0.25, 0.95) * difficulty.rival_aggression()).min(1.0);
                 (tuning, Some(Rival::new(lane, commitment, aggression)))
             };
             bikes.push(Bike::new(&track, s, lateral, tuning));
@@ -164,6 +286,7 @@ impl Race {
             rivals.push(rival);
         }
         let laps = track.def.laps;
+        let base_power = bikes.iter().map(|b| b.tuning.power).collect();
         let mut race = Self {
             track,
             bikes,
@@ -174,6 +297,9 @@ impl Race {
             laps,
             order: (0..n).collect(),
             events: Vec::with_capacity(32),
+            difficulty,
+            guard_chance: difficulty.rival_guard(),
+            base_power,
             rng,
             last_player_place: n,
             beeps: 0,
@@ -211,6 +337,7 @@ impl Race {
                 if t >= COUNTDOWN_SECS {
                     self.phase = Phase::Racing;
                     self.push(PLAYER, EventKind::Go);
+                    self.launch(player_input.throttle);
                 } else {
                     self.phase = Phase::Countdown { t };
                     // Revving on the line: wheels held.
@@ -234,6 +361,50 @@ impl Race {
         self.rank();
     }
 
+    /// The green light: a throttle held in the sweet spot fires the bike off
+    /// the line; a pinned throttle spins the rear tyre. Rivals launch well
+    /// more often on harder levels.
+    fn launch(&mut self, player_throttle: f32) {
+        let good_odds = match self.difficulty {
+            Difficulty::Easy => 0.2,
+            Difficulty::Normal => 0.35,
+            Difficulty::Hard => 0.55,
+        };
+        for i in 0..self.bikes.len() {
+            let perfect = if i == PLAYER {
+                let t = player_throttle;
+                if t > LAUNCH_SPIN {
+                    Some(false)
+                } else if (LAUNCH_SWEET.0..=LAUNCH_SWEET.1).contains(&t) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else {
+                let roll = self.rng.next_f32();
+                if roll < good_odds {
+                    Some(true)
+                } else if roll > 0.93 {
+                    Some(false)
+                } else {
+                    None
+                }
+            };
+            let b = &mut self.bikes[i];
+            match perfect {
+                Some(true) => {
+                    b.vel = b.fwd() * 7.0;
+                    b.boost = (b.boost + 0.2).min(1.0);
+                }
+                Some(false) => b.wheelspin = 0.9,
+                None => {}
+            }
+            if let (true, Some(p)) = (i == PLAYER, perfect) {
+                self.push(PLAYER, EventKind::Launch { perfect: p });
+            }
+        }
+    }
+
     fn push(&mut self, bike: usize, kind: EventKind) {
         self.events.push(Event { bike, kind });
     }
@@ -250,27 +421,48 @@ impl Race {
                     (0..n).filter(|&j| j != i).map(|j| &self.bikes[j]).collect();
                 let rival = self.rivals[i].get_or_insert_with(|| Rival::new(0.0, 0.88, 0.0));
                 let mut c = rival.drive(&self.bikes[i], &others, &self.track, DT, roll);
-                // Mild catch-up: rivals far behind the player push harder,
-                // rivals far ahead ease off. Never decisive.
+                // Catch-up, set by the difficulty: never decisive.
                 let gap = self.racers[PLAYER].progress - self.racers[i].progress;
                 if i != PLAYER {
-                    let t = &mut self.bikes[i].tuning;
-                    let base = t.power.clamp(0.85, 1.08);
-                    t.power = if gap > 120.0 {
-                        base.max(1.04)
-                    } else if gap < -160.0 {
-                        base.min(0.94)
-                    } else {
-                        base
-                    };
+                    self.bikes[i].tuning.power = self.base_power[i] * self.difficulty.catch_up(gap);
                 }
+                // A rival's guard goes up when it saw a strike coming.
+                let r = &mut self.racers[i];
+                if r.ai_guard_in >= 0.0 {
+                    r.ai_guard_in -= DT;
+                    if r.ai_guard_in < 0.0 {
+                        r.ai_guard_hold = 0.6;
+                    }
+                }
+                r.ai_guard_hold = (r.ai_guard_hold - DT).max(0.0);
+                c.block = r.ai_guard_hold > 0.0;
                 if self.racers[i].finish_time.is_some() {
                     c.throttle *= 0.55;
                     c.attack = false;
+                    c.kick = false;
                     c.boost = false;
                 }
                 c
             };
+            // Guard: comes up fast, and while it's up the rider sits up.
+            let mut controls = controls;
+            let r = &mut self.racers[i];
+            let want_guard = controls.block && self.bikes[i].is_riding();
+            if want_guard {
+                if r.guard <= 0.0 {
+                    r.guard_held = 0.0;
+                }
+                r.guard = (r.guard + GUARD_RISE * DT).min(1.0);
+                r.guard_held += DT;
+            } else {
+                r.guard = (r.guard - GUARD_RISE * DT).max(0.0);
+            }
+            if r.guarding() {
+                controls.throttle *= GUARD_THROTTLE;
+                controls.boost = false;
+                controls.attack = false;
+                controls.kick = false;
+            }
             // Slipstream: tucked in behind another bike.
             let me = &self.bikes[i];
             let mut drafting = false;
@@ -293,8 +485,10 @@ impl Race {
             if drafting {
                 bike.boost = (bike.boost + 0.06 * DT).min(1.0);
             }
-            if controls.attack && bike.is_riding() {
-                self.start_swing(i);
+            if controls.kick && bike.is_riding() {
+                self.start_swing(i, Strike::Kick);
+            } else if controls.attack && bike.is_riding() {
+                self.start_swing(i, Strike::Punch);
             }
             let bike = &mut self.bikes[i];
             let fx = bike.step(&self.track, &controls, DT);
@@ -311,11 +505,12 @@ impl Race {
         }
     }
 
-    fn start_swing(&mut self, i: usize) {
+    fn start_swing(&mut self, i: usize, kind: Strike) {
         let r = &mut self.racers[i];
         if r.swing > 0.0 || r.attack_cooldown > 0.0 {
             return;
         }
+        let mut target = None;
         // Swing towards the nearest bike alongside (default: right).
         let me = &self.bikes[i];
         let mut side = 1.0;
@@ -328,6 +523,7 @@ impl Race {
             let d = rel.length();
             if d < best && d < 4.0 {
                 best = d;
+                target = Some(j);
                 side = if rel.dot(me.right()) >= 0.0 {
                     1.0
                 } else {
@@ -336,10 +532,28 @@ impl Race {
             }
         }
         let r = &mut self.racers[i];
-        r.swing = SWING_SECS;
+        r.swing = kind.secs();
+        r.swing_kind = kind;
         r.swing_side = side;
         r.swing_landed = false;
-        r.attack_cooldown = ATTACK_COOLDOWN + SWING_SECS;
+        r.attack_cooldown = kind.secs()
+            + match kind {
+                Strike::Punch => ATTACK_COOLDOWN,
+                Strike::Kick => KICK_COOLDOWN,
+            };
+        // A rival that sees it coming may get its guard up, early enough
+        // to parry or a beat too late.
+        if let Some(j) = target {
+            let roll = self.rng.next_f32();
+            let t = &mut self.racers[j];
+            if j != PLAYER
+                && roll < self.guard_chance
+                && t.ai_guard_hold <= 0.0
+                && t.ai_guard_in < 0.0
+            {
+                t.ai_guard_in = self.rng.next_f32_in(0.0, kind.hit_at() + 0.05);
+            }
+        }
     }
 
     fn combat(&mut self) {
@@ -354,14 +568,19 @@ impl Race {
             if r.swing <= 0.0 {
                 continue;
             }
+            let kind = r.swing_kind;
             let before = r.swing;
             r.swing = (r.swing - DT).max(0.0);
-            let elapsed = SWING_SECS - r.swing;
-            let crossed = SWING_SECS - before < SWING_HIT_AT && elapsed >= SWING_HIT_AT;
+            let total = kind.secs();
+            let crossed = total - before < kind.hit_at() && total - r.swing >= kind.hit_at();
             if !crossed || r.swing_landed || !self.bikes[i].is_riding() {
                 continue;
             }
             let side = r.swing_side;
+            let reach = match kind {
+                Strike::Punch => 0.3..2.7,
+                Strike::Kick => 0.3..3.1,
+            };
             let me = self.bikes[i].clone();
             for j in 0..n {
                 if j == i || !self.bikes[j].is_solid() {
@@ -370,27 +589,76 @@ impl Race {
                 let rel = self.bikes[j].pos2() - me.pos2();
                 let along = rel.dot(me.fwd());
                 let across = rel.dot(me.right()) * side;
-                if along.abs() < 1.9 && (0.3..2.7).contains(&across) {
-                    self.racers[i].swing_landed = true;
-                    self.racers[i].hits_landed += 1;
-                    self.bikes[i].boost = (self.bikes[i].boost + 0.12).min(1.0);
-                    let target = &mut self.bikes[j];
-                    let shove = me.right() * side * 3.2;
-                    target.vel += shove;
-                    target.yaw_rate += side * 0.6;
-                    let tr = &mut self.racers[j];
-                    tr.balance -= HIT_DAMAGE;
-                    tr.since_hit = 0.0;
-                    self.push(j, EventKind::Hit { attacker: i });
-                    if self.racers[j].balance <= 0.0 {
-                        self.racers[j].balance = 100.0;
-                        self.racers[j].knockdowns += 1;
-                        self.bikes[j].crash();
-                        self.push(j, EventKind::Crash);
-                    }
+                if along.abs() < 1.9 && reach.contains(&across) {
+                    self.strike(i, j, kind, side);
                     break;
                 }
             }
+        }
+    }
+
+    /// Strike `i` reaches bike `j`: parried, blocked, or clean.
+    fn strike(&mut self, i: usize, j: usize, kind: Strike, side: f32) {
+        self.racers[i].swing_landed = true;
+        let (guard, held) = (self.racers[j].guarding(), self.racers[j].guard_held);
+        if guard && held <= PARRY_WINDOW {
+            // Parry: the strike bounces back on the attacker.
+            self.racers[j].parries += 1;
+            self.bikes[j].boost = (self.bikes[j].boost + 0.1).min(1.0);
+            let a = &mut self.racers[i];
+            a.attack_cooldown = a.attack_cooldown.max(PARRY_STUN);
+            a.swing = 0.0;
+            self.push(j, EventKind::Parried { attacker: i });
+            let back = -self.bikes[i].right() * side * 1.6;
+            self.bikes[i].vel += back;
+            self.damage(i, PARRY_PUNISH, j);
+            return;
+        }
+        let (damage, shove) = match kind {
+            Strike::Punch => (HIT_DAMAGE, 3.2),
+            Strike::Kick => (KICK_DAMAGE, 5.0),
+        };
+        let soak = if guard { GUARD_SOAK } else { 1.0 };
+        let right = self.bikes[i].right();
+        let target = &mut self.bikes[j];
+        target.vel += right * side * shove * if guard { 0.4 } else { 1.0 };
+        target.yaw_rate += side * 0.6 * soak;
+        if guard {
+            self.push(j, EventKind::Blocked { attacker: i });
+        } else {
+            self.racers[i].hits_landed += 1;
+            self.bikes[i].boost = (self.bikes[i].boost + 0.12).min(1.0);
+            self.push(
+                j,
+                EventKind::Hit {
+                    attacker: i,
+                    kick: kind == Strike::Kick,
+                },
+            );
+        }
+        self.damage(j, damage * soak, i);
+    }
+
+    /// Takes balance off `j`; at zero the rider goes down and `by` gets the
+    /// knock-off: a full boost meter.
+    fn damage(&mut self, j: usize, amount: f32, by: usize) {
+        let scale = if j == PLAYER {
+            self.difficulty.damage_to_player()
+        } else {
+            1.0
+        };
+        let tr = &mut self.racers[j];
+        tr.balance -= amount * scale;
+        tr.since_hit = 0.0;
+        if tr.balance <= 0.0 {
+            tr.balance = 100.0;
+            tr.knockdowns += 1;
+            tr.guard = 0.0;
+            self.bikes[j].crash();
+            self.push(j, EventKind::Crash);
+            self.racers[by].knockoffs += 1;
+            self.bikes[by].boost = 1.0;
+            self.push(by, EventKind::KnockOff { victim: j });
         }
     }
 
@@ -521,12 +789,12 @@ impl Race {
         });
         let place = self.place_of(PLAYER);
         if matches!(self.phase, Phase::Racing) && place != self.last_player_place {
-            self.push(
-                PLAYER,
-                EventKind::Overtake {
-                    gained: place < self.last_player_place,
-                },
-            );
+            let gained = place < self.last_player_place;
+            if gained {
+                let b = &mut self.bikes[PLAYER];
+                b.boost = (b.boost + OVERTAKE_BOOST).min(1.0);
+            }
+            self.push(PLAYER, EventKind::Overtake { gained });
         }
         self.last_player_place = place;
     }
@@ -668,5 +936,160 @@ mod tests {
         }
         assert!(race.racers[1].balance < before, "rival took the hit");
         assert_eq!(race.racers[PLAYER].hits_landed, 1);
+    }
+
+    /// Player at `s` on the centre line, rival 1 alongside on the right, the
+    /// rest of the field far up the road; racing, no rival guards.
+    fn duel() -> Race {
+        let mut race = Race::new(catalog()[0], 3);
+        race.phase = Phase::Racing;
+        race.guard_chance = 0.0;
+        let s = 40.0;
+        let track = race.track.clone();
+        race.bikes[PLAYER] = Bike::new(&track, s, 0.0, Tuning::default());
+        race.bikes[1] = Bike::new(&track, s, 1.4, Tuning::default());
+        for k in 2..race.bikes.len() {
+            race.bikes[k] = Bike::new(&track, s + 200.0 + k as f32 * 10.0, 0.0, Tuning::default());
+        }
+        race
+    }
+
+    fn run(race: &mut Race, first: Controls, ticks: usize) -> Vec<Event> {
+        let mut seen = Vec::new();
+        race.tick(&first);
+        seen.extend(race.events.iter().copied());
+        for _ in 0..ticks {
+            race.tick(&Controls::default());
+            seen.extend(race.events.iter().copied());
+        }
+        seen
+    }
+
+    #[test]
+    fn kick_hits_harder_than_a_punch() {
+        let mut a = duel();
+        let mut b = duel();
+        let punch = Controls {
+            attack: true,
+            ..Controls::default()
+        };
+        let kick = Controls {
+            kick: true,
+            ..Controls::default()
+        };
+        run(&mut a, punch, 90);
+        let seen = run(&mut b, kick, 90);
+        assert!(seen.iter().any(|e| e.kind
+            == EventKind::Hit {
+                attacker: PLAYER,
+                kick: true
+            }));
+        assert!(b.racers[1].balance < a.racers[1].balance);
+    }
+
+    #[test]
+    fn guard_soaks_a_strike_and_an_early_guard_parries() {
+        // Rival 1 swings at the player.
+        let mut race = duel();
+        race.racers[PLAYER].guard = 1.0;
+        race.racers[PLAYER].guard_held = 1.0; // up for a while: block, not parry
+        race.start_swing(1, Strike::Punch);
+        let block = Controls {
+            block: true,
+            ..Controls::default()
+        };
+        let mut seen = Vec::new();
+        for _ in 0..80 {
+            race.tick(&block);
+            seen.extend(race.events.iter().copied());
+        }
+        assert!(seen
+            .iter()
+            .any(|e| e.kind == EventKind::Blocked { attacker: 1 }));
+        let soaked = 100.0 - race.racers[PLAYER].balance;
+        assert!(soaked > 0.0 && soaked < HIT_DAMAGE * 0.5, "{soaked}");
+
+        // Guard raised just before the blow lands: parried, attacker hurt.
+        let mut race = duel();
+        race.start_swing(1, Strike::Punch);
+        let mut seen = Vec::new();
+        for k in 0..80 {
+            let c = if k >= 8 { block } else { Controls::default() };
+            race.tick(&c);
+            seen.extend(race.events.iter().copied());
+        }
+        assert!(
+            seen.iter()
+                .any(|e| e.kind == EventKind::Parried { attacker: 1 }),
+            "{seen:?}"
+        );
+        assert_eq!(race.racers[PLAYER].balance, 100.0);
+        assert!(race.racers[1].balance < 100.0);
+    }
+
+    #[test]
+    fn knocking_a_rider_off_fills_the_boost() {
+        let mut race = duel();
+        race.racers[1].balance = 10.0;
+        race.bikes[PLAYER].boost = 0.1;
+        let seen = run(
+            &mut race,
+            Controls {
+                attack: true,
+                ..Controls::default()
+            },
+            60,
+        );
+        assert!(seen
+            .iter()
+            .any(|e| e.kind == EventKind::KnockOff { victim: 1 }));
+        assert!(!race.bikes[1].is_riding());
+        assert!(race.bikes[PLAYER].boost > 0.95);
+        assert_eq!(race.racers[PLAYER].knockoffs, 1);
+    }
+
+    fn launch_with(throttle: f32) -> (Race, Vec<Event>) {
+        let mut race = Race::new(catalog()[0], 1);
+        let c = Controls {
+            throttle,
+            ..Controls::default()
+        };
+        let mut seen = Vec::new();
+        for _ in 0..((COUNTDOWN_SECS / DT) as usize + 3) {
+            race.tick(&c);
+            seen.extend(race.events.iter().copied());
+        }
+        (race, seen)
+    }
+
+    #[test]
+    fn launch_rewards_revs_in_the_sweet_spot() {
+        let (good, seen) = launch_with(0.7);
+        assert!(seen
+            .iter()
+            .any(|e| e.kind == EventKind::Launch { perfect: true }));
+        let (spun, seen) = launch_with(1.0);
+        assert!(seen
+            .iter()
+            .any(|e| e.kind == EventKind::Launch { perfect: false }));
+        assert!(spun.player().wheelspin > 0.0);
+        assert!(good.player().speed() > spun.player().speed() + 3.0);
+    }
+
+    #[test]
+    fn harder_levels_field_quicker_rivals() {
+        let lap_pace = |d: Difficulty| {
+            let race = Race::with_difficulty(catalog()[0], 7, d);
+            let n = race.bikes.len() as f32 - 1.0;
+            race.bikes
+                .iter()
+                .skip(1)
+                .map(|b| b.tuning.power)
+                .sum::<f32>()
+                / n
+        };
+        let [e, n, h] = Difficulty::ALL.map(lap_pace);
+        assert!(e < n && n < h, "{e} {n} {h}");
+        assert_eq!(Race::new(catalog()[0], 7).difficulty, Difficulty::Normal);
     }
 }

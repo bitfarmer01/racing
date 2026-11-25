@@ -104,10 +104,10 @@ fn fs_shadow() {
 
 fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let ndl = dot(n, g.sun_dir.xyz);
-    let offset = n * (0.06 + 0.12 * (1.0 - abs(ndl)));
+    let offset = n * (0.035 + 0.07 * (1.0 - abs(ndl)));
     let p = g.shadow_mat * vec4<f32>(world + offset, 1.0);
     let uv = p.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    let depth = p.z - 0.0008;
+    let depth = p.z - 0.0002;
     let t = g.params2.z;
     var s = 0.0;
     for (var j = -1; j <= 1; j = j + 1) {
@@ -305,8 +305,12 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         albedo = albedo * mix(0.88, 1.12, in.tint);
     }
 
-    let shadow = mix(1.0, sun_shadow(wp, n), g.sun_dir.w);
-    var col = shade(albedo, n, v, rough, metal, shadow, ao);
+    // Contact shadows ground the bikes: they darken both sun and sky light.
+    let contact = contact_shadow(wp);
+    let shadow = mix(1.0, sun_shadow(wp, n), g.sun_dir.w) * (1.0 - contact);
+    // The patch blocks sky light and reflections too, so it reads even
+    // when the bike rides into a low sun.
+    var col = shade(albedo, n, v, rough, metal, shadow, ao) * (1.0 - contact * 0.82);
     if (kind == K_FOLIAGE) {
         // Light through the leaves when backlit.
         let back = max(dot(-n, g.sun_dir.xyz), 0.0) * max(dot(-v, g.sun_dir.xyz), 0.0);

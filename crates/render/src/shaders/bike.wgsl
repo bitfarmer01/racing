@@ -25,6 +25,11 @@ struct Inst {
     @location(11) anim: vec4<f32>,
     // rider offset (bike space) xyz, w rider tumble angle
     @location(12) rider: vec4<f32>,
+    // hang-off (-1 left .. 1 right), tuck 0..1, front and rear suspension
+    // compression (m)
+    @location(13) pose: vec4<f32>,
+    // kick (-1 left .. 1 right), block 0..1
+    @location(14) act: vec4<f32>,
 };
 
 struct VOut {
@@ -35,6 +40,8 @@ struct VOut {
     @location(3) @interpolate(flat) mat: vec4<f32>,
     @location(4) @interpolate(flat) paint: vec4<f32>,
     @location(5) @interpolate(flat) paint2: vec4<f32>,
+    // Height above the ground in bike space, for a little occlusion.
+    @location(6) local_y: f32,
 };
 
 fn rot_x(a: f32) -> mat3x3<f32> {
@@ -43,16 +50,22 @@ fn rot_x(a: f32) -> mat3x3<f32> {
     return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, c, s), vec3<f32>(0.0, -s, c));
 }
 
-fn rot_y(a: f32) -> mat3x3<f32> {
-    let c = cos(a);
-    let s = sin(a);
-    return mat3x3<f32>(vec3<f32>(c, 0.0, -s), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(s, 0.0, c));
-}
-
 fn rot_z(a: f32) -> mat3x3<f32> {
     let c = cos(a);
     let s = sin(a);
     return mat3x3<f32>(vec3<f32>(c, s, 0.0), vec3<f32>(-s, c, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+}
+
+// Rotation by `a` about unit axis `k` (right-handed).
+fn rot_axis(k: vec3<f32>, a: f32) -> mat3x3<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    let t = 1.0 - c;
+    return mat3x3<f32>(
+        vec3<f32>(t * k.x * k.x + c, t * k.x * k.y + s * k.z, t * k.x * k.z - s * k.y),
+        vec3<f32>(t * k.x * k.y - s * k.z, t * k.y * k.y + c, t * k.y * k.z + s * k.x),
+        vec3<f32>(t * k.x * k.z + s * k.y, t * k.y * k.z - s * k.x, t * k.z * k.z + c),
+    );
 }
 
 struct Posed {
@@ -60,33 +73,100 @@ struct Posed {
     nrm: vec3<f32>,
 };
 
+// Rig points; these match the constants in models.rs.
+const FRONT_AXLE: vec3<f32> = vec3<f32>(0.0, 0.325, -0.72);
+const REAR_AXLE: vec3<f32> = vec3<f32>(0.0, 0.325, 0.70);
+const STEER_HEAD: vec3<f32> = vec3<f32>(0.0, 0.98, -0.5);
+const PIVOT_Z: f32 = 0.06;
+const R_SHOULDER: vec3<f32> = vec3<f32>(0.2, 1.30, -0.16);
+const L_SHOULDER: vec3<f32> = vec3<f32>(-0.2, 1.30, -0.16);
+const R_HIP: vec3<f32> = vec3<f32>(0.13, 1.0, 0.2);
+const L_HIP: vec3<f32> = vec3<f32>(-0.13, 1.0, 0.2);
+const R_HAND: vec3<f32> = vec3<f32>(0.31, 0.97, -0.43);
+const L_HAND: vec3<f32> = vec3<f32>(-0.31, 0.97, -0.43);
+const SEAT: vec3<f32> = vec3<f32>(0.0, 0.92, 0.18);
+const HIPS: vec3<f32> = vec3<f32>(0.0, 1.0, 0.22);
+
+// How far the sprung mass has sunk at bike-space z: the fork at the front,
+// the shock at the back, pitching in between.
+fn sag_at(z: f32, inst: Inst) -> f32 {
+    let t = clamp((z - FRONT_AXLE.z) / (REAR_AXLE.z - FRONT_AXLE.z), 0.0, 1.0);
+    return mix(inst.pose.z, inst.pose.w, t);
+}
+
 fn pose(v: VIn, inst: Inst) -> Posed {
     let part = u32(round(v.mat.x * 255.0));
     var p = v.pos;
     var n = v.nrm;
-    let front = vec3<f32>(0.0, 0.325, -0.72);
-    let rear = vec3<f32>(0.0, 0.325, 0.70);
+    let rake = normalize(STEER_HEAD - FRONT_AXLE);
+    let steer = rot_axis(rake, -inst.anim.z);
+    let sprung = vec3<f32>(0.0, -sag_at(v.pos.z, inst), 0.0);
     if (part == 1u) {
-        let r = rot_y(-inst.anim.z) * rot_x(-inst.anim.x);
-        p = r * (p - front) + front;
+        let r = steer * rot_x(-inst.anim.x);
+        p = r * (p - FRONT_AXLE) + FRONT_AXLE;
         n = r * n;
     } else if (part == 2u) {
         let r = rot_x(-inst.anim.y);
-        p = r * (p - rear) + rear;
+        p = r * (p - REAR_AXLE) + REAR_AXLE;
         n = r * n;
+    } else if (part == 3u) {
+        p = steer * (p - FRONT_AXLE) + FRONT_AXLE;
+        n = steer * n;
+    } else if (part == 4u) {
+        // The pivot rides with the frame; the axle stays on the ground.
+        let w = clamp((REAR_AXLE.z - v.pos.z) / (REAR_AXLE.z - PIVOT_Z), 0.0, 1.0);
+        p.y = p.y - sag_at(PIVOT_Z, inst) * w;
+    } else if (part == 5u) {
+        // Stanchions slide down along the rake into the sliders.
+        p = p - rake * inst.pose.z;
+        p = steer * (p - FRONT_AXLE) + FRONT_AXLE;
+        n = steer * n;
     } else if (part >= 10u) {
-        if (part == 11u && inst.anim.w > 0.0) {
-            let sh = vec3<f32>(0.2, 1.30, -0.18);
-            let r = rot_z(inst.anim.w * 1.5) * rot_x(inst.anim.w * 0.5);
-            p = r * (p - sh) + sh;
+        let hang = inst.pose.x;
+        let tuck = inst.pose.y;
+        let punch = inst.anim.w;
+        let kick = inst.act.x;
+        let block = inst.act.y;
+        if (part == 13u || part == 14u) {
+            let side = select(-1.0, 1.0, part == 13u);
+            let hip = select(L_HIP, R_HIP, part == 13u);
+            // Inside knee out when hanging off; a kick swings the whole leg
+            // out sideways and straightens it.
+            let knee = max(hang * side, 0.0) * 0.5;
+            let k = max(kick * side, 0.0);
+            let r = rot_z(side * (knee + k * 1.25)) * rot_x(-k * 0.35);
+            p = r * (p - hip) + hip;
+            n = r * n;
+        } else if (part == 11u || part == 12u) {
+            let side = select(-1.0, 1.0, part == 11u);
+            let sh = select(L_SHOULDER, R_SHOULDER, part == 11u);
+            let hand = select(L_HAND, R_HAND, part == 11u);
+            // Tucked: elbows drop, pivoting about the grip.
+            let rt = rot_x(tuck * 0.15);
+            p = rt * (p - hand) + hand;
+            n = rt * n;
+            // Guard up: forearms come up in front of the helmet.
+            if (block > 0.0) {
+                let r = rot_z(-side * 0.35 * block) * rot_x(block);
+                p = r * (p - sh) + sh;
+                n = r * n;
+            }
+            let ps = max(punch * side, 0.0);
+            if (ps > 0.0) {
+                let r = rot_z(side * ps * 1.5) * rot_x(ps * 0.5);
+                p = r * (p - sh) + sh;
+                n = r * n;
+            }
+        } else {
+            // Torso and head fold down towards the tank.
+            let r = rot_x(-tuck * 0.13);
+            p = r * (p - HIPS) + HIPS + vec3<f32>(0.0, -0.025 * tuck, 0.0);
             n = r * n;
         }
-        if (part == 12u && inst.anim.w < 0.0) {
-            let sh = vec3<f32>(-0.2, 1.30, -0.18);
-            let r = rot_z(inst.anim.w * 1.5) * rot_x(-inst.anim.w * 0.5);
-            p = r * (p - sh) + sh;
-            n = r * n;
-        }
+        // Hang off the inside of the bike in a corner.
+        let rh = rot_z(-hang * 0.32);
+        p = rh * (p - SEAT) + SEAT + vec3<f32>(hang * 0.11, -abs(hang) * 0.03, 0.0);
+        n = rh * n;
         // Thrown rider: tumble about the hips, then offset.
         if (inst.rider.w != 0.0 || dot(inst.rider.xyz, inst.rider.xyz) > 0.0) {
             let hip = vec3<f32>(0.0, 1.0, 0.1);
@@ -94,6 +174,10 @@ fn pose(v: VIn, inst: Inst) -> Posed {
             p = r * (p - hip) + hip + inst.rider.xyz;
             n = r * n;
         }
+        p = p + sprung;
+    }
+    if (part == 0u) {
+        p = p + sprung;
     }
     let m = mat4x4<f32>(inst.m0, inst.m1, inst.m2, inst.m3);
     var o: Posed;
@@ -113,6 +197,7 @@ fn vs_main(v: VIn, inst: Inst) -> VOut {
     o.mat = v.mat;
     o.paint = inst.paint;
     o.paint2 = inst.paint2;
+    o.local_y = v.pos.y;
     return o;
 }
 
@@ -127,9 +212,9 @@ fn fs_shadow() {
 }
 
 fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
-    let p = g.shadow_mat * vec4<f32>(world + n * 0.03, 1.0);
+    let p = g.shadow_mat * vec4<f32>(world + n * 0.02, 1.0);
     let uv = p.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    let depth = p.z - 0.0006;
+    let depth = p.z - 0.00015;
     let t = g.params2.z;
     var s = 0.0;
     for (var j = -1; j <= 1; j = j + 1) {
@@ -172,7 +257,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let n = normalize(in.nrm);
     let v = normalize(g.cam_pos.xyz - in.world);
     let shadow = mix(1.0, sun_shadow(in.world, n), g.sun_dir.w);
-    var col = shade(albedo, n, v, rough, metal, shadow, 1.0);
+    // Ground occlusion: the underside and wheels sit in the bike's own shade.
+    let ao = mix(0.5, 1.0, smoothstep(0.02, 0.5, in.local_y));
+    var col = shade(albedo, n, v, rough, metal, shadow, ao);
     if (coat > 0.0) {
         // Clear coat: a second, sharp specular lobe and a sky reflection.
         let h = normalize(g.sun_dir.xyz + v);

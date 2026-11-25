@@ -5,16 +5,27 @@
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 
-use crate::mesh::{kind, Mat, MeshBuilder};
+use crate::mesh::{kind, Mat, MeshBuilder, Section};
 
-/// Bike part ids (vertex `mat.r` in the bike pipeline).
+/// Bike part ids (vertex `mat.r` in the bike pipeline). The vertex shader
+/// poses each part: wheels spin and steer, the fork and swingarm follow the
+/// suspension, and the rider's limbs move.
 pub mod part {
+    /// Sprung mass: frame, engine, bodywork. Rides on the suspension.
     pub const BODY: u8 = 0;
     pub const FRONT_WHEEL: u8 = 1;
     pub const REAR_WHEEL: u8 = 2;
+    /// Fork sliders, calipers and fender: steer, but stay with the wheel.
+    pub const FORK_LOWER: u8 = 3;
+    /// Pivots so the rear axle stays on the ground as the shock works.
+    pub const SWINGARM: u8 = 4;
+    /// Fork tubes, yokes and bars: steer and ride on the suspension.
+    pub const STEER: u8 = 5;
     pub const RIDER: u8 = 10;
     pub const RIGHT_ARM: u8 = 11;
     pub const LEFT_ARM: u8 = 12;
+    pub const RIGHT_LEG: u8 = 13;
+    pub const LEFT_LEG: u8 = 14;
 }
 
 /// Bike vertex flags (vertex `mat.a`).
@@ -28,267 +39,517 @@ pub mod flag {
 pub const WHEEL_R: f32 = 0.325;
 pub const FRONT_AXLE: Vec3 = Vec3::new(0.0, WHEEL_R, -0.72);
 pub const REAR_AXLE: Vec3 = Vec3::new(0.0, WHEEL_R, 0.70);
-pub const RIGHT_SHOULDER: Vec3 = Vec3::new(0.2, 1.30, -0.18);
-pub const LEFT_SHOULDER: Vec3 = Vec3::new(-0.2, 1.30, -0.18);
+/// Top of the steering head, where the fork tubes meet the top yoke.
+pub const STEER_HEAD: Vec3 = Vec3::new(0.0, 0.98, -0.5);
+pub const SWINGARM_PIVOT: Vec3 = Vec3::new(0.0, 0.47, 0.06);
+pub const RIGHT_SHOULDER: Vec3 = Vec3::new(0.2, 1.30, -0.16);
+pub const LEFT_SHOULDER: Vec3 = Vec3::new(-0.2, 1.30, -0.16);
+pub const RIGHT_HIP: Vec3 = Vec3::new(0.13, 1.0, 0.2);
+pub const LEFT_HIP: Vec3 = Vec3::new(-0.13, 1.0, 0.2);
 
 fn bike_mat(color: [f32; 3], rough: f32, metal: f32, part: u8, flags: f32) -> Mat {
     Mat::new(color, rough, metal).kind(part).extra(flags)
 }
 
+fn sec(z: f32, y: f32, w: f32, h: f32, square: f32) -> Section {
+    Section::new(Vec3::new(0.0, y, z), w, h, square)
+}
+
+fn sec_x(x: f32, y: f32, z: f32, w: f32, h: f32, square: f32) -> Section {
+    Section::new(Vec3::new(x, y, z), w, h, square)
+}
+
+/// A disc lying across the x axis (brake rotor, hub, can tip).
+fn disc_x(b: &mut MeshBuilder, c: Vec3, half: f32, r: f32, seg: u32, m: &Mat) {
+    let saved = b.transform;
+    b.transform = saved
+        * Mat4::from_rotation_translation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), c);
+    b.cylinder(Vec3::ZERO, -half, half, r, r, seg, true, m);
+    b.transform = saved;
+}
+
 /// The full bike + rider as one mesh; parts animate in the vertex shader.
 pub fn bike() -> MeshBuilder {
     let mut b = MeshBuilder::new();
-    let paint = bike_mat([0.8, 0.8, 0.8], 0.22, 0.35, part::BODY, flag::PAINT);
-    let carbon = bike_mat([0.025, 0.025, 0.03], 0.35, 0.2, part::BODY, 0.0);
-    let metal_dark = bike_mat([0.08, 0.08, 0.09], 0.45, 0.8, part::BODY, 0.0);
-    let chrome = bike_mat([0.85, 0.85, 0.88], 0.12, 1.0, part::BODY, 0.0);
-    let gold = bike_mat([0.85, 0.55, 0.15], 0.25, 1.0, part::BODY, 0.0);
-    let glass = bike_mat([0.05, 0.06, 0.08], 0.05, 0.0, part::BODY, 0.0);
-    let seat = bike_mat([0.03, 0.03, 0.03], 0.7, 0.0, part::BODY, 0.0);
+    let paint = bike_mat([0.8, 0.8, 0.8], 0.2, 0.3, part::BODY, flag::PAINT);
+    let carbon = bike_mat([0.03, 0.03, 0.035], 0.32, 0.25, part::BODY, 0.0);
+    let metal_dark = bike_mat([0.09, 0.09, 0.1], 0.42, 0.85, part::BODY, 0.0);
+    let alloy = bike_mat([0.55, 0.56, 0.6], 0.3, 1.0, part::BODY, 0.0);
+    let chrome = bike_mat([0.9, 0.9, 0.92], 0.1, 1.0, part::BODY, 0.0);
+    let titanium = bike_mat([0.45, 0.42, 0.5], 0.22, 1.0, part::BODY, 0.0);
+    let glass = bike_mat([0.06, 0.07, 0.09], 0.04, 0.0, part::BODY, 0.0);
+    let seat = bike_mat([0.035, 0.035, 0.035], 0.75, 0.0, part::BODY, 0.0);
     let head = bike_mat([1.0, 0.95, 0.85], 0.2, 0.0, part::BODY, flag::HEADLIGHT);
     let tail = bike_mat([1.0, 0.05, 0.03], 0.2, 0.0, part::BODY, flag::TAILLIGHT);
 
-    // Wheels: tyre, rim disc and spokes so the spin reads.
-    for (axle, p) in [
-        (FRONT_AXLE, part::FRONT_WHEEL),
-        (REAR_AXLE, part::REAR_WHEEL),
-    ] {
-        let tyre = bike_mat([0.02, 0.02, 0.022], 0.85, 0.0, p, 0.0);
-        let rim = bike_mat([0.06, 0.06, 0.065], 0.3, 0.9, p, 0.0);
-        let rim_lip = bike_mat([0.9, 0.6, 0.12], 0.25, 1.0, p, 0.0);
-        let width = if p == part::REAR_WHEEL { 0.085 } else { 0.07 };
-        b.torus_x(axle, WHEEL_R - width, width, 20, 6, &tyre);
-        b.torus_x(axle, WHEEL_R - width * 2.0 - 0.01, 0.012, 16, 4, &rim_lip);
-        let saved = b.transform;
-        b.transform = saved
-            * Mat4::from_rotation_translation(
-                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
-                axle,
-            );
-        b.cylinder(Vec3::ZERO, -0.05, 0.05, 0.06, 0.06, 10, true, &rim);
-        b.transform = saved;
-        for k in 0..5 {
-            let a = k as f32 / 5.0 * std::f32::consts::TAU;
-            let dir = Vec3::new(0.0, a.cos(), a.sin());
-            b.beam(
-                axle + dir * 0.05,
-                axle + dir * (WHEEL_R - width * 2.0),
-                0.018,
-                &rim,
-            );
-        }
-        if p == part::FRONT_WHEEL {
-            // Brake discs.
-            for x in [-0.085f32, 0.085] {
-                let saved = b.transform;
-                b.transform = saved
-                    * Mat4::from_rotation_translation(
-                        Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
-                        axle + Vec3::X * x,
-                    );
-                b.cylinder(Vec3::ZERO, -0.006, 0.006, 0.16, 0.16, 14, true, &chrome);
-                b.transform = saved;
-            }
-        }
-    }
+    wheels(&mut b);
+    front_end(&mut b);
 
-    // Front forks and clip-ons.
-    for x in [-0.1f32, 0.1] {
-        b.beam(
-            Vec3::new(x, WHEEL_R, -0.72),
-            Vec3::new(x, 0.98, -0.5),
-            0.028,
-            &gold,
+    // Frame: twin alloy spars from the steering head round the engine to
+    // the swingarm pivot.
+    for x in [-1.0f32, 1.0] {
+        b.loft(
+            &[
+                sec_x(0.07 * x, 0.9, -0.46, 0.025, 0.06, 4.0),
+                sec_x(0.15 * x, 0.8, -0.24, 0.025, 0.07, 4.0),
+                sec_x(0.15 * x, 0.66, -0.02, 0.025, 0.07, 4.0),
+                sec_x(0.13 * x, 0.5, 0.06, 0.03, 0.06, 4.0),
+            ],
+            Vec3::X,
+            8,
+            &alloy,
         );
     }
-    b.beam(
-        Vec3::new(-0.33, 1.02, -0.46),
-        Vec3::new(0.33, 1.02, -0.46),
-        0.018,
+    // Engine: crankcase, a canted cylinder block with fins, side covers.
+    b.loft(
+        &[
+            sec(-0.34, 0.38, 0.13, 0.1, 4.0),
+            sec(-0.2, 0.36, 0.16, 0.13, 4.0),
+            sec(0.04, 0.4, 0.15, 0.12, 4.0),
+            sec(0.1, 0.44, 0.1, 0.08, 4.0),
+        ],
+        Vec3::X,
+        12,
         &metal_dark,
     );
-    // Swingarm and rear shock.
-    for x in [-0.11f32, 0.11] {
-        b.beam(
-            Vec3::new(x, WHEEL_R, 0.70),
-            Vec3::new(x, 0.45, 0.05),
-            0.035,
-            &metal_dark,
-        );
-    }
-    b.beam(
-        Vec3::new(0.0, 0.5, 0.25),
-        Vec3::new(0.0, 0.85, 0.05),
-        0.03,
-        &gold,
-    );
-    // Engine and frame spars.
     b.cuboid(
-        Vec3::new(0.0, 0.48, -0.08),
-        Vec3::new(0.18, 0.18, 0.26),
-        Vec2::new(0.9, 0.85),
+        Vec3::new(0.0, 0.6, -0.24),
+        Vec3::new(0.14, 0.12, 0.09),
+        Vec2::new(0.95, 0.85),
         &metal_dark,
     );
-    for x in [-0.16f32, 0.16] {
-        b.beam(
-            Vec3::new(x, 0.88, -0.48),
-            Vec3::new(x, 0.62, 0.12),
-            0.03,
+    for k in 0..4 {
+        b.cube(
+            Vec3::new(0.0, 0.52 + k as f32 * 0.05, -0.33),
+            Vec3::new(0.145, 0.008, 0.012),
+            &alloy,
+        );
+    }
+    for x in [-0.165f32, 0.165] {
+        disc_x(&mut b, Vec3::new(x, 0.37, -0.14), 0.012, 0.085, 12, &alloy);
+    }
+    // Exhaust: headers sweep under the engine to a short titanium can.
+    for x in [-0.05f32, 0.05] {
+        b.loft(
+            &[
+                Section::round(Vec3::new(x, 0.56, -0.38), 0.022),
+                Section::round(Vec3::new(x, 0.34, -0.42), 0.024),
+                Section::round(Vec3::new(x * 1.6, 0.22, -0.2), 0.026),
+                Section::round(Vec3::new(0.12, 0.26, 0.1), 0.03),
+            ],
+            Vec3::X,
+            8,
             &chrome,
         );
     }
-    // Exhaust: header under the engine, can up by the tail.
-    b.beam(
-        Vec3::new(0.08, 0.28, -0.25),
-        Vec3::new(0.16, 0.36, 0.25),
-        0.04,
-        &chrome,
+    b.loft(
+        &[
+            Section::round(Vec3::new(0.14, 0.3, 0.14), 0.04),
+            Section::new(Vec3::new(0.19, 0.42, 0.34), 0.07, 0.06, 2.6),
+            Section::new(Vec3::new(0.21, 0.52, 0.56), 0.065, 0.055, 2.6),
+            Section::round(Vec3::new(0.215, 0.545, 0.62), 0.045),
+        ],
+        Vec3::X,
+        12,
+        &titanium,
     );
-    b.beam(
-        Vec3::new(0.16, 0.36, 0.25),
-        Vec3::new(0.2, 0.62, 0.72),
-        0.06,
-        &carbon,
-    );
-    b.cylinder(
-        Vec3::new(0.2, 0.62, 0.72),
-        -0.01,
-        0.0,
-        0.05,
-        0.05,
+    b.sphere(
+        Vec3::new(0.215, 0.548, 0.63),
+        Vec3::splat(0.03),
+        3,
         8,
-        false,
-        &chrome,
+        &carbon,
     );
 
-    // Bodywork.
-    b.cuboid(
-        Vec3::new(0.0, 0.76, -0.58),
-        Vec3::new(0.21, 0.2, 0.26),
-        Vec2::new(0.62, 0.8),
+    // Fairing: a sharp nose above the front wheel, then side panels that
+    // drop down round the engine once they're clear of the tyre.
+    b.loft(
+        &[
+            sec(-0.96, 0.8, 0.025, 0.035, 2.2),
+            sec(-0.91, 0.79, 0.11, 0.085, 2.8),
+            sec(-0.8, 0.8, 0.16, 0.125, 3.4),
+            sec(-0.66, 0.8, 0.19, 0.14, 3.8),
+            sec(-0.5, 0.74, 0.205, 0.19, 4.2),
+            sec(-0.36, 0.61, 0.205, 0.3, 4.4),
+            sec(-0.2, 0.56, 0.19, 0.27, 4.2),
+            sec(-0.06, 0.53, 0.15, 0.2, 3.6),
+            sec(0.0, 0.53, 0.09, 0.12, 2.8),
+        ],
+        Vec3::X,
+        24,
         &paint,
     );
-    b.cuboid(
-        Vec3::new(0.0, 0.62, -0.22),
-        Vec3::new(0.23, 0.2, 0.25),
-        Vec2::new(0.88, 1.0),
-        &paint,
-    );
-    b.cuboid(
-        Vec3::new(0.0, 0.93, -0.16),
-        Vec3::new(0.17, 0.11, 0.22),
-        Vec2::new(0.78, 0.86),
-        &paint,
-    );
-    b.cuboid(
-        Vec3::new(0.0, 0.97, 0.46),
-        Vec3::new(0.13, 0.08, 0.22),
-        Vec2::new(0.55, 1.0),
-        &paint,
-    );
-    b.cuboid(
-        Vec3::new(0.0, 0.99, -0.62),
-        Vec3::new(0.13, 0.08, 0.1),
-        Vec2::new(0.6, 0.6),
-        &glass,
-    );
-    b.cuboid(
-        Vec3::new(0.0, 0.9, 0.2),
-        Vec3::new(0.14, 0.04, 0.16),
-        Vec2::new(0.9, 1.0),
-        &seat,
-    );
-    // Lower fairing belly pan.
-    b.cuboid(
-        Vec3::new(0.0, 0.36, -0.2),
-        Vec3::new(0.16, 0.06, 0.28),
-        Vec2::new(1.2, 1.0),
+    // Air intake under the nose.
+    b.loft(
+        &[
+            sec(-0.92, 0.73, 0.04, 0.02, 3.0),
+            sec(-0.86, 0.72, 0.05, 0.026, 3.0),
+        ],
+        Vec3::X,
+        10,
         &carbon,
     );
-    // Lights.
-    for x in [-0.075f32, 0.075] {
-        b.cube(
-            Vec3::new(x, 0.77, -0.845),
-            Vec3::new(0.045, 0.028, 0.01),
+    // Screen.
+    b.loft(
+        &[
+            sec(-0.84, 0.92, 0.07, 0.01, 2.4),
+            sec(-0.74, 0.97, 0.11, 0.012, 2.4),
+            sec(-0.62, 1.0, 0.1, 0.012, 2.4),
+            sec(-0.56, 0.99, 0.06, 0.008, 2.4),
+        ],
+        Vec3::X,
+        12,
+        &glass,
+    );
+    // Tank, seat and a tail that kicks up.
+    b.loft(
+        &[
+            sec(-0.5, 0.93, 0.1, 0.06, 2.6),
+            sec(-0.4, 0.97, 0.17, 0.1, 2.8),
+            sec(-0.2, 0.98, 0.19, 0.11, 3.0),
+            sec(-0.02, 0.94, 0.16, 0.09, 3.0),
+            sec(0.06, 0.9, 0.1, 0.05, 2.6),
+        ],
+        Vec3::X,
+        16,
+        &paint,
+    );
+    b.loft(
+        &[
+            sec(0.02, 0.9, 0.11, 0.03, 3.5),
+            sec(0.2, 0.91, 0.13, 0.035, 3.5),
+            sec(0.34, 0.94, 0.11, 0.03, 3.5),
+        ],
+        Vec3::X,
+        12,
+        &seat,
+    );
+    b.loft(
+        &[
+            sec(0.12, 0.84, 0.14, 0.05, 3.0),
+            sec(0.34, 0.9, 0.15, 0.06, 3.0),
+            sec(0.56, 0.98, 0.1, 0.06, 3.0),
+            sec(0.72, 1.03, 0.05, 0.035, 2.6),
+            sec(0.76, 1.03, 0.02, 0.02, 2.0),
+        ],
+        Vec3::X,
+        14,
+        &paint,
+    );
+    b.cube(
+        Vec3::new(0.0, 1.0, 0.71),
+        Vec3::new(0.035, 0.014, 0.012),
+        &tail,
+    );
+    for x in [-0.07f32, 0.07] {
+        b.sphere(
+            Vec3::new(x, 0.79, -0.89),
+            Vec3::new(0.04, 0.022, 0.03),
+            3,
+            8,
             &head,
         );
     }
-    b.cube(
-        Vec3::new(0.0, 0.98, 0.685),
-        Vec3::new(0.08, 0.025, 0.01),
-        &tail,
+    // Rear hugger and number board under the tail.
+    b.loft(
+        &[
+            sec(0.48, 0.66, 0.06, 0.015, 3.0),
+            sec(0.66, 0.62, 0.09, 0.015, 3.0),
+            sec(0.8, 0.5, 0.08, 0.012, 3.0),
+        ],
+        Vec3::X,
+        10,
+        &carbon,
     );
+    // Rear shock and the pegs.
+    b.limb(
+        Vec3::new(0.0, 0.48, 0.24),
+        Vec3::new(0.0, 0.84, 0.06),
+        0.03,
+        0.025,
+        &chrome,
+    );
+    for x in [-1.0f32, 1.0] {
+        b.beam(
+            Vec3::new(0.13 * x, 0.5, 0.18),
+            Vec3::new(0.21 * x, 0.46, 0.2),
+            0.012,
+            &alloy,
+        );
+    }
 
+    swingarm(&mut b);
     rider(&mut b);
     b
 }
 
-fn rider(b: &mut MeshBuilder) {
-    let leather = bike_mat([0.5, 0.5, 0.5], 0.55, 0.0, part::RIDER, flag::PAINT2);
-    let stripe = bike_mat([0.8, 0.8, 0.8], 0.4, 0.1, part::RIDER, flag::PAINT);
-    let helmet = bike_mat([0.8, 0.8, 0.8], 0.15, 0.2, part::RIDER, flag::PAINT);
-    let visor = bike_mat([0.02, 0.02, 0.03], 0.05, 0.6, part::RIDER, 0.0);
-    let boots = bike_mat([0.03, 0.03, 0.03], 0.6, 0.0, part::RIDER, 0.0);
-    let gloves = bike_mat([0.04, 0.04, 0.04], 0.6, 0.0, part::RIDER, 0.0);
+fn wheels(b: &mut MeshBuilder) {
+    for (axle, p) in [
+        (FRONT_AXLE, part::FRONT_WHEEL),
+        (REAR_AXLE, part::REAR_WHEEL),
+    ] {
+        let tyre = bike_mat([0.022, 0.022, 0.024], 0.82, 0.0, p, 0.0);
+        let wall = bike_mat([0.04, 0.04, 0.045], 0.6, 0.0, p, 0.0);
+        let rim = bike_mat([0.05, 0.05, 0.055], 0.25, 0.9, p, 0.0);
+        let lip = bike_mat([0.92, 0.62, 0.12], 0.25, 1.0, p, 0.0);
+        let rotor = bike_mat([0.75, 0.75, 0.78], 0.18, 1.0, p, 0.0);
+        let width = if p == part::REAR_WHEEL { 0.095 } else { 0.07 };
+        // A round racing profile: the tread is the outer half of a torus.
+        b.torus_x(axle, WHEEL_R - width, width, 24, 8, &tyre);
+        b.torus_x(axle, WHEEL_R - width * 1.9, width * 0.45, 24, 4, &wall);
+        b.torus_x(axle, WHEEL_R - width * 2.35, 0.012, 24, 3, &lip);
+        disc_x(b, axle, width * 0.7, 0.055, 12, &rim);
+        // Three split spokes.
+        let inner = 0.05;
+        let outer = WHEEL_R - width * 2.3;
+        for k in 0..3 {
+            let a = k as f32 / 3.0 * std::f32::consts::TAU;
+            for da in [-0.16f32, 0.16] {
+                let d0 = Vec3::new(0.0, a.cos(), a.sin());
+                let d1 = Vec3::new(0.0, (a + da).cos(), (a + da).sin());
+                b.beam(axle + d0 * inner, axle + d1 * outer, 0.014, &rim);
+            }
+        }
+        if p == part::FRONT_WHEEL {
+            for x in [-0.088f32, 0.088] {
+                disc_x(b, axle + Vec3::X * x, 0.004, 0.16, 20, &rotor);
+            }
+        } else {
+            disc_x(b, axle - Vec3::X * 0.1, 0.004, 0.11, 16, &rotor);
+            // Sprocket.
+            disc_x(b, axle - Vec3::X * 0.075, 0.006, 0.1, 14, &rim);
+        }
+    }
+}
 
-    // Legs: hips -> knees (tucked against the tank) -> pegs.
-    for x in [-1.0f32, 1.0] {
-        let hip = Vec3::new(0.14 * x, 0.99, 0.16);
-        let knee = Vec3::new(0.25 * x, 0.82, -0.22);
-        let foot = Vec3::new(0.2 * x, 0.46, 0.18);
-        b.beam(hip, knee, 0.085, &leather);
-        b.beam(knee, foot, 0.07, &leather);
-        b.cube(
-            foot + Vec3::new(0.0, -0.02, -0.06),
-            Vec3::new(0.05, 0.05, 0.11),
-            &boots,
+/// Fork, yokes, bars and the front fender.
+fn front_end(b: &mut MeshBuilder) {
+    let slider = bike_mat([0.92, 0.6, 0.1], 0.25, 1.0, part::FORK_LOWER, 0.0);
+    let caliper = bike_mat([0.9, 0.12, 0.08], 0.35, 0.4, part::FORK_LOWER, 0.0);
+    let fender = bike_mat([0.8, 0.8, 0.8], 0.2, 0.3, part::FORK_LOWER, flag::PAINT);
+    let tube = bike_mat([0.85, 0.85, 0.88], 0.08, 1.0, part::STEER, 0.0);
+    let yoke = bike_mat([0.5, 0.5, 0.55], 0.3, 1.0, part::STEER, 0.0);
+    let bar = bike_mat([0.06, 0.06, 0.07], 0.4, 0.8, part::STEER, 0.0);
+    let grip = bike_mat([0.03, 0.03, 0.03], 0.8, 0.0, part::STEER, 0.0);
+    let rake = (STEER_HEAD - FRONT_AXLE).normalize();
+    for x in [-0.1f32, 0.1] {
+        let base = FRONT_AXLE + Vec3::X * x;
+        // Sliders hold the axle; the stanchions slide into them.
+        b.limb(base, base + rake * 0.34, 0.036, 0.034, &slider);
+        b.loft(
+            &[
+                Section::round(base + rake * 0.2, 0.026),
+                Section::round(base + rake * 0.72, 0.027),
+            ],
+            Vec3::X,
+            10,
+            &tube,
+        );
+        b.cuboid(
+            base + Vec3::new(0.0, -0.03, 0.09),
+            Vec3::new(0.02, 0.07, 0.035),
+            Vec2::ONE,
+            &caliper,
         );
     }
-    // Torso in a racing tuck, with a stripe down the back.
-    let hips = Vec3::new(0.0, 1.03, 0.16);
-    let shoulders = Vec3::new(0.0, 1.31, -0.2);
-    b.beam(hips, shoulders, 0.17, &leather);
-    b.beam(
-        hips + Vec3::new(0.0, 0.13, 0.03),
-        shoulders + Vec3::new(0.0, 0.14, 0.04),
-        0.06,
-        &stripe,
+    b.loft(
+        &[
+            sec(-0.96, 0.53, 0.06, 0.01, 2.5),
+            sec(-0.86, 0.66, 0.075, 0.012, 2.5),
+            sec(-0.72, 0.7, 0.08, 0.012, 2.5),
+            sec(-0.58, 0.64, 0.07, 0.01, 2.5),
+        ],
+        Vec3::X,
+        10,
+        &fender,
     );
-    b.cuboid(
-        Vec3::new(0.0, 1.33, -0.16),
-        Vec3::new(0.22, 0.08, 0.1),
-        Vec2::new(0.9, 1.0),
+    for t in [0.66f32, 0.74] {
+        let c = FRONT_AXLE + rake * t;
+        b.cuboid(c, Vec3::new(0.13, 0.015, 0.05), Vec2::ONE, &yoke);
+    }
+    // Clip-ons.
+    for x in [-1.0f32, 1.0] {
+        let a = Vec3::new(0.1 * x, 0.96, -0.47);
+        let h = Vec3::new(0.3 * x, 0.94, -0.41);
+        b.beam(a, h, 0.013, &bar);
+        b.limb(
+            h,
+            h + Vec3::new(0.06 * x, -0.005, 0.015),
+            0.019,
+            0.019,
+            &grip,
+        );
+    }
+}
+
+fn swingarm(b: &mut MeshBuilder) {
+    let arm = bike_mat([0.5, 0.52, 0.56], 0.28, 1.0, part::SWINGARM, 0.0);
+    let chain = bike_mat([0.08, 0.08, 0.08], 0.5, 0.8, part::SWINGARM, 0.0);
+    for x in [-1.0f32, 1.0] {
+        b.loft(
+            &[
+                sec_x(
+                    0.11 * x,
+                    SWINGARM_PIVOT.y,
+                    SWINGARM_PIVOT.z,
+                    0.03,
+                    0.055,
+                    4.0,
+                ),
+                sec_x(0.13 * x, 0.42, 0.32, 0.028, 0.06, 4.0),
+                sec_x(0.12 * x, WHEEL_R + 0.01, REAR_AXLE.z, 0.022, 0.035, 4.0),
+            ],
+            Vec3::X,
+            8,
+            &arm,
+        );
+    }
+    b.beam(
+        Vec3::new(-0.075, 0.42, -0.12),
+        Vec3::new(-0.075, WHEEL_R + 0.08, REAR_AXLE.z),
+        0.008,
+        &chain,
+    );
+    b.beam(
+        Vec3::new(-0.075, 0.33, -0.1),
+        Vec3::new(-0.075, WHEEL_R - 0.08, REAR_AXLE.z),
+        0.008,
+        &chain,
+    );
+}
+
+fn rider(b: &mut MeshBuilder) {
+    let leather = bike_mat([0.5, 0.5, 0.5], 0.5, 0.0, part::RIDER, flag::PAINT2);
+    let stripe = bike_mat([0.8, 0.8, 0.8], 0.35, 0.1, part::RIDER, flag::PAINT);
+    let helmet = bike_mat([0.8, 0.8, 0.8], 0.12, 0.25, part::RIDER, flag::PAINT);
+    let shell = bike_mat([0.05, 0.05, 0.06], 0.2, 0.3, part::RIDER, 0.0);
+    let visor = bike_mat([0.02, 0.02, 0.03], 0.04, 0.7, part::RIDER, 0.0);
+    let boots = bike_mat([0.04, 0.04, 0.045], 0.55, 0.0, part::RIDER, 0.0);
+    let slider = bike_mat([0.85, 0.85, 0.82], 0.5, 0.0, part::RIDER, 0.0);
+
+    // Torso in a racing crouch, chest down towards the tank.
+    b.loft(
+        &[
+            sec(0.27, 1.0, 0.15, 0.1, 2.4),
+            sec(0.16, 1.07, 0.17, 0.12, 2.4),
+            sec(0.02, 1.18, 0.19, 0.12, 2.5),
+            sec(-0.1, 1.27, 0.2, 0.12, 2.6),
+            sec(-0.2, 1.31, 0.17, 0.1, 2.4),
+            sec(-0.25, 1.32, 0.08, 0.06, 2.2),
+        ],
+        Vec3::X,
+        14,
         &leather,
     );
-    // Helmet and visor.
-    b.sphere(
-        Vec3::new(0.0, 1.47, -0.33),
-        Vec3::new(0.145, 0.15, 0.17),
-        7,
+    // Aero hump and a stripe down the spine in the bike's colour.
+    b.loft(
+        &[
+            sec(0.16, 1.17, 0.05, 0.03, 2.2),
+            sec(0.0, 1.29, 0.09, 0.07, 2.4),
+            sec(-0.12, 1.38, 0.08, 0.05, 2.4),
+            sec(-0.18, 1.39, 0.03, 0.02, 2.0),
+        ],
+        Vec3::X,
         10,
+        &stripe,
+    );
+    b.sphere(
+        Vec3::new(0.0, 1.03, 0.22),
+        Vec3::new(0.16, 0.1, 0.13),
+        5,
+        10,
+        &leather,
+    );
+    // Neck, helmet with a chin bar, visor and a small spoiler.
+    b.limb(
+        Vec3::new(0.0, 1.32, -0.22),
+        Vec3::new(0.0, 1.38, -0.3),
+        0.055,
+        0.055,
+        &leather,
+    );
+    let hc = Vec3::new(0.0, 1.46, -0.34);
+    b.sphere(hc, Vec3::new(0.135, 0.14, 0.155), 8, 14, &helmet);
+    b.loft(
+        &[
+            Section::new(hc + Vec3::new(0.0, -0.09, -0.04), 0.1, 0.05, 2.2),
+            Section::new(hc + Vec3::new(0.0, -0.085, -0.13), 0.085, 0.05, 2.2),
+            Section::new(hc + Vec3::new(0.0, -0.075, -0.165), 0.05, 0.035, 2.0),
+        ],
+        Vec3::X,
+        12,
         &helmet,
     );
     b.sphere(
-        Vec3::new(0.0, 1.455, -0.42),
-        Vec3::new(0.115, 0.065, 0.09),
+        hc + Vec3::new(0.0, 0.005, -0.075),
+        Vec3::new(0.12, 0.06, 0.095),
         5,
-        8,
+        12,
         &visor,
     );
+    b.loft(
+        &[
+            Section::new(hc + Vec3::new(0.0, 0.1, 0.1), 0.06, 0.012, 2.4),
+            Section::new(hc + Vec3::new(0.0, 0.085, 0.17), 0.07, 0.014, 2.4),
+        ],
+        Vec3::X,
+        10,
+        &shell,
+    );
+
+    // Legs: hip -> knee (tucked into the tank) -> ankle on the peg.
+    for (x, p) in [(1.0f32, part::RIGHT_LEG), (-1.0, part::LEFT_LEG)] {
+        let leg = bike_mat([0.5, 0.5, 0.5], 0.5, 0.0, p, flag::PAINT2);
+        let boot = Mat { kind: p, ..boots };
+        let puck = Mat { kind: p, ..slider };
+        let hip = if x > 0.0 { RIGHT_HIP } else { LEFT_HIP };
+        let knee = Vec3::new(0.24 * x, 0.86, -0.2);
+        let ankle = Vec3::new(0.2 * x, 0.55, 0.2);
+        b.limb(hip, knee, 0.085, 0.065, &leg);
+        b.limb(knee, ankle, 0.065, 0.045, &leg);
+        b.sphere(
+            knee + Vec3::new(0.05 * x, -0.02, -0.03),
+            Vec3::new(0.025, 0.05, 0.06),
+            3,
+            8,
+            &puck,
+        );
+        b.loft(
+            &[
+                Section::new(ankle + Vec3::new(0.0, 0.06, 0.03), 0.045, 0.05, 2.4),
+                Section::new(ankle + Vec3::new(0.0, -0.06, 0.0), 0.045, 0.05, 2.4),
+                Section::new(ankle + Vec3::new(0.0, -0.07, -0.12), 0.035, 0.035, 2.4),
+            ],
+            Vec3::X,
+            10,
+            &boot,
+        );
+    }
     // Arms to the clip-ons.
     for (x, p) in [(1.0f32, part::RIGHT_ARM), (-1.0, part::LEFT_ARM)] {
-        let arm = bike_mat([0.5, 0.5, 0.5], 0.55, 0.0, p, flag::PAINT2);
-        let glove = Mat { kind: p, ..gloves };
+        let arm = bike_mat([0.5, 0.5, 0.5], 0.5, 0.0, p, flag::PAINT2);
+        let pad = bike_mat([0.8, 0.8, 0.8], 0.35, 0.1, p, flag::PAINT);
+        let glove = bike_mat([0.04, 0.04, 0.045], 0.6, 0.0, p, 0.0);
         let shoulder = if x > 0.0 {
             RIGHT_SHOULDER
         } else {
             LEFT_SHOULDER
         };
-        let elbow = Vec3::new(0.29 * x, 1.12, -0.32);
-        let hand = Vec3::new(0.3 * x, 1.03, -0.46);
-        b.beam(shoulder, elbow, 0.06, &arm);
-        b.beam(elbow, hand, 0.05, &arm);
-        b.cube(hand, Vec3::new(0.045, 0.04, 0.05), &glove);
+        let elbow = Vec3::new(0.3 * x, 1.12, -0.3);
+        let hand = Vec3::new(0.31 * x, 0.97, -0.43);
+        b.sphere(shoulder, Vec3::new(0.075, 0.07, 0.08), 4, 8, &pad);
+        b.limb(shoulder, elbow, 0.06, 0.05, &arm);
+        b.limb(elbow, hand, 0.05, 0.04, &arm);
+        b.loft(
+            &[
+                Section::round(hand + Vec3::new(0.0, 0.03, 0.04), 0.042),
+                Section::new(hand, 0.045, 0.04, 2.4),
+                Section::new(hand + Vec3::new(0.0, -0.01, -0.06), 0.035, 0.03, 2.4),
+            ],
+            Vec3::X,
+            8,
+            &glove,
+        );
     }
 }
 

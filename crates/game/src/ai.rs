@@ -2,8 +2,9 @@
 //!
 //! Each rival follows a lookahead point on its own lane (cutting to the
 //! inside of corners), plans its speed from the curvature ahead against its
-//! grip budget, swings out to pass slower bikes, and picks fights when a
-//! bike rides alongside.
+//! grip budget, swings out to pass slower bikes, and picks fights (punches
+//! and kicks) when a bike rides alongside. Guarding is decided by the race,
+//! which sees strikes coming.
 
 use glam::Vec2;
 
@@ -131,20 +132,24 @@ impl Rival {
         }
         let boost = self.boost_timer > 0.0 && throttle > 0.9;
 
-        let attack = alongside.is_some()
+        let strike = alongside.is_some()
             && self.attack_cooldown <= 0.0
             && roll < self.aggression * 0.05
             && !ahead_slow;
-        if attack {
+        if strike {
             self.attack_cooldown = 1.4 + (1.0 - self.aggression) * 2.0;
         }
+        // About a third of strikes are kicks; the angrier the rider, the more.
+        let kick = strike && roll < self.aggression * 0.05 * (0.2 + 0.3 * self.aggression);
 
         Controls {
             throttle,
             brake,
             steer,
             boost,
-            attack,
+            attack: strike && !kick,
+            kick,
+            block: false,
         }
     }
 }

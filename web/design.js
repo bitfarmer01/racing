@@ -71,7 +71,23 @@ export const DIRECTION = {
   [CUE.CONTACT]: () => ({ sound: [120, 0.06, 'square', 0.2] }),
   // Hits and crashes get an impact frame in the 3D picture; the page only
   // adds the sound and the word.
-  [CUE.HIT_LANDED]: () => ({ toast: ['Hit!', 'best'], sound: [180, 0.08, 'triangle', 0.4] }),
+  // a = 1 for a kick.
+  [CUE.HIT_LANDED]: (c) =>
+    c.a > 0
+      ? { toast: ['Kick!', 'best'], sound: [140, 0.12, 'triangle', 0.5] }
+      : { toast: ['Hit!', 'best'], sound: [180, 0.08, 'triangle', 0.4] },
+  // Your guard soaked a strike.
+  [CUE.GUARDED]: () => ({ toast: ['Blocked', ''], sound: [260, 0.05, 'square', 0.2] }),
+  // You raised your guard just in time: the attacker is stunned.
+  [CUE.PARRIED]: () => ({ toast: ['Parry!', 'best'], flash: 0.25, sound: [880, 0.09, 'triangle', 0.35] }),
+  // Your strike was parried and you are wobbling.
+  [CUE.WAS_PARRIED]: () => ({ toast: ['Parried', 'bad'], sound: [110, 0.14, 'sawtooth', 0.3] }),
+  [CUE.KNOCKOFF]: () => ({ toast: ['Knock-off · full boost', 'best'], sound: [520, 0.16, 'triangle', 0.4] }),
+  // a = 1 for a perfect launch.
+  [CUE.LAUNCH]: (c) =>
+    c.a > 0
+      ? { toast: ['Perfect start', 'best'], sound: [740, 0.1, 'sine', 0.25] }
+      : { toast: ['Wheelspin', 'bad'] },
   [CUE.GOT_HIT]: () => ({ sound: [95, 0.1, 'square', 0.35] }),
   [CUE.CRASH]: () => ({ sound: [55, 0.3, 'sawtooth', 0.5] }),
   [CUE.LAP]: (c, h) => {

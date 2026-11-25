@@ -25,7 +25,7 @@ export class Game {
      * Advances `dt` seconds of play and draws. Returns the cues raised,
      * as (code, a, b) triples.
      */
-    frame(dt: number, throttle: number, brake: number, steer: number, analog_steer: boolean, boost: boolean, attack: boolean): Float32Array;
+    frame(dt: number, throttle: number, brake: number, steer: number, analog_steer: boolean, boost: boolean, attack: boolean, kick: boolean, block: boolean): Float32Array;
     hdr_format(): string;
     /**
      * HUD snapshot; layout in `pack_hud`.
@@ -54,9 +54,10 @@ export class Game {
      */
     standings(): string;
     /**
-     * Starts a race the player drives, on `slug`.
+     * Starts a race the player drives, on `slug`, at `difficulty`
+     * (`easy`, `normal` or `hard`; anything else is normal).
      */
-    start_race(slug: string): void;
+    start_race(slug: string, difficulty: string): void;
     /**
      * Draw calls, triangles and visible props in the last frame.
      */
@@ -102,7 +103,7 @@ export interface InitOutput {
     readonly game_bike_points: (a: number) => [number, number];
     readonly game_boot: (a: any, b: number, c: number) => any;
     readonly game_cycle_camera: (a: number) => number;
-    readonly game_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
+    readonly game_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number];
     readonly game_hdr_format: (a: number) => [number, number];
     readonly game_hud: (a: number) => [number, number];
     readonly game_resize: (a: number, b: number, c: number) => void;
@@ -111,7 +112,7 @@ export interface InitOutput {
     readonly game_set_render_scale: (a: number, b: number) => void;
     readonly game_show: (a: number, b: number, c: number) => void;
     readonly game_standings: (a: number) => [number, number];
-    readonly game_start_race: (a: number, b: number, c: number) => void;
+    readonly game_start_race: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly game_stats: (a: number) => [number, number];
     readonly game_track: (a: number) => [number, number];
     readonly game_track_outline: (a: number) => [number, number];
