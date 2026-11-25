@@ -679,9 +679,6 @@ impl Race {
                     snapshot.speed = pace;
                 }
             }
-            if bike::should_crash(&snapshot, half_width) {
-                bike::crash(&mut snapshot);
-            }
             if was_crashed
                 && snapshot.control != Control::Crashed
                 && snapshot.is_off_road(half_width)
@@ -689,8 +686,16 @@ impl Race {
                 // Back in the saddle, stranded in the dirt: place the rider
                 // in a lane at least RECOVERY_LANE_MARGIN meters inside the
                 // edge (audit item 3), so a picked-up bike has road to ride
-                // instead of immediately leaving the tarmac again.
+                // instead of immediately leaving the tarmac again. This runs
+                // BEFORE the crash check: a rider whose crash timer expired
+                // while still past the deep-excursion bound must be pulled
+                // back onto the tarmac — checked first, the depth bound
+                // would re-crash them on this very tick and the recovery
+                // placement would never run, stranding the rider forever.
                 snapshot.lateral = snapshot.lateral.signum() * (half_width - RECOVERY_LANE_MARGIN);
+            }
+            if bike::should_crash(&snapshot, half_width) {
+                bike::crash(&mut snapshot);
             }
             // Shoulder rumble: the last meters before the tarmac ends warn
             // the rider — a scrub and a shake — before the off-road crash
@@ -1559,18 +1564,23 @@ mod tests {
     fn off_road_at_low_speed_slows_without_crashing() {
         let mut race = flat_race(0, 7);
         race.clear_traffic();
+        let half_width = 6.0;
         // Throttle + steer right together: the bike stays under the 30 m/s
         // crash threshold while full steering authority walks it off the
         // road. The across-road speed is speed · tan(full lock) — a few
-        // seconds to cross 6 m of tarmac, so 600 ticks leaves margin.
+        // seconds to cross 6 m of tarmac. Riding shallow dirt at dirt
+        // speed is legal: no crash, speed capped. (Pushing deep past the
+        // excursion bound is a different offense — see the overshoot test.)
         for _ in 0..600 {
             run(
                 &mut race,
                 1,
                 &[GameInput::Accelerate, GameInput::SteerRight],
             );
+            if race.player_lateral() > half_width + 1.0 {
+                break;
+            }
         }
-        let half_width = 6.0;
         assert!(race.player_lateral() > half_width, "driven off the road");
         assert_ne!(
             race.player_control(),
@@ -2323,6 +2333,43 @@ mod tests {
             "flat out through the climbing hairpin must run off the tarmac (exit lateral {}, control {:?})",
             race.player_lateral(),
             race.player_control()
+        );
+    }
+
+    #[test]
+    fn a_flat_out_overshoot_stays_bounded_and_pulls_back_to_the_tarmac() {
+        let mut race = probe_race(0);
+        while race.is_counting_down() {
+            race.tick();
+        }
+        // Full throttle up to the hairpin, then pin it and hold the lean:
+        // the overshoot line, riding the 18-30 m/s dirt window that used to
+        // leave the lateral unbounded (46-50 m out, rider lost off-world).
+        while race.player_distance() < HAIRPIN_RIGHT.0 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        let mut max_lateral = 0.0_f32;
+        let mut recovered_inside = true;
+        let mut was_crashed = false;
+        while race.player_distance() < HAIRPIN_RIGHT.1 + 500.0 {
+            race.push_input(GameInput::Accelerate);
+            race.push_input(GameInput::SteerRight);
+            race.tick();
+            max_lateral = max_lateral.max(race.player_lateral());
+            let crashed = race.player_control() == Control::Crashed;
+            if was_crashed && !crashed {
+                recovered_inside &= race.player_lateral().abs() <= HALF_WIDTH;
+            }
+            was_crashed = crashed;
+        }
+        assert!(
+            max_lateral <= HALF_WIDTH + bike::OFFROAD_EXCURSION_LIMIT_M + 1.0,
+            "the excursion must stay recoverable (peak lateral {max_lateral})"
+        );
+        assert!(
+            recovered_inside,
+            "every crash recovery must place the rider back inside the edge"
         );
     }
 
