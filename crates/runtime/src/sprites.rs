@@ -1493,4 +1493,16 @@ mod tests {
             "atlas rows must upload without a staging copy on WebGL2"
         );
     }
+
+    #[test]
+    fn the_packed_atlas_fits_the_stated_byte_budget() {
+        // Item 16-test: the packer's 4096 px dimension cap alone would allow
+        // a 64 MB RGBA8 texture; the real pack must sit inside the stated
+        // budget (render::check_atlas_budget), or the suite fails.
+        let packed = pack_placeholder_atlas().expect("placeholder atlas packs");
+        let dims = render::AtlasDims::new(packed.atlas.width(), packed.atlas.height());
+        let bytes = render::check_atlas_budget(dims)
+            .expect("the packed atlas must fit the stated byte budget");
+        assert!(bytes > 0, "the packed atlas must be non-empty");
+    }
 }

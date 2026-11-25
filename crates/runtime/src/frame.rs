@@ -116,6 +116,10 @@ const GRASS_FOG: f32 = 0.9;
 const HAZE: [f32; 4] = [0.72, 0.80, 0.88, 1.0];
 /// Muted blue-green of the backdrop ridge silhouettes (B3).
 const BACKDROP: [f32; 4] = [0.40, 0.50, 0.45, 1.0];
+/// How far the zone's sky tint pulls the ridge colour (item 9): enough that
+/// each zone's ridge reads as its own, little enough that the ridge stays
+/// the same grey silhouette with its pale haze band everywhere.
+const BACKDROP_ZONE_TINT: f32 = 0.25;
 /// Lap length of the demo course, in meters — zones and landmarks wrap
 /// per lap (7c).
 pub const LAP_LENGTH: f32 = 2_000.0;
@@ -185,6 +189,17 @@ const CAMERA_HEADING_LEAN: f32 = 4.0;
 const CAMERA_LEAN: f32 = 2.0;
 /// Hard cap on the camera's lateral lean, in meters (B8).
 const CAMERA_LEAN_MAX: f32 = 1.5;
+
+/// The camera's corner-drift term, in lateral meters (2b): how the camera
+/// pans for the road's bend. The sign convention makes `RoadGeometry`
+/// authoritative — negative curvature is a left bend, center_offset falls —
+/// and the pan must act *opposite* to the sign of center_offset's change:
+/// in a left bend the camera pans left (negative lateral), which slides the
+/// world right on screen, into the corner the road is opening toward.
+/// Pure.
+fn camera_bend_lean(curvature: f32, speed: f32) -> f32 {
+    curvature * speed * CAMERA_LEAN
+}
 /// How much the view widens at full speed: focal shrinks by this fraction.
 const SPEED_WIDENING: f32 = 0.25;
 /// Camera shake amplitude while crashed, in world units.
@@ -623,7 +638,15 @@ impl GameFrame {
             road: RoadMesh::default(),
             batch: SpriteBatch::for_tier(render::QualityTier::WebGpuCapable),
         };
-        compose(race, geometry, mapping, &mut frame.batch, &mut frame.road);
+        compose(
+            race,
+            geometry,
+            mapping,
+            &mut frame.batch,
+            &mut frame.road,
+            &mut Vec::new(),
+            &TickBlend::identity(race),
+        );
         frame
     }
 
@@ -644,7 +667,10 @@ impl GameFrame {
 }
 
 /// Advances the race one tick and fills pre-owned batch and road buffers —
-/// the steady-state per-frame path, no reallocation after warmup.
+/// the steady-state per-tick path, no reallocation after warmup. Draws the
+/// exact tick it ran: between-tick interpolation needs the caller's frame
+/// delta, which this signature does not carry — [`GameSession::advance`] is
+/// the interpolation-aware steady-state path.
 pub fn advance_game_frame(
     race: &mut Race,
     geometry: &RoadGeometry,
@@ -657,7 +683,116 @@ pub fn advance_game_frame(
         race.push_input(*input);
     }
     race.tick();
-    compose(race, geometry, mapping, batch, road);
+    // The shell's per-tick path has no buffer of its own for the draw list
+    // (its signature predates it), so the list lives in a thread-local and
+    // is reused across ticks — one grow, then none. Single-threaded wasm and
+    // test hosts; never re-entered (compose does not call back in here).
+    thread_local! {
+        static DRAWS: std::cell::RefCell<Vec<DrawItem>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    DRAWS.with_borrow_mut(|draws| {
+        compose(
+            race,
+            geometry,
+            mapping,
+            batch,
+            road,
+            draws,
+            &TickBlend::identity(race),
+        );
+    });
+}
+
+/// The steady-state per-frame path (items 13/15): pre-owned batch, road
+/// mesh, and draw list, plus the tick clock and the last two ticks' bike
+/// poses that between-tick interpolation needs. [`Self::advance`] feeds one
+/// rendered frame's delta, runs the due 60 Hz ticks, and composes with the
+/// clock's leftover alpha — no allocation after warmup, and every rendered
+/// frame moves.
+pub struct GameSession {
+    batch: SpriteBatch,
+    road: RoadMesh,
+    draws: Vec<DrawItem>,
+    clock: sim::clock::TickClock,
+    blend: TickBlend,
+    /// The player's interpolated draw pose from the last `advance`.
+    player_pose: BikePose,
+}
+
+impl GameSession {
+    pub fn new(tier: render::QualityTier) -> Self {
+        Self {
+            batch: SpriteBatch::for_tier(tier),
+            road: RoadMesh::default(),
+            draws: Vec::new(),
+            clock: sim::clock::TickClock::new(),
+            blend: TickBlend::default(),
+            player_pose: [0.0, 0.0],
+        }
+    }
+
+    /// The composed sprite batch for this frame's draw.
+    pub fn batch(&self) -> &SpriteBatch {
+        &self.batch
+    }
+
+    /// The composed road mesh for this frame's draw.
+    pub fn road(&self) -> &RoadMesh {
+        &self.road
+    }
+
+    /// The interpolation alpha the last `advance` composed with.
+    pub fn alpha(&self) -> f64 {
+        self.clock.alpha()
+    }
+
+    /// The player's `(distance, lateral)` draw pose from the last `advance`
+    /// — the interpolated position the player sprite was drawn at.
+    pub fn player_draw_pose(&self) -> BikePose {
+        self.player_pose
+    }
+
+    /// Capacity of the reused draw list (test seam for the no-realloc
+    /// guarantee).
+    pub fn draw_list_capacity(&self) -> usize {
+        self.draws.capacity()
+    }
+
+    /// Feeds one rendered frame's delta, runs the due 60 Hz ticks (queueing
+    /// `inputs` before the first), and composes the interpolated frame.
+    /// The tick rate never changes: `frame_dt_secs` only decides how many
+    /// ticks run and how far between the last two this draw sits.
+    pub fn advance(
+        &mut self,
+        race: &mut Race,
+        geometry: &RoadGeometry,
+        mapping: &AtlasMapping,
+        inputs: &[GameInput],
+        frame_dt_secs: f64,
+    ) {
+        for input in inputs {
+            race.push_input(*input);
+        }
+        let ticks = self.clock.update(frame_dt_secs);
+        for _ in 0..ticks {
+            self.blend.snapshot_before_tick(race);
+            race.tick();
+        }
+        self.blend.curr = capture_poses(race);
+        self.blend.alpha = self.clock.alpha() as f32;
+        compose(
+            race,
+            geometry,
+            mapping,
+            &mut self.batch,
+            &mut self.road,
+            &mut self.draws,
+            &self.blend,
+        );
+        if let Some(state) = race.bike_states().next() {
+            self.player_pose = self.blend.interpolate(0, [state.pos_x, state.pos_y]);
+        }
+    }
 }
 
 /// One drawable sprite collected before painter's-order sorting: everything
@@ -699,17 +834,15 @@ fn fog_at(depth: f32) -> f32 {
 }
 
 /// One parallax layer of the distant backdrop (B3, 7c). The ridge profile
-/// is a function of *backdrop meters*: the camera's course distance scrolls
-/// it (far layers scroll less), each screen column samples a slice of it,
-/// and a road bend ahead shifts it — so the horizon changes on straights,
-/// which a screen-x sine never does.
+/// is a function of *backdrop meters*: each screen column samples a slice
+/// of it, a road bend ahead shifts it, and each zone contributes its own
+/// phase — so the horizon changes by zone and on straights, which a
+/// screen-x sine never does (item 9: never with distance travelled).
 struct BackdropLayer {
     base_px: f32,
     amp_px: f32,
     wavelength_px: f32,
     phase: f32,
-    /// Fraction of the camera's course distance that scrolls this layer.
-    parallax: f32,
     /// Backdrop meters per screen column.
     world_per_px: f32,
     /// Backdrop meters of shift per meter of road bend ahead.
@@ -726,7 +859,6 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 6.0,
         wavelength_px: 110.0,
         phase: 4.4,
-        parallax: 0.25,
         world_per_px: 1.0,
         shift_per_m: 0.3,
         haze: 0.55,
@@ -736,7 +868,6 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 9.0,
         wavelength_px: 150.0,
         phase: 2.1,
-        parallax: 0.45,
         world_per_px: 1.2,
         shift_per_m: 0.5,
         haze: 0.38,
@@ -746,7 +877,6 @@ const BACKDROP_LAYERS: [BackdropLayer; 3] = [
         amp_px: 12.0,
         wavelength_px: 210.0,
         phase: 0.8,
-        parallax: 0.7,
         world_per_px: 1.5,
         shift_per_m: 0.8,
         haze: 0.15,
@@ -762,6 +892,26 @@ const BACKDROP_COLUMN_PX: f32 = 12.0;
 /// straight runs and long curves alike.
 const BACKDROP_BEND_AHEAD: f32 = 150.0;
 
+/// How much zone-to-zone backdrop-amplitude spread feeds the ridge phase:
+/// phase = (amp - RIDGE_AMP_ORIGIN) * RIDGE_PHASE_PER_AMP, in backdrop
+/// meters per unit of amplitude. Carried by the zone sample's blended
+/// amplitude so the ridge handover slides across boundary windows.
+const RIDGE_PHASE_PER_AMP: f32 = 240.0;
+/// The amplitude the phase origin maps to (the coast zone's backdrop_amp).
+const RIDGE_AMP_ORIGIN: f32 = 0.7;
+
+/// The zone-anchored ridge phase for a camera distance (item 9): each zone
+/// contributes a constant offset to the ridge's horizontal coordinate, so
+/// the far profile changes by zone — never slides with distance travelled.
+/// The phase is carried by the zone sample's blended `backdrop_amp`, so it
+/// hands over smoothly across boundary windows. Pure.
+fn ridge_zone_phase(camera_distance: f32) -> f32 {
+    let amp = world::ZoneLayout::for_track()
+        .sample(camera_distance)
+        .backdrop_amp;
+    (amp - RIDGE_AMP_ORIGIN) * RIDGE_PHASE_PER_AMP
+}
+
 /// Ridge profile value for one layer at backdrop coordinate `u`, in [0, 1]:
 /// two incommensurate sines of backdrop meters so the ridge line never
 /// visibly repeats as it scrolls. Pure.
@@ -772,42 +922,56 @@ fn ridge_value(u: f32, layer: &BackdropLayer) -> f32 {
     (0.5 + 0.5 * (0.65 * a + 0.35 * b)).clamp(0.0, 1.0)
 }
 
-/// The world-anchored ridge profile for one screen column at a camera
-/// distance and bend shift, in [0, 1]. Pure — the frozen-horizon regression
-/// holds this: on a straight, changing `camera_distance` must change the
-/// value. `push_backdrop` renders through this same function, so the tested
-/// profile is the shipped one.
-fn backdrop_profile(camera_distance: f32, px: f32, shift: f32, layer: &BackdropLayer) -> f32 {
-    ridge_value(
-        camera_distance * layer.parallax + px * layer.world_per_px + shift,
-        layer,
-    )
+/// The world-anchored ridge profile for one screen column at a zone phase
+/// and bend shift, in [0, 1]. Pure — the zone-anchoring regression holds
+/// this (item 9): inside one zone the value never changes with camera
+/// distance, and the per-zone phase makes the profile differ between
+/// zones. `push_backdrop` renders through this same function, so the
+/// tested profile is the shipped one.
+fn backdrop_profile(zone_phase: f32, px: f32, shift: f32, layer: &BackdropLayer) -> f32 {
+    ridge_value(zone_phase + px * layer.world_per_px + shift, layer)
+}
+
+/// The backdrop's bend shift, in backdrop meters (2b): how a road bend
+/// ahead swings the ridge line. The sign convention makes `RoadGeometry`
+/// authoritative — negative curvature is a left bend, center_offset falls —
+/// and the swing must act *opposite* to the sign of center_offset's change:
+/// in a left bend (negative `bend`) the shift goes negative, which slides
+/// the ridge content right on screen, the way turning left swings the
+/// scenery rightward through the view. Pure.
+fn backdrop_bend_shift(bend: f32, layer: &BackdropLayer) -> f32 {
+    bend * layer.shift_per_m
 }
 
 /// Paints the layered hill silhouettes between the sky and the horizon
 /// (B3, 7c): one flat-color column quad per [`BACKDROP_COLUMN_PX`] pixels of
-/// screen, their tops traced by the world-anchored
-/// [`backdrop_profile`], shifted by the road's bend ahead and scaled by the
-/// zone's backdrop amplitude.
+/// screen, their tops traced by the zone-anchored [`backdrop_profile`]
+/// (item 9), shifted by the road's bend ahead, and pulled toward the
+/// zone's own sky tint — also blended across boundaries.
 fn push_backdrop(
     geometry: &RoadGeometry,
     camera: &world::Camera,
     road: &mut RoadMesh,
     horizon: f32,
-    backdrop_amp: f32,
+    zone: &world::ZoneSample,
 ) {
     let bend = geometry.center_offset(camera.distance + BACKDROP_BEND_AHEAD)
         - geometry.center_offset(camera.distance);
+    // The zone's own ridge phase and colour (item 9): both ride values the
+    // zone sample blends smoothly across boundary windows, while staying
+    // recognisably the same grey ridge and pale band.
+    let zone_phase = ridge_zone_phase(camera.distance);
+    let zone_ridge = lerp_color(BACKDROP, zone.sky_tint, BACKDROP_ZONE_TINT);
     for layer in &BACKDROP_LAYERS {
         // The bend shift moves in backdrop meters now, on the same
         // world-anchored coordinate the camera scrolls.
-        let bend_shift = -bend * layer.shift_per_m;
-        let color = lerp_color(BACKDROP, HAZE, layer.haze);
+        let bend_shift = backdrop_bend_shift(bend, layer);
+        let color = lerp_color(zone_ridge, HAZE, layer.haze);
         let mut x = 0.0;
         while x < VIEWPORT_WIDTH {
             let x1 = (x + BACKDROP_COLUMN_PX).min(VIEWPORT_WIDTH);
-            let height = backdrop_profile(camera.distance, x, bend_shift, layer);
-            let top = horizon - layer.base_px - layer.amp_px * backdrop_amp * height;
+            let height = backdrop_profile(zone_phase, x, bend_shift, layer);
+            let top = horizon - layer.base_px - layer.amp_px * zone.backdrop_amp * height;
             // One pixel past the horizon: the grass bands below cover the
             // seam, so no hairline gap opens between ridge and ground.
             road.push_screen_rect(x, top, x1, horizon + 1.0, color);
@@ -937,19 +1101,82 @@ fn player_camera(
     let player_distance = race.player_distance();
     let player_curvature = geometry.curvature_at(player_distance);
     let player_heading = race.player_heading();
+    let player_lateral = race.player_lateral();
+    // Lean with the player's steering and the road bend (2b), then clamp —
+    // but only on the tarmac. Off it, the camera follows the bike's
+    // lateral outright (3b): clamped at ±1.5 m, the sprite rode off the
+    // screen for the whole OFF ROAD stretch.
+    let lean =
+        player_heading * CAMERA_HEADING_LEAN + camera_bend_lean(player_curvature, player_speed);
+    let lateral = if player_lateral.abs() > geometry.road_width() * 0.5 {
+        player_lateral + lean
+    } else {
+        lean.clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
+    };
     world::Camera {
         distance: player_distance - CAMERA_TRAIL,
         height: CAMERA_HEIGHT + shake_height,
-        lateral: (player_heading * CAMERA_HEADING_LEAN
-            - player_curvature * player_speed * CAMERA_LEAN)
-            .clamp(-CAMERA_LEAN_MAX, CAMERA_LEAN_MAX)
-            + shake_lateral,
+        lateral: lateral + shake_lateral,
         focal: FOCAL * (1.0 - SPEED_WIDENING * (player_speed / game::bike::MAX_SPEED)),
         horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
         viewport: Viewport {
             width: VIEWPORT_WIDTH,
             height: VIEWPORT_HEIGHT,
         },
+    }
+}
+
+/// Bike poses at the last two ticks, plus the leftover fraction between
+/// them (item 13): what between-tick interpolation draws with. `identity`
+/// pins the draw to the latest tick — the single-tick paths' exactness.
+#[derive(Debug, Clone, Default)]
+struct TickBlend {
+    /// `(distance, lateral)` per bike slot at the tick before last.
+    prev: Vec<[f32; 2]>,
+    /// `(distance, lateral)` per bike slot at the latest tick.
+    curr: Vec<[f32; 2]>,
+    /// The clock's leftover fraction between the two ticks, in [0, 1).
+    alpha: f32,
+}
+
+/// One bike's pose at a tick: course distance and lateral offset.
+type BikePose = [f32; 2];
+
+/// Captures every bike's pose from the live race, in slot order.
+fn capture_poses(race: &Race) -> Vec<BikePose> {
+    race.bike_states().map(|s| [s.pos_x, s.pos_y]).collect()
+}
+
+impl TickBlend {
+    /// Draw exactly the current tick: no interpolation. The one-tick paths
+    /// (`GameFrame::build`, `advance_game_frame`) compose the state they
+    /// just ticked to.
+    fn identity(race: &Race) -> Self {
+        let curr = capture_poses(race);
+        Self {
+            prev: curr.clone(),
+            curr,
+            alpha: 0.0,
+        }
+    }
+
+    /// Records the pre-tick state; call immediately before `race.tick()`.
+    fn snapshot_before_tick(&mut self, race: &Race) {
+        self.prev = capture_poses(race);
+    }
+
+    /// The pose to draw for bike `slot` now: the last two ticks' poses
+    /// blended by the clock's leftover fraction. Falls back to the passed
+    /// current pose when the slot has no history (first frame, new rider).
+    fn interpolate(&self, slot: usize, curr: BikePose) -> BikePose {
+        let Some(prev) = self.prev.get(slot) else {
+            return curr;
+        };
+        let a = self.alpha;
+        [
+            prev[0] + (curr[0] - prev[0]) * a,
+            prev[1] + (curr[1] - prev[1]) * a,
+        ]
     }
 }
 
@@ -961,6 +1188,8 @@ fn compose(
     mapping: &AtlasMapping,
     batch: &mut SpriteBatch,
     road: &mut RoadMesh,
+    draws: &mut Vec<DrawItem>,
+    blend: &TickBlend,
 ) {
     let player_control = race.player_control();
 
@@ -1005,7 +1234,7 @@ fn compose(
         lerp_color(sky_color_at(0.0), zone.sky_tint, SKY_TINT_STRENGTH),
         lerp_color(sky_color_at(1.0), zone.sky_tint, SKY_TINT_STRENGTH),
     );
-    push_backdrop(geometry, &camera, road, horizon, zone.backdrop_amp);
+    push_backdrop(geometry, &camera, road, horizon, &zone);
 
     // Road: near-to-far trapezoid strips, alternating shades, with grass
     // bands behind every strip so the whole ground plane fades with depth
@@ -1088,9 +1317,13 @@ fn compose(
     // deterministic roadside scenery, then paint far to near. Each item's
     // ground shadow is a separate sprite a hair farther away, so painter's
     // order drops it onto the road just before the object (D3).
-    let mut draws: Vec<DrawItem> = Vec::new();
+    draws.clear();
     let shadow_uv = mapping.shadow_uv();
     for (slot, state) in race.bike_states().enumerate() {
+        // Between-tick interpolation (item 13): the draw pose blends the
+        // last two ticks' poses by the clock's leftover fraction, so a
+        // rendered frame between ticks still moves.
+        let [draw_distance, draw_lateral] = blend.interpolate(slot, [state.pos_x, state.pos_y]);
         let control = if slot == 0 {
             player_control
         } else {
@@ -1117,8 +1350,8 @@ fn compose(
             mapping.rival_uv(slot)
         };
         draws.push(DrawItem {
-            distance: state.pos_x + SHADOW_DEPTH_BIAS,
-            lateral: state.pos_y,
+            distance: draw_distance + SHADOW_DEPTH_BIAS,
+            lateral: draw_lateral,
             world_width: BIKE_SHADOW.0 * rival_scale,
             world_height: BIKE_SHADOW.1 * rival_scale,
             uv: shadow_uv,
@@ -1126,8 +1359,8 @@ fn compose(
             fog: 0.0,
         });
         draws.push(DrawItem {
-            distance: state.pos_x,
-            lateral: state.pos_y,
+            distance: draw_distance,
+            lateral: draw_lateral,
             world_width: BIKE_WORLD_WIDTH * rival_scale,
             world_height: BIKE_WORLD_HEIGHT * rival_scale,
             uv,
@@ -1177,15 +1410,15 @@ fn compose(
             fog: 0.0,
         });
     }
-    push_scenery(geometry, mapping, &mut draws, camera.distance);
-    push_landmarks(geometry, mapping, &mut draws, camera.distance);
+    push_scenery(geometry, mapping, draws, camera.distance);
+    push_landmarks(geometry, mapping, draws, camera.distance);
     push_distance_markers(
         mapping,
-        &mut draws,
+        draws,
         camera.distance + 2.0,
         camera.distance + ROAD_DRAW_DISTANCE,
     );
-    push_poles(geometry, mapping, &mut draws, camera.distance);
+    push_poles(geometry, mapping, draws, camera.distance);
     draws.sort_by(|a, b| b.distance.total_cmp(&a.distance));
     for item in draws {
         let style = SpriteStyle {
@@ -1591,7 +1824,11 @@ mod tests {
         // composing the same race into a fresh batch must agree with the
         // reused one, instance for instance.
         let mut fresh = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
-        compose(&race, &geometry, &mapping, &mut fresh, &mut road);
+        let mut draws = Vec::new();
+        let blend = TickBlend::identity(&race);
+        compose(
+            &race, &geometry, &mapping, &mut fresh, &mut road, &mut draws, &blend,
+        );
         let reused_positions: Vec<[f32; 2]> =
             batch.instances().iter().map(|i| i.position).collect();
         let fresh_positions: Vec<[f32; 2]> = fresh.instances().iter().map(|i| i.position).collect();
@@ -1712,32 +1949,6 @@ mod tests {
     // Wave 7c — world construction: distance-anchored horizon, zones,
     // landmarks. Red-first per the spec's verification list.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn the_backdrop_changes_with_camera_distance_on_a_straight() {
-        // Same screen column, two camera distances on the opening straight:
-        // the world-anchored ridge must differ — the frozen-horizon
-        // regression. A screen-anchored sine is frozen here.
-        let layer = &BACKDROP_LAYERS[1];
-        assert_ne!(
-            backdrop_profile(0.0, 400.0, 0.0, layer),
-            backdrop_profile(120.0, 400.0, 0.0, layer),
-            "on a straight the horizon must change with camera distance"
-        );
-        // Not just one column: the whole ridge line scrolls as the bike
-        // travels, so most columns read a different height.
-        let changed = (0..VIEWPORT_WIDTH as u32)
-            .step_by(50)
-            .filter(|px| {
-                backdrop_profile(0.0, *px as f32, 0.0, layer)
-                    != backdrop_profile(200.0, *px as f32, 0.0, layer)
-            })
-            .count();
-        assert!(
-            changed > 8,
-            "the whole ridge must scroll: {changed} columns changed"
-        );
-    }
 
     #[test]
     fn zone_tints_reach_the_composed_frame() {
@@ -1891,9 +2102,323 @@ mod tests {
         let mut b = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
         let mut road_a = RoadMesh::default();
         let mut road_b = RoadMesh::default();
-        compose(&race, &geometry, &mapping, &mut a, &mut road_a);
-        compose(&race, &geometry, &mapping, &mut b, &mut road_b);
+        let mut draws = Vec::new();
+        let blend = TickBlend::identity(&race);
+        compose(
+            &race,
+            &geometry,
+            &mapping,
+            &mut a,
+            &mut road_a,
+            &mut draws,
+            &blend,
+        );
+        compose(
+            &race,
+            &geometry,
+            &mapping,
+            &mut b,
+            &mut road_b,
+            &mut draws,
+            &blend,
+        );
         assert_eq!(a.instances(), b.instances());
         assert_eq!(road_a.vertices, road_b.vertices);
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 7 audit — rendering and camera (items 2b/3b/9/10/13/15).
+    // Sign convention: RoadGeometry is authoritative — negative curvature
+    // is a left bend (center_offset falls); effects of bend act opposite
+    // to the sign of center_offset's change.
+    // -------------------------------------------------------------------
+
+    /// A race on a synthetic constant-curvature track, released from the
+    /// grid and rolled up to speed with held throttle. Mirrored bends come
+    /// from flipping the curvature sign; every other input is identical.
+    fn bend_race(curvature: f32) -> (Race, RoadGeometry) {
+        let geometry = RoadGeometry::new(
+            vec![world::CurveSegment {
+                start: 0.0,
+                length: 2_000.0,
+                curvature,
+            }],
+            Vec::new(),
+            12.0,
+        );
+        let mut race = Race::new(RaceConfig {
+            rivals: 1,
+            track_length: LAP_LENGTH,
+            total_laps: 1,
+            seed: 0x5EED_C0DE,
+            geometry: geometry.clone(),
+        });
+        while race.is_counting_down() {
+            race.tick();
+        }
+        for _ in 0..40 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+        }
+        (race, geometry)
+    }
+
+    #[test]
+    fn the_camera_bend_lean_acts_opposite_to_the_center_offset_change() {
+        // Left bend: curvature < 0, center_offset falls (the convention's
+        // "-15 m at 300 m"). The camera must pan INTO the corner — negative
+        // lateral, which slides the world right on screen, opposite to the
+        // center_offset change — not slide left with the drift (the old
+        // sign doubled the drift).
+        assert!(
+            camera_bend_lean(-0.002, 30.0) < 0.0,
+            "left bend: camera pans left (world slides right)"
+        );
+        assert!(
+            camera_bend_lean(0.002, 30.0) > 0.0,
+            "right bend: camera pans right (world slides left)"
+        );
+
+        // End to end through the live camera: mirrored bends must mirror
+        // the pan, on the convention's side each time.
+        let (left_race, left_geo) = bend_race(-0.003);
+        let (right_race, right_geo) = bend_race(0.003);
+        assert!(
+            left_geo.center_offset(300.0) < 0.0 && right_geo.center_offset(300.0) > 0.0,
+            "the synthetic tracks really bend left/right"
+        );
+        let left = player_camera(&left_race, &left_geo, 0.0, 0.0);
+        let right = player_camera(&right_race, &right_geo, 0.0, 0.0);
+        assert!(
+            left.lateral < 0.0,
+            "left bend: camera pans left so the world slides right (got {})",
+            left.lateral
+        );
+        assert!(
+            right.lateral > 0.0,
+            "right bend: camera pans right (got {})",
+            right.lateral
+        );
+        assert!(
+            left.lateral.abs() <= CAMERA_LEAN_MAX && right.lateral.abs() <= CAMERA_LEAN_MAX,
+            "the bend lean stays clamped"
+        );
+    }
+
+    #[test]
+    fn the_backdrop_bend_shift_moves_the_ridge_opposite_to_the_center_offset_change() {
+        // A left bend ahead: center_offset over the backdrop window falls
+        // (negative bend). The ridge must slide RIGHT on screen — opposite
+        // to the center_offset change — so the profile's tallest column
+        // moves to a larger px, the way turning left swings the scenery
+        // rightward through the view.
+        let layer = &BACKDROP_LAYERS[0];
+        let bend = -60.0; // meters of center_offset change: a hard left
+        let shift = backdrop_bend_shift(bend, layer);
+        assert!(
+            shift < 0.0,
+            "left bend: negative shift slides ridge content right (got {shift})"
+        );
+        let peak = |shift: f32| {
+            let mut best = (f32::MIN, 0.0_f32);
+            let mut x = 0.0;
+            while x < VIEWPORT_WIDTH {
+                let v = backdrop_profile(0.0, x, shift, layer);
+                if v > best.0 {
+                    best = (v, x);
+                }
+                x += BACKDROP_COLUMN_PX;
+            }
+            best.1
+        };
+        assert!(
+            peak(shift) > peak(0.0),
+            "the ridge peak must move right in a left bend: {} -> {}",
+            peak(0.0),
+            peak(shift)
+        );
+    }
+
+    #[test]
+    fn the_camera_follows_the_bike_when_it_leaves_the_tarmac() {
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let half_width = geometry.road_width() * 0.5;
+        // Off the tarmac, right verge: the camera must track the bike's
+        // lateral so the sprite stays on screen (the OFF ROAD sprite
+        // disappearing was the hosted-run defect).
+        race.place_bike(0, 300.0, half_width + 3.0);
+        let off = player_camera(&race, &geometry, 0.0, 0.0);
+        assert!(
+            (off.lateral - race.player_lateral()).abs() < 0.5,
+            "off tarmac the camera must follow the bike's lateral (bike {}, camera {})",
+            race.player_lateral(),
+            off.lateral
+        );
+        // On the tarmac the soft-lean clamp still applies: the camera stays
+        // near the centreline even when the bike hugs the edge.
+        race.place_bike(0, 300.0, half_width - 1.0);
+        let on = player_camera(&race, &geometry, 0.0, 0.0);
+        assert!(
+            on.lateral.abs() <= CAMERA_LEAN_MAX + 1e-3,
+            "on tarmac the lean stays clamped (got {})",
+            on.lateral
+        );
+    }
+
+    #[test]
+    fn the_far_ridge_profile_is_zone_anchored_not_distance_scrolled() {
+        let layer = &BACKDROP_LAYERS[2];
+        let columns = || (0..VIEWPORT_WIDTH as u32).step_by(50);
+        // Two camera distances inside the coast, past its blend window, on
+        // a straight (zero bend shift): identical profile, column for
+        // column — the ridge does not slide with distance travelled.
+        for px in columns() {
+            assert_eq!(
+                backdrop_profile(ridge_zone_phase(100.0), px as f32, 0.0, layer),
+                backdrop_profile(ridge_zone_phase(160.0), px as f32, 0.0, layer),
+                "inside one zone the ridge must not move with distance at px {px}"
+            );
+        }
+        // Different zones, different ridge: each zone owns a profile.
+        let coast: Vec<f32> = columns()
+            .map(|px| backdrop_profile(ridge_zone_phase(100.0), px as f32, 0.0, layer))
+            .collect();
+        let town: Vec<f32> = columns()
+            .map(|px| backdrop_profile(ridge_zone_phase(700.0), px as f32, 0.0, layer))
+            .collect();
+        assert_ne!(coast, town, "each zone must have its own ridge profile");
+    }
+
+    #[test]
+    fn the_ridge_hands_over_smoothly_across_a_zone_boundary() {
+        // The coast→town boundary sits at 520 m. The zone-carried phase
+        // (and with it the ridge profile) must slide across the blend
+        // window, not snap: consecutive steps move by a small fraction of
+        // the full zone-to-zone phase gap.
+        let mut prev = ridge_zone_phase(460.0);
+        for d in [480.0, 500.0, 520.0, 540.0, 560.0] {
+            let phase = ridge_zone_phase(d);
+            assert!(
+                (phase - prev).abs() < RIDGE_PHASE_PER_AMP * 0.2,
+                "the ridge phase must blend across the boundary: {prev} -> {phase}"
+            );
+            prev = phase;
+        }
+    }
+
+    #[test]
+    fn a_landmark_grows_as_the_camera_closes() {
+        // Item 10: the landmark's projected height must increase at every
+        // step as the camera closes from 800 m out to 50 m.
+        let geometry = track_geometry();
+        let landmark = &world::course_landmarks()[0];
+        let (width, height) = WATER_TOWER_SIZE;
+        let camera_at = |distance: f32| world::Camera {
+            distance,
+            height: CAMERA_HEIGHT,
+            lateral: 0.0,
+            focal: FOCAL,
+            horizon_y_px: VIEWPORT_HEIGHT * HORIZON_FRAC,
+            viewport: Viewport {
+                width: VIEWPORT_WIDTH,
+                height: VIEWPORT_HEIGHT,
+            },
+        };
+        let mut prev = 0.0;
+        let mut steps = 0;
+        // 800 m out down to 50 m, in 50 m steps.
+        for step in 1..=16u32 {
+            let depth = 850.0 - step as f32 * 50.0;
+            let projector = world::Projector::new(&geometry, camera_at(landmark.distance - depth));
+            let billboard = projector
+                .billboard(landmark.distance, landmark.lateral, width, height)
+                .expect("the landmark is inside the draw window at this depth");
+            assert!(
+                billboard.height > prev,
+                "landmark height must grow at every step: depth {depth} m"
+            );
+            prev = billboard.height;
+            steps += 1;
+        }
+        assert_eq!(steps, 16, "the closing run samples the full 800→50 m range");
+    }
+
+    #[test]
+    fn frames_between_ticks_move_the_bike_by_alpha() {
+        // Item 13: a rendered frame between two ticks must not repeat the
+        // last tick's position — the draw blends the last two ticks' poses
+        // by the clock's leftover fraction, without changing the tick rate.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let mut session = GameSession::new(render::QualityTier::WebGpuCapable);
+        // Two full ticks prime the blend so every sampled frame below has a
+        // real (prev, curr) tick pair to interpolate.
+        for _ in 0..2 {
+            session.advance(
+                &mut race,
+                &geometry,
+                &mapping,
+                &[GameInput::Accelerate],
+                sim::clock::TICK_DURATION_SECS,
+            );
+        }
+        let half_tick = sim::clock::TICK_DURATION_SECS * 0.5;
+        let mut poses = Vec::new();
+        for _ in 0..60 {
+            session.advance(
+                &mut race,
+                &geometry,
+                &mapping,
+                &[GameInput::Accelerate],
+                half_tick,
+            );
+            poses.push(session.player_draw_pose());
+        }
+        for pair in poses.windows(2) {
+            assert!(
+                pair[1][0] != pair[0][0],
+                "the bike's draw pose must change every frame (alpha {})",
+                session.alpha()
+            );
+        }
+    }
+
+    #[test]
+    fn the_draw_list_is_reused_across_frames() {
+        // Item 15: composing must reuse one draw list, like the batch and
+        // road mesh — capacity may grow once, never per frame.
+        let mapping = mapping();
+        let (mut race, geometry) = demo_race();
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let mut batch = SpriteBatch::for_tier(render::QualityTier::WebGpuCapable);
+        let mut road = RoadMesh::default();
+        let mut draws: Vec<DrawItem> = Vec::new();
+        let blend = TickBlend::identity(&race);
+        compose(
+            &race, &geometry, &mapping, &mut batch, &mut road, &mut draws, &blend,
+        );
+        let first = draws.capacity();
+        assert!(first > 0, "the first compose sizes the draw list");
+        for _ in 0..100 {
+            race.push_input(GameInput::Accelerate);
+            race.tick();
+            let blend = TickBlend::identity(&race);
+            compose(
+                &race, &geometry, &mapping, &mut batch, &mut road, &mut draws, &blend,
+            );
+            assert_eq!(
+                draws.capacity(),
+                first,
+                "the draw list must be reused, not reallocated"
+            );
+        }
     }
 }
