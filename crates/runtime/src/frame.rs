@@ -2314,6 +2314,61 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_out_hairpin_overshoot_keeps_the_rider_and_the_road_in_frame() {
+        // The climbing hairpin taken flat out with the lean held: the exact
+        // overshoot line that used to lose the rider. Unlike the flat-road
+        // framing tests above, this builds FramingBounds from real
+        // track_geometry() distances inside the bend — the gap that let the
+        // saturation through (the old camera truncated the rider-band shift
+        // at the road bound, and the rider left the frame mid-hairpin and
+        // for the whole off-road slide after).
+        let geometry = track_geometry();
+        let mut race = Race::new(RaceConfig {
+            rivals: 0,
+            track_length: LAP_LENGTH,
+            total_laps: 1,
+            seed: 0x5EED_C0DE,
+            geometry: geometry.clone(),
+        });
+        while race.is_counting_down() {
+            race.tick();
+        }
+        let mut ticks = 0;
+        while race.player_distance() < 1_280.0 {
+            race.push_input(GameInput::Accelerate);
+            if race.player_distance() > 1_080.0 {
+                race.push_input(GameInput::SteerRight);
+            }
+            race.tick();
+            if race.player_distance() < 1_100.0 {
+                continue;
+            }
+            let camera = player_camera(&race, &geometry, 0.0, 0.0);
+            let px_per_m = camera.focal / CAMERA_TRAIL;
+            let rider_axis = race.player_lateral() + geometry.center_offset(race.player_distance())
+                - geometry.center_offset(camera.distance);
+            let rider_px = px_per_m * (rider_axis - camera.lateral);
+            assert!(
+                rider_px.abs() <= VIEWPORT_WIDTH * 0.5,
+                "tick {ticks} at {}: the rider must never leave the frame \
+                 (rider {rider_px} px, axis {rider_axis})",
+                race.player_distance()
+            );
+            assert!(
+                rider_px.abs() <= world::RIDER_BAND_FRAC * VIEWPORT_WIDTH * 0.5 + 1.0,
+                "tick {ticks} at {}: the rider must stay in the screen band \
+                 (rider {rider_px} px)",
+                race.player_distance()
+            );
+            ticks += 1;
+        }
+        assert!(
+            ticks > 100,
+            "the probe must ride the hairpin window ({ticks} in-window ticks)"
+        );
+    }
+
+    #[test]
     fn the_far_ridge_profile_is_zone_anchored_not_distance_scrolled() {
         let layer = &BACKDROP_LAYERS[2];
         let columns = || (0..VIEWPORT_WIDTH as u32).step_by(50);
