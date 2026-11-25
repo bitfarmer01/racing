@@ -1,352 +1,220 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Racing — browser shell</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Racing</title>
+  <link rel="icon" href="data:,">
   <style>
-    :root { color-scheme: dark; }
-    html, body { height: 100%; }
-    body {
-      margin: 0;
-      overflow: hidden;
-      background: #101014;
-      color: #d8d8de;
-      font-family: system-ui, sans-serif;
+    /* Design tokens. The same palette drives the 3D scene (render/src/style.rs);
+       loader.js overwrites these from the wasm on boot and on each track
+       change, so --accent follows the track. */
+    :root {
+      --ink: #14121a;
+      --paper: #f4f1ea;
+      --accent: #ffb347;
+      --accent-rgb: 255, 179, 71;
+      --dim: rgba(244, 241, 234, 0.62);
+      --glass: rgba(10, 12, 18, 0.46);
+      --glass-strong: rgba(10, 12, 18, 0.72);
+      --line: rgba(255, 255, 255, 0.14);
+      --hot: #ff4d2e;
+      --gold: #ffc23d;
+      --boost: #48c8ff;
+      --good: #6fe39b;
+      --font: "Inter", "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
     }
-    /* Letterbox (playtest finding): runtime composes every frame in a fixed
-       800x450 16:9 space (runtime::VIEWPORT_WIDTH/HEIGHT — another worker's
-       crate; the ratio is mirrored here on purpose). The frame keeps that
-       aspect: wide or tall windows letterbox with black bars instead of
-       stretching the scene non-uniformly. All overlays are scoped to the
-       frame, so HUD chrome tracks the picture, not the window. */
-    #stage {
-      position: fixed;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      background: #000;
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden; background: #07080b; color: var(--paper);
+      font-family: var(--font); -webkit-font-smoothing: antialiased; user-select: none;
     }
-    #frame {
-      position: relative;
-      width: min(100vw, calc(100vh * 16 / 9));
-      aspect-ratio: 16 / 9;
-    }
-    canvas {
-      display: block;
-      width: 100%;
-      height: 100%;
-      background: #000;
-    }
-    /* Overlay covers the stage until the game boots; then it is removed. */
-    #overlay {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      text-align: center;
-      background: rgba(8, 8, 12, 0.82);
-      padding: 1rem;
-    }
-    #overlay.error { color: #ff8383; }
-    /* HUD: translucent glass strip with bright figures, readable over the
-       pale sky (playtest E1); blurred and gradient-shaded to match the HD
-       in-game look. */
-    #hud:not([hidden]) {
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      padding: 8px 16px;
-      background: linear-gradient(180deg, rgba(18, 20, 28, 0.72), rgba(8, 10, 14, 0.84));
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 10px;
-      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
-      backdrop-filter: blur(6px);
-      color: #f2f4f8;
-      pointer-events: none;
-    }
-    #hud-speed {
-      font: 700 30px/1 ui-monospace, monospace;
-      color: #ffffff;
-    }
-    #hud-speed .unit {
-      font-size: 13px;
-      font-weight: 400;
-      color: #aeb6c2;
-      margin-left: 4px;
-    }
-    #hud-lines {
-      font: 13px/1.55 ui-monospace, monospace;
-      color: #d5dae2;
-    }
-    #lap-bar {
-      width: 180px;
-      height: 4px;
-      border-radius: 2px;
-      background: rgba(255, 255, 255, 0.14);
-      overflow: hidden;
-    }
-    /* Zone ticks + labels on the lap bar (presentation config duplicated
-       from crates/world/src/geometry.rs — see zones.js). Ticks sit at the
-       zone boundaries, labels under each zone's midpoint; the current zone's
-       label lights up. Lives outside the bar's overflow:hidden. */
-    #lap-track {
-      position: relative;
-      width: 180px;
-      margin-top: 4px;
-    }
-    #zone-markers {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      font: 9px/1 ui-monospace, monospace;
-    }
-    .zone-tick {
-      position: absolute;
-      top: 0;
-      width: 1px;
-      height: 4px;
-      background: rgba(255, 255, 255, 0.55);
-    }
-    .zone-label {
-      position: absolute;
-      top: 6px;
-      transform: translateX(-50%);
-      color: rgba(213, 218, 226, 0.65);
-      letter-spacing: 0.04em;
-    }
-    .zone-label.current {
-      color: #86efac;
-      font-weight: 700;
-    }
-    #lap-fill {
-      width: 0%;
-      height: 100%;
-      background: linear-gradient(90deg, #34d399, #86efac);
-      border-radius: 2px;
-    }
-    /* Combat stamina bar, under the lap bar: amber while fighting, red
-       when the bar runs low. */
-    #stamina-bar {
-      width: 180px;
-      height: 4px;
-      margin-top: 3px;
-      border-radius: 2px;
-      background: rgba(255, 255, 255, 0.14);
-      overflow: hidden;
-    }
-    #stamina-fill {
-      width: 100%;
-      height: 100%;
-      background: linear-gradient(90deg, #fbbf24, #fde68a);
-      border-radius: 2px;
-    }
-    #stamina-fill.low {
-      background: linear-gradient(90deg, #ef4444, #fca5a5);
-    }
-    /* Rider-state badge, top-right (playtest E5). */
-    #rider-state:not([hidden]) {
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      font: 700 14px system-ui, sans-serif;
-      letter-spacing: 0.08em;
-      color: #ffffff;
-      padding: 6px 14px;
-      border-radius: 999px;
-      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
-      pointer-events: none;
-    }
-    #rider-state.crashed { background: linear-gradient(180deg, #d63a3a, #a52222); }
-    #rider-state.offroad { background: linear-gradient(180deg, #cd6a1b, #99450c); }
-    #rider-state.braking { background: linear-gradient(180deg, #2f63e0, #1c3f9e); }
-    #rider-state.grid {
-      background: rgba(8, 10, 14, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      color: #ffd75e;
-    }
-    /* Author display rules must not defeat the hidden attribute's UA
-       display:none — scope them to :not([hidden]) so overlays actually
-       disappear when hidden is set. */
-    #countdown:not([hidden]) {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      font: 700 84px ui-monospace, monospace;
-      color: #ffd75e;
-      text-shadow: 0 2px 12px #000;
-      pointer-events: none;
-    }
-    #finish:not([hidden]) {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      text-align: center;
-      background: rgba(8, 8, 12, 0.72);
-    }
-    /* Shell-side pause (Escape): the sim stops ticking, the picture holds. */
-    #paused:not([hidden]) {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      font: 700 44px ui-monospace, monospace;
-      color: #ffd75e;
-      text-shadow: 0 2px 12px #000;
-      background: rgba(8, 8, 12, 0.55);
-      pointer-events: none;
-    }
-    #finish h1 {
-      margin: 0 0 0.5rem;
-      font-size: 1.6rem;
-      color: #ffd75e;
-    }
-    #finish p {
-      margin: 0 0 1rem;
-      color: #c9cdd4;
-    }
-    #restart {
-      font: 600 1rem system-ui, sans-serif;
-      padding: 0.5rem 1.4rem;
-      border-radius: 6px;
-      border: 1px solid #4a4a56;
-      background: #26262e;
-      color: #f0f0f4;
-      cursor: pointer;
-    }
-    #restart:hover { background: #33333e; }
-    /* Mute control (bottom-right): toggles the shell's Web Audio master
-       gain — see audio.js. Pointer-events auto, unlike the HUD chrome. */
-    #mute-btn {
-      position: absolute;
-      bottom: 12px;
-      right: 12px;
-      font-size: 18px;
-      line-height: 1;
-      padding: 8px;
-      border-radius: 8px;
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      background: rgba(8, 10, 14, 0.72);
-      cursor: pointer;
-      z-index: 10;
-    }
-    #mute-btn:hover { background: rgba(30, 32, 42, 0.85); }
-    #finish-times {
-      font: 600 1.05rem ui-monospace, monospace;
-      color: #f2f4f8;
-    }
-    /* Track-select control (wave 8): the boot overlay lists every catalog
-       course; the loader reads its value and boots that course. Styled to
-       the overlay's dark-glass idiom. */
-    #track-select {
-      font: 600 1rem system-ui, sans-serif;
-      color: #f0f0f4;
-      background: #26262e;
-      border: 1px solid #4a4a56;
-      border-radius: 6px;
-      padding: 0.5rem 0.75rem;
-      margin-top: 0.75rem;
-      cursor: pointer;
-    }
-    #track-select:hover { background: #33333e; }
-    .track-choice {
-      display: block;
-      margin-top: 1.25rem;
-      margin-bottom: 0.35rem;
-      font: 700 0.8rem system-ui, sans-serif;
-      letter-spacing: 0.08em;
-      color: #aeb6c2;
-    }
-    #keys {
-      margin-top: 0.75rem;
-      font-size: 0.85rem;
-      color: #84848e;
-    }
-    /* Focus prompt (iframe focus capture): shown after boot whenever the
-       frame has never been engaged (click/keydown/focus). The overlay is
-       pointer-events:none — the first click passes through to the stage, so
-       one click focuses the frame AND counts as engagement, and the overlay
-       can never swallow a keypress. */
-    #focus-overlay:not([hidden]) {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      text-align: center;
-      pointer-events: none;
-    }
-    #focus-title {
-      font: 700 34px system-ui, sans-serif;
-      letter-spacing: 0.12em;
-      color: #ffd75e;
-      text-shadow: 0 2px 12px #000;
-    }
-    #focus-keys {
-      margin-top: 0.75rem;
-      font-size: 0.85rem;
-      color: #d5dae2;
-      text-shadow: 0 1px 6px #000;
-    }
-    /* Control affordance line under the HUD strip (visible while riding). */
-    #hud-keys:not([hidden]) {
-      position: absolute;
-      top: 88px;
-      left: 12px;
-      font: 12px/1.4 ui-monospace, monospace;
-      color: rgba(245, 247, 250, 0.8);
-      text-shadow: 0 1px 4px #000;
-      pointer-events: none;
+    canvas#game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; outline: none; }
+    .num { font-variant-numeric: tabular-nums; }
+    .hidden { display: none !important; }
+    .layer { position: fixed; inset: 0; pointer-events: none; }
+    .layer > * { pointer-events: auto; }
+
+    /* Boot */
+    #boot { display: grid; place-items: center; background: radial-gradient(ellipse at 50% 60%, #1a1420, #07080b 70%); z-index: 30; }
+    #boot .box { text-align: center; }
+    #boot .spin { width: 42px; height: 42px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--hot); margin: 0 auto 18px; animation: spin 0.9s linear infinite; }
+    #boot-status { color: var(--dim); font-size: 14px; letter-spacing: 0.04em; max-width: 520px; line-height: 1.5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Menu */
+    #menu { z-index: 20; display: flex; flex-direction: column; justify-content: space-between;
+      background: linear-gradient(90deg, rgba(7, 8, 11, 0.82) 0%, rgba(7, 8, 11, 0.35) 45%, rgba(7, 8, 11, 0) 70%); padding: 6vh 5vw; }
+    .brand { font-weight: 900; font-style: italic; letter-spacing: -0.02em; font-size: clamp(48px, 8vw, 104px); line-height: 0.9; margin: 0;
+      text-shadow: 5px 5px 0 var(--ink), 0 6px 40px rgba(0, 0, 0, 0.5); }
+    .brand span { color: var(--hot); }
+    .tag { color: var(--dim); margin: 14px 0 0; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .tracks { display: flex; flex-direction: column; gap: 10px; width: min(440px, 90vw); margin-top: 4vh; }
+    .track { text-align: left; background: var(--glass); border: 1px solid var(--line); color: var(--paper); border-radius: 12px; padding: 14px 16px;
+      cursor: pointer; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: transform 0.15s, border-color 0.15s, background 0.15s; font: inherit; }
+    .track:hover { transform: translateX(4px); border-color: rgba(255, 255, 255, 0.3); }
+    .track.sel { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.16); box-shadow: inset 4px 0 0 var(--accent), 4px 4px 0 var(--ink); }
+    .track .t { font-weight: 800; font-size: 18px; display: flex; justify-content: space-between; align-items: baseline; }
+    .track .t small { color: var(--dim); font-weight: 600; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .track .b { color: var(--dim); font-size: 13px; margin-top: 4px; line-height: 1.4; }
+    .actions { display: flex; gap: 12px; align-items: center; margin-top: 22px; flex-wrap: wrap; }
+    .btn { font: inherit; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; border-radius: 999px; padding: 14px 30px; cursor: pointer;
+      border: 1px solid var(--line); background: var(--glass); color: var(--paper); }
+    .btn.primary { background: var(--hot); border-color: var(--hot); color: #fff; box-shadow: 0 10px 30px rgba(255, 77, 46, 0.35); }
+    .btn:hover { filter: brightness(1.1); }
+    .keys { color: var(--dim); font-size: 13px; line-height: 1.9; }
+    kbd { font: 700 11px var(--font); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; margin: 0 2px; color: var(--paper); background: rgba(255, 255, 255, 0.06); }
+    .corner { position: fixed; right: 18px; top: 16px; display: flex; gap: 8px; z-index: 25; }
+    .icon { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line); background: var(--glass); color: var(--paper); cursor: pointer; font-size: 16px; }
+
+    /* HUD */
+    #hud { z-index: 10; pointer-events: none; }
+    #hud * { pointer-events: none; }
+    .panel { position: absolute; background: var(--glass); border: 1px solid var(--line); border-radius: 14px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+    #pos { left: 22px; top: 18px; padding: 10px 18px 12px; min-width: 190px; }
+    #pos .p { font-weight: 900; font-style: italic; font-size: 54px; line-height: 1; }
+    #pos .p sup { font-size: 22px; margin-left: 2px; }
+    #pos .p small { font-size: 22px; color: var(--dim); font-style: normal; font-weight: 700; margin-left: 6px; }
+    .row { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; color: var(--dim); margin-top: 6px; }
+    .row b { color: var(--paper); font-weight: 700; }
+    .bal { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.1); margin-top: 10px; overflow: hidden; }
+    .bal i { display: block; height: 100%; width: 100%; background: var(--good); transition: width 0.15s, background 0.15s; }
+    .bal i.low { background: var(--hot); }
+    #lapline { font-weight: 800; font-size: 15px; color: var(--accent); letter-spacing: 0.06em; margin-top: 6px; }
+    #map { right: 22px; top: 18px; width: 200px; height: 200px; padding: 0; overflow: hidden; }
+    #map canvas { width: 100%; height: 100%; display: block; }
+    #dash { right: 22px; bottom: 22px; width: 250px; padding: 14px 18px 16px; }
+    #tach { width: 100%; height: 56px; display: block; }
+    .speed { display: flex; align-items: baseline; justify-content: space-between; margin-top: -6px; }
+    .speed .v { font-weight: 900; font-style: italic; font-size: 60px; line-height: 1; }
+    .speed .u { color: var(--dim); font-size: 13px; font-weight: 700; letter-spacing: 0.1em; }
+    .speed .g { font-weight: 900; font-size: 34px; color: var(--gold); }
+    .speed .g small { font-size: 11px; color: var(--dim); display: block; letter-spacing: 0.1em; text-align: center; }
+    .boostbar { height: 8px; border-radius: 999px; background: rgba(255, 255, 255, 0.1); overflow: hidden; margin-top: 10px; }
+    .boostbar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #2a7fff, var(--boost)); border-radius: inherit; transition: width 0.08s linear; }
+    .boostlbl { display: flex; justify-content: space-between; font-size: 11px; font-weight: 800; letter-spacing: 0.12em; color: var(--dim); margin-top: 6px; }
+    .boostlbl .on { color: var(--boost); }
+    #draft { color: var(--good); opacity: 0; transition: opacity 0.2s; }
+    #draft.on { opacity: 1; }
+    #center { position: absolute; left: 0; right: 0; top: 24vh; text-align: center; }
+    #count { font-weight: 900; font-style: italic; font-size: clamp(90px, 16vw, 190px); line-height: 1;
+      -webkit-text-stroke: 3px var(--ink); paint-order: stroke fill; text-shadow: 7px 7px 0 var(--ink), 0 10px 40px rgba(0, 0, 0, 0.55); }
+    #count.go { color: var(--good); }
+    #banner { display: inline-block; margin-top: 10px; font-weight: 900; font-style: italic; font-size: clamp(26px, 4vw, 44px); letter-spacing: 0.02em;
+      padding: 6px 22px; border-radius: 10px; text-shadow: 3px 3px 0 var(--ink); }
+    #banner.lap { background: var(--accent); color: var(--ink); text-shadow: none; box-shadow: 5px 5px 0 var(--ink); }
+    #banner.warn { background: rgba(200, 20, 20, 0.75); }
+    #toast { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); text-align: center; }
+    #toast div { font-weight: 800; font-size: 18px; padding: 8px 18px; border-radius: 999px; background: var(--glass-strong); border: 1px solid var(--line); margin-bottom: 6px;
+      animation: pop 2.4s forwards; }
+    #toast .best { color: var(--good); }
+    #toast .bad { color: var(--hot); }
+    @keyframes pop { 0% { opacity: 0; transform: translateY(-8px); } 8% { opacity: 1; transform: none; } 80% { opacity: 1; } 100% { opacity: 0; } }
+    #hint { position: absolute; left: 22px; bottom: 22px; padding: 10px 14px; font-size: 12px; color: var(--dim); line-height: 1.9; transition: opacity 1s; }
+    #flash { position: absolute; inset: 0; background: radial-gradient(ellipse at center, rgba(255, 60, 30, 0) 50%, rgba(255, 40, 20, 0.45)); opacity: 0; transition: opacity 0.35s; }
+
+    /* Overlays */
+    .modal { z-index: 22; display: grid; place-items: center; background: rgba(5, 6, 9, 0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+    .card { background: var(--glass-strong); border: 1px solid var(--line); border-radius: 18px; padding: 26px 30px; min-width: min(460px, 92vw); text-align: center; }
+    .card h2 { margin: 0 0 4px; font-weight: 900; font-style: italic; font-size: 44px; }
+    .card .sub { color: var(--dim); margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; margin: 8px 0 18px; font-size: 15px; }
+    td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+    td:first-child { width: 38px; color: var(--dim); font-weight: 800; }
+    td:last-child { text-align: right; }
+    tr.me td { color: var(--gold); font-weight: 800; }
+    .card .actions { justify-content: center; }
+
+    @media (max-width: 720px) {
+      #map { width: 130px; height: 130px; }
+      #dash { width: 200px; }
+      .speed .v { font-size: 44px; }
+      #pos .p { font-size: 40px; }
+      #hint { display: none; }
     }
   </style>
 </head>
 <body>
-  <div id="stage">
-    <div id="frame">
-    <canvas id="game"></canvas>
-    <div id="overlay"><div>
-      <div id="status">Loading…</div>
-      <label class="track-choice" for="track-select">TRACK</label>
-      <select id="track-select">
-        <option value="coast-run">Coast Run</option>
-        <option value="island-hop">Island Hop</option>
-      </select>
-      <div id="keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
-    </div></div>
-    <div id="hud" hidden>
-      <div id="hud-speed"><span id="speed-value">0</span><span class="unit">km/h</span></div>
-      <div id="hud-lines">
-        <div id="hud-pos"></div>
-        <div id="hud-lap"></div>
-        <div id="lap-track">
-          <div id="lap-bar"><div id="lap-fill"></div></div>
-        </div>
-        <div id="stamina-bar"><div id="stamina-fill"></div></div>
-      </div>
-    </div>
-    <div id="focus-overlay" hidden><div>
-      <div id="focus-title">CLICK TO RIDE</div>
-      <div id="focus-keys">Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · R restart · Esc pause</div>
-    </div></div>
-    <div id="hud-keys" hidden>Up/W accelerate · Down/S or Space brake · Left/Right or A/D steer · X punch · Z kick · R restart · Esc pause</div>
-    <div id="rider-state" hidden></div>
-    <div id="countdown" hidden></div>
-    <div id="paused" hidden>PAUSED — Esc to resume</div>
-    <div id="finish" hidden>
-      <div>
-        <h1>Finish!</h1>
-        <p id="finish-text"></p>
-        <p id="finish-times"></p>
-        <button id="restart" type="button">Race again</button>
-      </div>
-    </div>
-    <button id="mute-btn" type="button" title="Mute" aria-label="Mute">🔊</button>
+  <canvas id="game" tabindex="0"></canvas>
+
+  <div id="boot" class="layer">
+    <div class="box">
+      <div class="spin"></div>
+      <div id="boot-status">Starting the engine…</div>
     </div>
   </div>
-  <script type="module" src="loader.js"></script>
+
+  <div id="menu" class="layer hidden">
+    <div>
+      <h1 class="brand">RACING<span>.</span></h1>
+      <p class="tag">Eight riders · three laps · no rules</p>
+      <div class="tracks" id="tracks"></div>
+      <div class="actions">
+        <button class="btn primary" id="start">Race</button>
+        <span class="keys"><kbd>Enter</kbd> to start</span>
+      </div>
+    </div>
+    <div class="keys">
+      <kbd>W</kbd><kbd>↑</kbd> throttle &nbsp; <kbd>S</kbd><kbd>↓</kbd> brake &nbsp; <kbd>A</kbd><kbd>D</kbd> steer &nbsp;
+      <kbd>Shift</kbd> boost &nbsp; <kbd>X</kbd> punch &nbsp; <kbd>C</kbd> camera &nbsp; <kbd>Esc</kbd> pause &nbsp; · &nbsp; gamepad supported
+    </div>
+  </div>
+
+  <div class="corner">
+    <button class="icon" id="mute" title="Mute">🔊</button>
+    <button class="icon" id="fs" title="Fullscreen">⛶</button>
+  </div>
+
+  <div id="hud" class="layer hidden">
+    <div id="flash"></div>
+    <div id="pos" class="panel">
+      <div class="p num"><span id="h-pos">1</span><sup id="h-suf">st</sup><small id="h-of">/ 8</small></div>
+      <div id="lapline" class="num">LAP <span id="h-lap">1 / 3</span></div>
+      <div class="row num">TIME <b id="h-time">0:00.000</b></div>
+      <div class="row num">BEST <b id="h-best">–</b></div>
+      <div class="bal"><i id="h-bal"></i></div>
+    </div>
+    <div id="map" class="panel"><canvas id="minimap" width="400" height="400"></canvas></div>
+    <div id="dash" class="panel">
+      <canvas id="tach" width="500" height="112"></canvas>
+      <div class="speed">
+        <div><span class="v num" id="h-speed">0</span> <span class="u">KM/H</span></div>
+        <div class="g num"><span id="h-gear">1</span><small>GEAR</small></div>
+      </div>
+      <div class="boostbar"><i id="h-boost"></i></div>
+      <div class="boostlbl"><span id="h-boostlbl">BOOST</span><span id="draft">SLIPSTREAM</span></div>
+    </div>
+    <div id="center"><div id="count" class="num"></div><div id="banner" class="hidden"></div></div>
+    <div id="toast"></div>
+    <div id="hint" class="panel">
+      <kbd>W</kbd> throttle <kbd>S</kbd> brake <kbd>A</kbd><kbd>D</kbd> steer <kbd>Shift</kbd> boost <kbd>X</kbd> punch <kbd>C</kbd> camera <kbd>Esc</kbd> pause
+    </div>
+  </div>
+
+  <div id="pause" class="layer modal hidden">
+    <div class="card">
+      <h2>Paused</h2>
+      <div class="sub" id="pause-sub"></div>
+      <div class="actions">
+        <button class="btn primary" id="resume">Resume</button>
+        <button class="btn" id="restart">Restart</button>
+        <button class="btn" id="quit">Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="results" class="layer modal hidden">
+    <div class="card">
+      <h2 id="r-title">Finished</h2>
+      <div class="sub" id="r-sub"></div>
+      <table id="r-table"></table>
+      <div class="actions">
+        <button class="btn primary" id="again">Race again</button>
+        <button class="btn" id="tomenu">Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./loader.js"></script>
 </body>
 </html>

@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# Builds both wasm backend bundles (WebGPU / WebGL2) for the browser and
-# prints a gzip-size report of each wasm artifact against the blueprint's
-# 2 MB gzipped budget.
+# Builds both wasm bundles (WebGPU and WebGL2) into web/pkg-* and prints a
+# gzip-size report against a 2 MB budget per bundle.
 #
-# Size flags: the workspace release profile in the root Cargo.toml already
-# carries the aggressive set — opt-level="z" (tighter than "s"), fat LTO,
-# one codegen unit, panic=abort, strip — so `--release` picks those up.
-# wasm-opt runs when the binary-wasm tools are on PATH.
+# The `wasm` cargo profile (root Cargo.toml) is release with opt-level "s".
+# wasm-opt runs when binaryen is on PATH.
 #
-# Serves with, from the repo root: python3 -m http.server
-# then open http://localhost:8000/web/ — loader.js picks dist/pkg-webgpu or
-# dist/pkg-webgl2 underneath web/.
+# Serve from the repo root (python3 -m http.server) and open
+# http://localhost:8000/web/ — loader.js picks pkg-webgpu or
+# pkg-webgl2. The built bundles are committed so the page runs as-is.
 
 set -euo pipefail
 
@@ -19,7 +16,7 @@ cd "$ROOT"
 
 TARGET=wasm32-unknown-unknown
 BUDGET_BYTES=$((2 * 1024 * 1024))
-OUT=web/dist
+OUT=web
 
 if command -v rustup >/dev/null 2>&1; then
   rustup target add "$TARGET" >/dev/null
@@ -35,11 +32,11 @@ fi
 build_bundle() {
   local features="$1" out_name="$2"
   echo "=== building $out_name (features: $features) ==="
-  cargo build -p web --target "$TARGET" --release --no-default-features --features "$features"
+  cargo build -p web --target "$TARGET" --profile wasm --no-default-features --features "$features"
 
-  local wasm="target/$TARGET/release/web.wasm"
+  local wasm="target/$TARGET/wasm/web.wasm"
   if command -v wasm-opt >/dev/null 2>&1; then
-    local optimized="target/$TARGET/release/web.opt.wasm"
+    local optimized="target/$TARGET/wasm/web.opt.wasm"
     wasm-opt -Os --strip-debug "$wasm" -o "$optimized"
     wasm="$optimized"
   else

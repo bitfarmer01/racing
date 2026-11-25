@@ -1,203 +1,150 @@
-//! Deterministic pursuit AI for rival bikes, built on world-crate lookahead
-//! queries.
+//! Rival riders.
 //!
-//! Each rival holds a preferred lane offset and, once per tick, turns world
-//! geometry ahead of it into a plain [`Intent`]: slow into corners using the
-//! curvature at the far lookahead point, and take the inside line using the
-//! curvature at the near lookahead point. The same state, geometry, and
-//! distance always produce the same decision — no RNG in the tick path.
-//!
-//! Positive curvature bends the road right (the centreline shifts
-//! positive), so the inside of a left-hand corner — negative curvature — is
-//! on the negative-lateral side.
+//! Each rival follows a lookahead point on its own lane (cutting to the
+//! inside of corners), plans its speed from the curvature ahead against its
+//! grip budget, swings out to pass slower bikes, and picks fights when a
+//! bike rides alongside.
 
-use crate::input::{Intent, Steer, Throttle};
-use world::RoadGeometry;
+use glam::Vec2;
 
-/// How far ahead (meters) the AI samples curvature for corner speed.
-pub const LOOKAHEAD_FAR: f32 = 90.0;
-/// How far ahead (meters) the AI samples curvature for the racing line.
-pub const LOOKAHEAD_NEAR: f32 = 30.0;
-/// Corner sensitivity: target speed is `MAX_SPEED / (1 + SENSITIVITY * |k|)`.
-pub const CORNER_SENSITIVITY: f32 = 80.0;
-/// Curvature below this is treated as straight, in 1/meters.
-pub const CURVE_DEADZONE: f32 = 0.004;
-/// Half the lateral span of lanes the grid spreads across, in meters: a
-/// six-rival field then rides lanes a lane-and-a-half apart, clear of the
-/// side-crash gap and of the shoulder rumble band.
-pub const GRID_HALF_SPAN: f32 = 4.0;
-/// How far off the preferred lane toward the inside of a corner the AI leans,
-/// in meters. Scaled per rival by [`lane_bias_factor`] so a packed field
-/// spreads across the bend instead of stacking on one line.
-pub const INSIDE_BIAS: f32 = 3.0;
+use crate::bike::{Bike, Controls, BRAKE_DECEL, GRIP_ROAD};
+use crate::track::Track;
 
-/// The share of [`INSIDE_BIAS`] a rival on lane `lane` takes: riders near
-/// an edge barely cut in, riders near the centre cut deepest. Keeps
-/// in-bend lines apart by roughly a lane width.
-pub fn lane_bias_factor(lane: f32) -> f32 {
-    (0.5 + 0.5 * (lane / GRID_HALF_SPAN)).clamp(0.1, 0.9)
+#[derive(Debug, Clone)]
+pub struct Rival {
+    /// Preferred lane, -1 (left) .. 1 (right).
+    pub lane: f32,
+    /// How close to its grip limit it dares to corner (0.8..0.97).
+    pub commitment: f32,
+    /// Likelihood of swinging at a bike alongside (0..1).
+    pub aggression: f32,
+    pub attack_cooldown: f32,
+    /// Temporary lane shift while passing.
+    pub dodge: f32,
+    pub dodge_timer: f32,
+    pub boost_timer: f32,
 }
 
-/// Curvature at which the inside-line bias reaches its full
-/// [`INSIDE_BIAS`]: the demo track's sharpest bend. Gentler bends bias
-/// proportionally, so the demo's 0.003 left bend still cuts in.
-pub const INSIDE_BIAS_CURVATURE: f32 = 0.005;
-/// Lateral error below which the AI stops steering, in meters.
-pub const LANE_DEADZONE: f32 = 0.25;
-/// Speed error below which the AI coasts rather than throttles, in m/s.
-pub const THROTTLE_DEADZONE: f32 = 0.5;
-/// Speed error above which the AI brakes rather than coasts, in m/s.
-pub const BRAKE_MARGIN: f32 = 2.0;
-
-/// Target speed through a corner of curvature `curvature` (1/meters) for a
-/// rider capable of `top_speed` on the straight. Pure and clamped above zero.
-pub fn corner_speed(curvature: f32, top_speed: f32) -> f32 {
-    top_speed / (1.0 + CORNER_SENSITIVITY * curvature.abs())
-}
-
-/// One rival's decision for this tick, from pure inputs only.
-///
-/// `speed` and `lateral` are the rival's current state, `distance` is its
-/// position along the road, and `target_lane` is its preferred lateral
-/// offset. `avoid`, when set, is an absolute lane to dodge to because
-/// another bike is in the way — it overrides the preferred line for the
-/// tick. All world lookups run at `distance + LOOKAHEAD_*`.
-pub fn decide(
-    speed: f32,
-    lateral: f32,
-    distance: f32,
-    target_lane: f32,
-    top_speed: f32,
-    avoid: Option<f32>,
-    geometry: &RoadGeometry,
-) -> Intent {
-    // Far lookahead: how fast this corner may be taken.
-    let curvature_far = geometry.curvature_at(distance + LOOKAHEAD_FAR);
-    let target_speed = corner_speed(curvature_far, top_speed);
-
-    let throttle = if speed < target_speed - THROTTLE_DEADZONE {
-        Throttle::Accelerate
-    } else if speed > target_speed + BRAKE_MARGIN {
-        Throttle::Brake
-    } else {
-        Throttle::Coast
-    };
-
-    // Near lookahead: lean toward the inside of the upcoming corner.
-    // RoadGeometry is authoritative: negative curvature is a left bend and
-    // the centreline shifts negative, so the inside of a bend lies on the
-    // same side as the curvature sign. The bias scales with bend severity
-    // up to INSIDE_BIAS_CURVATURE instead of a hard deadzone — the demo
-    // track's gentlest bend (0.003) must still visibly cut in.
-    let curvature_near = geometry.curvature_at(distance + LOOKAHEAD_NEAR);
-    let severity = (curvature_near.abs() / INSIDE_BIAS_CURVATURE).min(1.0);
-    let inside_bias =
-        curvature_near.signum() * INSIDE_BIAS * lane_bias_factor(target_lane) * severity;
-
-    // Lateral error drives steering; a small deadzone stops dithering.
-    let lane_target = avoid.unwrap_or(target_lane + inside_bias);
-    let lane_error = lane_target - lateral;
-    let steer = if lane_error > LANE_DEADZONE {
-        Steer::Right
-    } else if lane_error < -LANE_DEADZONE {
-        Steer::Left
-    } else {
-        Steer::None
-    };
-
-    // Rival pursuit never attacks: retaliation resolves in the race's
-    // combat pass, not through a steering intent.
-    Intent {
-        throttle,
-        steer,
-        attack: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bike::MAX_SPEED;
-    use world::CurveSegment;
-
-    fn straight() -> RoadGeometry {
-        RoadGeometry::new(Vec::new(), Vec::new(), 12.0)
+impl Rival {
+    pub fn new(lane: f32, commitment: f32, aggression: f32) -> Self {
+        Self {
+            lane,
+            commitment,
+            aggression,
+            attack_cooldown: 2.0,
+            dodge: 0.0,
+            dodge_timer: 0.0,
+            boost_timer: 0.0,
+        }
     }
 
-    fn left_hand(length: f32, curvature: f32) -> RoadGeometry {
-        RoadGeometry::new(
-            vec![CurveSegment {
-                start: 0.0,
-                length,
-                curvature,
-            }],
-            Vec::new(),
-            12.0,
-        )
-    }
+    /// Decides this tick's controls. `others` are every other bike; `roll`
+    /// is a fresh uniform random number.
+    pub fn drive(
+        &mut self,
+        me: &Bike,
+        others: &[&Bike],
+        track: &Track,
+        dt: f32,
+        roll: f32,
+    ) -> Controls {
+        self.attack_cooldown = (self.attack_cooldown - dt).max(0.0);
+        self.dodge_timer = (self.dodge_timer - dt).max(0.0);
+        if self.dodge_timer <= 0.0 {
+            self.dodge *= 1.0 - (2.0 * dt).min(1.0);
+        }
+        let v = me.forward_speed().max(0.0);
+        let s = me.track_pos.s;
+        let hw = track.half_width;
 
-    #[test]
-    fn straight_road_means_full_throttle_and_centreline_hold() {
-        let intent = decide(20.0, 1.0, 100.0, 0.0, MAX_SPEED, None, &straight());
-        assert_eq!(intent.throttle, Throttle::Accelerate, "below target speed");
-        // 1 m right of the target lane: steer back left.
-        assert_eq!(intent.steer, Steer::Left);
-    }
+        // Traffic: swing out around a slower bike ahead in our lane.
+        let fwd = me.fwd();
+        let mut alongside = None;
+        let mut ahead_slow = false;
+        for o in others.iter().filter(|o| o.is_solid()) {
+            let d = track.delta_s(s, o.track_pos.s);
+            let lat = o.track_pos.lateral - me.track_pos.lateral;
+            if (2.0..28.0).contains(&d) && lat.abs() < 1.8 && o.forward_speed() < v + 2.0 {
+                ahead_slow = true;
+                if self.dodge_timer <= 0.0 {
+                    let room_left = o.track_pos.lateral + hw;
+                    let room_right = hw - o.track_pos.lateral;
+                    self.dodge = if room_right > room_left { 2.6 } else { -2.6 };
+                    self.dodge_timer = 1.6;
+                }
+            }
+            if d.abs() < 1.6 && (0.4..2.6).contains(&lat.abs()) {
+                alongside = Some(o.pos2());
+            }
+        }
 
-    #[test]
-    fn near_target_speed_the_ai_coasts() {
-        let target = corner_speed(0.0, MAX_SPEED);
-        let intent = decide(target, 0.0, 0.0, 0.0, MAX_SPEED, None, &straight());
-        assert_eq!(intent.throttle, Throttle::Coast);
-        assert_eq!(intent.steer, Steer::None, "on the lane: no steering");
-    }
+        // Line: lane + inside of the corner ahead.
+        let look = 9.0 + v * 0.55;
+        let curv_ahead = track.frame_at(s + look * 1.4).curvature;
+        let inside = (curv_ahead * 500.0).clamp(-1.0, 1.0) * hw * 0.55;
+        let mut target_lat = self.lane * hw * 0.45 + inside + self.dodge;
+        if me.track_pos.lateral.abs() > hw {
+            target_lat = 0.0;
+        }
+        target_lat = target_lat.clamp(-hw + 1.2, hw - 1.2);
+        let tp = track.point_at(s + look, target_lat);
+        let to = Vec2::new(tp.x, tp.z) - me.pos2();
+        let alpha = fwd.perp_dot(to.normalize_or_zero()).asin();
+        let want_yaw = 2.0 * alpha.sin() * v.max(6.0) / look;
+        let max_yaw = (GRIP_ROAD * me.tuning.grip / v.max(1.0)).min(2.4);
+        let steer = (want_yaw / max_yaw).clamp(-1.0, 1.0);
 
-    #[test]
-    fn too_fast_for_a_corner_means_brake() {
-        let corner = left_hand(400.0, 0.02);
-        let intent = decide(MAX_SPEED, 0.0, 0.0, 0.0, MAX_SPEED, None, &corner);
-        assert_eq!(intent.throttle, Throttle::Brake);
-    }
+        // Speed: the slowest of the corner limits ahead, reachable by braking.
+        let grip = GRIP_ROAD * me.tuning.grip * self.commitment;
+        let horizon = (v * v / (2.0 * BRAKE_DECEL * 0.6) + 40.0).min(220.0);
+        let mut target_v = f32::MAX;
+        let mut d = 0.0;
+        while d <= horizon {
+            let k = track.frame_at(s + d).curvature.abs().max(1e-4);
+            let v_corner = (grip / k).sqrt();
+            let v_here = (v_corner * v_corner + 2.0 * BRAKE_DECEL * 0.6 * d).sqrt();
+            target_v = target_v.min(v_here);
+            d += 6.0;
+        }
+        // Running out of grip on the current line: scrub speed now.
+        let overload = want_yaw.abs() / max_yaw;
+        if overload > 0.92 && v > 14.0 {
+            target_v = target_v.min(v - 4.0 * (overload - 0.9).min(1.0) * 10.0);
+        }
+        let (throttle, brake) = if v > target_v + 1.5 {
+            (0.0, ((v - target_v) / 6.0).clamp(0.3, 1.0))
+        } else if v > target_v {
+            (0.2, 0.0)
+        } else {
+            (1.0, 0.0)
+        };
 
-    #[test]
-    fn left_hand_corner_biases_the_inside_line_left() {
-        let corner = left_hand(400.0, -0.02);
-        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, None, &corner);
-        // Negative curvature (a left bend) pulls the target lane negative
-        // (left) — the inside is the side the centreline shifts toward.
-        assert_eq!(intent.steer, Steer::Left);
+        // Boost on straights when the meter is healthy.
+        self.boost_timer = (self.boost_timer - dt).max(0.0);
+        if self.boost_timer <= 0.0
+            && me.boost > 0.6
+            && curv_ahead.abs() < 0.004
+            && target_v > v + 15.0
+            && roll < 0.02
+        {
+            self.boost_timer = 2.5;
+        }
+        let boost = self.boost_timer > 0.0 && throttle > 0.9;
 
-        let mirrored = left_hand(400.0, 0.02);
-        let intent = decide(20.0, 0.0, 0.0, 0.0, MAX_SPEED, None, &mirrored);
-        assert_eq!(intent.steer, Steer::Right, "mirror symmetry");
-    }
+        let attack = alongside.is_some()
+            && self.attack_cooldown <= 0.0
+            && roll < self.aggression * 0.05
+            && !ahead_slow;
+        if attack {
+            self.attack_cooldown = 1.4 + (1.0 - self.aggression) * 2.0;
+        }
 
-    #[test]
-    fn identical_inputs_decide_identically() {
-        let corner = left_hand(400.0, 0.015);
-        let one = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, None, &corner);
-        let two = decide(35.0, -1.5, 420.0, 0.5, MAX_SPEED, None, &corner);
-        assert_eq!(one, two, "the AI is a pure function of its inputs");
-    }
-
-    #[test]
-    fn corner_speed_never_exceeds_max_and_stays_positive() {
-        assert_eq!(corner_speed(0.0, MAX_SPEED), MAX_SPEED);
-        assert!(corner_speed(0.02, MAX_SPEED) > 0.0);
-        assert!(
-            corner_speed(0.02, MAX_SPEED) < corner_speed(0.01, MAX_SPEED),
-            "tighter is slower"
-        );
-        assert!(corner_speed(1.0, MAX_SPEED) > 0.0);
-    }
-
-    #[test]
-    fn a_slower_rider_targets_a_slower_speed() {
-        let slow = corner_speed(0.0, MAX_SPEED * 0.7);
-        assert!((slow - MAX_SPEED * 0.7).abs() < 1e-4);
-        assert!(
-            slow < corner_speed(0.0, MAX_SPEED),
-            "rider variety reaches target speed"
-        );
+        Controls {
+            throttle,
+            brake,
+            steer,
+            boost,
+            attack,
+        }
     }
 }

@@ -1,465 +1,434 @@
-//! WASM browser shell: the layer between the page and the composed runtime.
-//!
-//! One wasm artifact ships per GPU backend (cargo features `webgpu` /
-//! `webgl2`, matching [`render::QualityTier::backend`]); the JS loader in
-//! `web/loader.js` feature-detects the browser and boots exactly one of them.
-//! Inside a build nothing branches on backend capability at runtime beyond
-//! [`render::QualityTier::select`] — the loader's adapter probe already made
-//! that decision.
-//!
-//! The shell reuses `runtime`'s [`advance_game_frame`] composition for the
-//! frame loop instead of re-wiring camera, road mesh, and sprite batching
-//! here: per frame the JS loader calls [`BrowserGame::advance_frame`] with
-//! input flags, the race advances one 60 Hz tick, the pre-owned batch and
-//! road mesh refill, and [`render::GpuRenderer::draw`] presents.
-//!
-//! Boundaries:
-//! - The canvas backing store is sized by the loader (window size ×
-//!   devicePixelRatio, capped) before construction and refreshed on window
-//!   resize. The renderer was built for the boot size and reconfigures its
-//!   surface implicitly when the canvas element's size changes — wgpu 25
-//!   checks the canvas size at `get_current_texture` — so no explicit
-//!   resize path lives here.
-//! - The camera's clip transform is a fixed ortho over the runtime's
-//!   800×450 pixel-space viewport (per-frame rider positions already live
-//!   in screen space), so one camera serves every frame at any surface
-//!   size; a non-16:9 window stretches the composition non-uniformly. That
-//!   fixed viewport is load-bearing in `runtime`'s frame builder, so it is
-//!   documented rather than changed.
-//! - No browser here on the dev host: this crate is compile-checked for
-//!   wasm32 (`cargo check -p web --target wasm32-unknown-unknown`, both
-//!   feature builds) and exercised in a browser only by the recorded
-//!   follow-up smoke test.
-//!
-//! No GPU here on the dev host: this crate is compile-checked for wasm32
-//! (`cargo check -p web --target wasm32-unknown-unknown`, both feature
-//! builds) and exercised in a browser only by the recorded follow-up smoke
-//! test. What IS testable headless is the boot path's course resolution —
-//! `BrowserGame::boot` resolves the track-select value through
-//! `resolve_course` and builds the race through `race_for_course`, and the
-//! wave-8 gate asks for headless boot evidence that each selection loads its
-//! own course (see the `tests` module at the bottom).
+//! Browser shell. `web/loader.js` boots one of two wasm bundles (WebGPU or
+//! WebGL2, chosen by cargo feature), creates a [`Game`] on a canvas and calls
+//! [`Game::frame`] from `requestAnimationFrame`. Everything visual is drawn by
+//! the `render` crate; the page only paints HTML HUD and menus on top, fed
+//! by the flat arrays this module hands back.
 
 #![forbid(unsafe_code)]
 
-// The browser shell only exists on wasm: wgpu's `SurfaceTarget::Canvas` is
-// gated to wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
-// `not(native)`), so every item that touches a GPU type is compiled only for
-// `wasm32-unknown-unknown` — the target the two workspace wasm checks build.
-// Host builds see the crate as the panic hook plus `backend_name`.
 use wasm_bindgen::prelude::*;
-// The race-construction path exists only on wasm and in the headless boot
-// tests; host non-test builds see neither, so the imports carry its gate.
-#[cfg(any(target_arch = "wasm32", test))]
-use game::race::{Race, RaceConfig};
-#[cfg(target_arch = "wasm32")]
-use render::{AtlasDims, AtlasUpload, GpuRenderer, OrthoCamera, QualityTier, SpriteBatch};
-#[cfg(target_arch = "wasm32")]
-use runtime::{advance_game_frame, pack_placeholder_atlas, AtlasMapping, RoadMesh};
-#[cfg(any(target_arch = "wasm32", test))]
-use world::{Course, CourseId, RoadGeometry};
 
-#[cfg(target_arch = "wasm32")]
-use game::bike::Control;
-#[cfg(target_arch = "wasm32")]
-use game::input::GameInput;
-
-/// Installs the panic hook once: panics surface in the browser console
-/// instead of vanishing behind a frozen loading screen.
-#[wasm_bindgen(start)]
-fn start() {
-    console_error_panic_hook::set_once();
-}
-
-/// Which backend this build was compiled for, as the loader picked it.
+/// Which GPU backend this bundle was built for.
 #[wasm_bindgen]
 pub fn backend_name() -> String {
     if cfg!(feature = "webgl2") {
-        "webgl2".to_owned()
+        "webgl2"
     } else {
-        "webgpu".to_owned()
+        "webgpu"
     }
+    .to_owned()
 }
 
-/// Folds the loader's input flags into the events queued for one tick:
-/// the last throttle-family command wins (brake over throttle), then the
-/// last steering direction. Pure — no device or race access.
-#[cfg(target_arch = "wasm32")]
-fn frame_inputs(
-    accelerate: bool,
-    brake: bool,
-    steer_left: bool,
-    steer_right: bool,
-    punch: bool,
-    kick: bool,
-) -> ([GameInput; 3], usize) {
-    let throttle = if brake {
-        Some(GameInput::Brake)
-    } else if accelerate {
-        Some(GameInput::Accelerate)
-    } else {
-        None
-    };
-    let steer = if steer_left {
-        Some(GameInput::SteerLeft)
-    } else if steer_right {
-        Some(GameInput::SteerRight)
-    } else {
-        None
-    };
-    // One swing per press; punch outranks kick if both land together.
-    let attack = if punch {
-        Some(GameInput::Punch)
-    } else if kick {
-        Some(GameInput::Kick)
-    } else {
-        None
-    };
-    let mut inputs = [
-        GameInput::Accelerate,
-        GameInput::Accelerate,
-        GameInput::Accelerate,
-    ];
-    let mut count = 0;
-    for input in [throttle, steer, attack].into_iter().flatten() {
-        inputs[count] = input;
-        count += 1;
-    }
-    (inputs, count)
-}
-
-/// The booted game: one race, its frame-composition buffers, and the GPU
-/// renderer presenting to the loader's canvas. Held across frames so the
-/// steady-state loop allocates nothing.
-///
-/// wasm-only, and not by choice: wgpu's `SurfaceTarget::Canvas` exists only
-/// on wasm targets (wgpu's build script aliases `webgpu`/`webgl` to
-/// `not(native)`), so this type cannot compile on host targets. The wasm32
-/// checks in the workspace gate compile the real code.
-#[cfg(target_arch = "wasm32")]
+/// The track list as `slug|name|laps|blurb` lines, for the track picker.
 #[wasm_bindgen]
-pub struct BrowserGame {
-    race: game::race::Race,
-    /// The course this race was booted from: the restart path re-boots the
-    /// same course, never falling back to the demo (spec: locked decision).
-    course: Course,
-    geometry: RoadGeometry,
-    mapping: AtlasMapping,
-    batch: SpriteBatch,
-    road: RoadMesh,
-    camera: OrthoCamera,
-    renderer: GpuRenderer,
+pub fn track_list() -> String {
+    game::tracks::catalog()
+        .iter()
+        .map(|d| format!("{}|{}|{}|{}", d.slug, d.name, d.laps, d.blurb))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) enum BootError {
-    Atlas(String),
-    Render(String),
-    Course(String),
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::fmt::Display for BootError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Atlas(e) => write!(f, "placeholder atlas pack failed: {e}"),
-            Self::Render(e) => write!(f, "renderer bring-up failed: {e}"),
-            Self::Course(e) => write!(f, "track selection failed: {e}"),
-        }
-    }
-}
-
-/// Builds the race for a catalog course: the same shape `runtime::demo_race`
-/// gives the demo — three rivals, three laps, the fixed seed — but with the
-/// selected course's own lap length and geometry (spec: "Track-select flow").
-/// Lives here rather than in `runtime`: `runtime::frame` is another
-/// workstream's lane, so its five `ZoneLayout::for_track()` call sites (the
-/// composed scenery still samples the demo table) move onto the selected
-/// course's layout when that lane migrates.
-#[cfg(any(target_arch = "wasm32", test))]
-fn race_for_course(course: &Course) -> (Race, RoadGeometry) {
-    let geometry = RoadGeometry::new(
-        course.curves.to_vec(),
-        course.elevation.to_vec(),
-        course.road_width,
-    );
-    let race = Race::new(RaceConfig {
-        rivals: 3,
-        // One lap = one pass through every zone; landmarks and dressing
-        // repeat per lap on the same fixed distances (7c).
-        track_length: course.layout.lap_length,
-        total_laps: 3,
-        seed: 0x5EED_C0DE,
-        geometry: geometry.clone(),
-    });
-    (race, geometry)
-}
-
-/// Resolves the track-select control's value to a catalog course. An unknown
-/// value is a boot error on the loading screen, same path as today's boot
-/// failures (spec: "Track-select flow").
-#[cfg(any(target_arch = "wasm32", test))]
-fn resolve_course(course_id: &str) -> Result<&'static Course, String> {
-    let id = CourseId::from_slug(course_id).ok_or_else(|| {
-        format!("unknown track '{course_id}' — expected one of the catalog slugs")
-    })?;
-    world::for_course(id).ok_or_else(|| format!("course '{course_id}' is not registered"))
-}
-
-#[cfg(target_arch = "wasm32")]
+/// The design system's CSS custom properties for a track (`--ink`, `--hot`,
+/// `--accent` and the rest), so the HTML HUD wears the same palette as the
+/// scene. Unknown slugs get the first track's.
 #[wasm_bindgen]
-impl BrowserGame {
-    /// Boots the selected course on `canvas`: packs the placeholder atlas,
-    /// selects the quality tier from the loader's capability facts, and
-    /// brings up the GPU pipeline (warm behind the loading screen per the
-    /// blueprint).
-    ///
-    /// `low_end_device` comes from the loader's device heuristics;
-    /// `has_webgpu` is compile-time — this build either carries the WebGPU
-    /// backend or it does not, and the loader already chose the build to
-    /// match its adapter probe. `course_id` is the track-select control's
-    /// value, resolved through `resolve_course`; an unknown value takes the
-    /// loading screen's error path.
-    ///
-    /// The canvas is sized before this call; its current `width`/`height`
-    /// become the swap-chain size.
-    ///
-    /// Async factory rather than an async constructor: wasm-bindgen has
-    /// deprecated async constructors (invalid TS bindings).
-    #[wasm_bindgen]
-    pub async fn boot(
-        canvas: web_sys::HtmlCanvasElement,
-        low_end_device: bool,
-        course_id: &str,
-    ) -> Result<BrowserGame, JsError> {
-        Self::bring_up(canvas, low_end_device, course_id)
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))
-    }
+pub fn style_css(slug: &str) -> String {
+    let def = game::tracks::by_slug(slug).unwrap_or(game::tracks::catalog()[0]);
+    render::style::css_vars(&def.theme)
+}
 
-    async fn bring_up(
-        canvas: web_sys::HtmlCanvasElement,
-        low_end_device: bool,
-        course_id: &str,
-    ) -> Result<Self, BootError> {
-        // The course resolves before any GPU work: an unknown track-select
-        // value fails fast on the loading screen.
-        let course = resolve_course(course_id).map_err(BootError::Course)?;
-        let has_webgpu = cfg!(feature = "webgpu");
-        let tier = QualityTier::select(has_webgpu, low_end_device);
+/// Number of floats in [`Game::hud`].
+pub const HUD_LEN: usize = 22;
 
-        let packed = pack_placeholder_atlas().map_err(|e| BootError::Atlas(e.to_string()))?;
-        let mapping = AtlasMapping::from_packed(&packed);
-        let (width, height) = (packed.atlas.width(), packed.atlas.height());
-        let rgba = packed.atlas.into_raw();
-        let atlas = AtlasUpload::from_rgba(AtlasDims::new(width, height), rgba)
-            .map_err(|e| BootError::Atlas(e.to_string()))?;
+/// Packs the HUD snapshot into a flat array (layout mirrored in loader.js).
+pub fn pack_hud(h: &runtime::Hud, paused: bool) -> [f32; HUD_LEN] {
+    let opt = |v: Option<f32>| v.unwrap_or(-1.0);
+    let b = |v: bool| if v { 1.0 } else { 0.0 };
+    [
+        h.position as f32,
+        h.racers as f32,
+        h.lap as f32,
+        h.laps as f32,
+        h.lap_time,
+        opt(h.last_lap),
+        opt(h.best_lap),
+        h.race_time,
+        h.speed_kmh,
+        h.gear as f32,
+        h.rpm,
+        h.boost,
+        b(h.boosting),
+        h.countdown,
+        b(h.wrong_way),
+        b(h.crashed),
+        opt(h.finished),
+        h.balance,
+        h.progress,
+        b(h.drafting),
+        b(paused),
+        0.0,
+    ]
+}
 
-        let (race, geometry) = race_for_course(course);
-
-        // One backend per bundle — the loader's probe already picked it.
-        // This matters even though wgpu only compiles the matching backend:
-        // with default features the render/runtime dependency graph unifies
-        // `wgpu/webgpu` back in, and an `Backends::all()` instance then binds
-        // the canvas for BOTH backends. In headless Chrome the WebGPU path's
-        // `canvas.getContext('webgpu')` races the WebGL2 binding and wins,
-        // leaving the GL surface without a context (`NoAdapter` at bring-up,
-        // or a renderer presenting into a void). Requesting exactly one
-        // backend keeps the canvas owned by the build's renderer.
-        let backends = if cfg!(feature = "webgpu") {
-            wgpu::Backends::BROWSER_WEBGPU
-        } else {
-            wgpu::Backends::GL
+/// Flattens cues into (code, a, b) triples (codes mirrored in loader.js).
+pub fn pack_cues(cues: &[runtime::Cue], out: &mut Vec<f32>) {
+    use runtime::Cue;
+    out.clear();
+    for c in cues {
+        let (code, a, b) = match *c {
+            Cue::Beep(n) => (1.0, n as f32, 0.0),
+            Cue::Go => (2.0, 0.0, 0.0),
+            Cue::WallHit(s) => (3.0, s, 0.0),
+            Cue::Contact(s) => (4.0, s, 0.0),
+            Cue::HitLanded => (5.0, 0.0, 0.0),
+            Cue::GotHit => (6.0, 0.0, 0.0),
+            Cue::Crash => (7.0, 0.0, 0.0),
+            Cue::Lap(n, t) => (8.0, n as f32, t),
+            Cue::Finished(p) => (9.0, p as f32, 0.0),
+            Cue::Overtake(gained) => (10.0, if gained { 1.0 } else { 0.0 }, 0.0),
         };
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            ..wgpu::InstanceDescriptor::default()
-        });
-        let renderer = GpuRenderer::new(
-            &instance,
-            wgpu::SurfaceTarget::Canvas(canvas.clone()),
-            (canvas.width(), canvas.height()),
-            &atlas,
-            tier,
-        )
-        .await
-        .map_err(|e| BootError::Render(e.to_string()))?;
+        out.extend_from_slice(&[code, a, b]);
+    }
+}
 
-        Ok(Self {
-            race,
-            course: *course,
-            geometry,
-            mapping,
-            batch: SpriteBatch::for_tier(tier),
-            road: RoadMesh::default(),
-            // The camera's clip transform is a fixed ortho over the runtime's
-            // pixel-space viewport; per-frame rider positions already live in
-            // screen space, so one camera serves every frame.
-            camera: OrthoCamera::new(runtime::VIEWPORT_WIDTH, runtime::VIEWPORT_HEIGHT),
-            renderer,
-        })
+#[cfg(target_arch = "wasm32")]
+mod browser {
+    use super::*;
+    use game::ai::Rival;
+    use game::tracks::{by_slug, catalog};
+    use render::{Renderer, Settings};
+    use runtime::{CamMode, Input, Session};
+
+    #[wasm_bindgen(start)]
+    fn start() {
+        console_error_panic_hook::set_once();
     }
 
-    /// Advances the race one 60 Hz tick under the loader's input flags and
-    /// draws the composed frame. Steady state: no allocation after warmup —
-    /// the batch and road mesh refill through `advance_game_frame`.
-    pub fn advance_frame(
-        &mut self,
-        accelerate: bool,
-        brake: bool,
-        steer_left: bool,
-        steer_right: bool,
-        punch: bool,
-        kick: bool,
-    ) -> Result<(), JsError> {
-        let (inputs, count) = frame_inputs(accelerate, brake, steer_left, steer_right, punch, kick);
-        advance_game_frame(
-            &mut self.race,
-            &self.geometry,
-            &self.mapping,
-            &inputs[..count],
-            &mut self.batch,
-            &mut self.road,
-        );
-        self.renderer
-            .draw(&self.batch, &self.road.vertices, &self.camera)
-            .map_err(|e| JsError::new(&e.to_string()))
+    #[wasm_bindgen]
+    pub struct Game {
+        surface: wgpu::Surface<'static>,
+        device: wgpu::Device,
+        config: wgpu::SurfaceConfiguration,
+        renderer: Renderer,
+        session: Session,
+        slug: String,
+        seed: u64,
+        cues: Vec<f32>,
+        adapter_name: String,
     }
 
-    /// Current race lap index, for the loader's HUD.
-    pub fn lap_index(&self) -> u32 {
-        self.race.lap_index()
+    fn err(e: impl std::fmt::Display) -> JsValue {
+        JsValue::from_str(&e.to_string())
     }
 
-    /// Current player distance along the track, in meters, for the HUD.
-    pub fn player_distance(&self) -> f32 {
-        self.race.player_distance()
-    }
-
-    /// Player speed in km/h, for the HUD.
-    pub fn speed_kmh(&self) -> u32 {
-        (self.race.player_speed() * 3.6) as u32
-    }
-
-    /// The player's race position, 1-based, for the HUD.
-    pub fn race_position(&self) -> usize {
-        self.race.race_position()
-    }
-
-    /// How many bikes are racing, for the HUD's `pos / total` display.
-    pub fn bike_count(&self) -> usize {
-        self.race.bike_count()
-    }
-
-    /// Seconds left on the green-light countdown, for the HUD.
-    pub fn countdown_secs(&self) -> u32 {
-        self.race.countdown_secs()
-    }
-
-    /// Whether the lights are still red.
-    pub fn is_counting_down(&self) -> bool {
-        self.race.is_counting_down()
-    }
-
-    /// Progress through the player's current lap, in `[0, 1)`, for the HUD's
-    /// progress bar.
-    pub fn lap_progress(&self) -> f32 {
-        self.race.lap_progress()
-    }
-
-    /// Laps needed to finish, for the HUD's `lap x of N` display.
-    pub fn total_laps(&self) -> u32 {
-        self.race.total_laps()
-    }
-
-    /// Length of one lap in meters, for the HUD's progress display.
-    pub fn lap_length(&self) -> f32 {
-        self.race.lap_length()
-    }
-
-    /// The rider's state as a bitmask for the HUD badge: 1 = crashed,
-    /// 2 = off-road, 4 = braking. A stable u32 rather than a string keeps
-    /// the per-frame HUD read allocation-free; the loader maps bits to
-    /// labels and colors. Off-road is derived here the same way the bike
-    /// state machine draws the line: lateral distance beyond the road's
-    /// half width.
-    pub fn rider_state(&self) -> u32 {
-        let mut state = 0;
-        if self.race.player_control() == Control::Crashed {
-            state |= 1;
+    #[wasm_bindgen]
+    impl Game {
+        /// Creates the GPU context on `canvas` (sized by the caller) and
+        /// loads `slug` in attract mode.
+        pub async fn boot(
+            canvas: web_sys::HtmlCanvasElement,
+            slug: String,
+        ) -> Result<Game, JsValue> {
+            let backends = if cfg!(feature = "webgl2") {
+                wgpu::Backends::GL
+            } else {
+                wgpu::Backends::BROWSER_WEBGPU
+            };
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends,
+                ..Default::default()
+            });
+            let (w, h) = (canvas.width().max(1), canvas.height().max(1));
+            let surface = instance
+                .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                .map_err(err)?;
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: Some(&surface),
+                })
+                .await
+                .map_err(err)?;
+            let limits =
+                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("racing"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits,
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
+                })
+                .await
+                .map_err(err)?;
+            let caps = surface.get_capabilities(&adapter);
+            // The post chain writes display-encoded colour itself, so prefer a
+            // plain UNORM surface; the renderer adapts if only sRGB exists.
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| !f.is_srgb())
+                .or_else(|| caps.formats.first().copied())
+                .ok_or_else(|| err("surface has no formats"))?;
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: w,
+                height: h,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps
+                    .alpha_modes
+                    .first()
+                    .copied()
+                    .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+                view_formats: vec![],
+            };
+            surface.configure(&device, &config);
+            let renderer =
+                Renderer::new(&adapter, &device, &queue, format, w, h, Settings::default());
+            let def = by_slug(&slug).unwrap_or(catalog()[0]);
+            let mut game = Game {
+                surface,
+                device,
+                config,
+                renderer,
+                session: Session::new(def, 1),
+                slug: def.slug.to_owned(),
+                seed: 1,
+                cues: Vec::new(),
+                adapter_name: adapter.get_info().name,
+            };
+            game.renderer.load_world(&game.session.race.track);
+            game.attract();
+            Ok(game)
         }
-        if self.race.player_lateral().abs() > self.geometry.road_width() * 0.5 {
-            state |= 2;
+
+        pub fn backend(&self) -> String {
+            backend_name()
         }
-        if self.race.player_control() == Control::Brake {
-            state |= 4;
+
+        pub fn adapter(&self) -> String {
+            self.adapter_name.clone()
         }
-        state
-    }
 
-    /// The player's combat stamina bar, 0..1, for the HUD strip.
-    pub fn player_stamina(&self) -> f32 {
-        self.race.player_stamina()
-    }
+        pub fn hdr_format(&self) -> String {
+            format!("{:?}", self.renderer.hdr_format())
+        }
 
-    /// Whether the player has finished every lap.
-    pub fn is_finished(&self) -> bool {
-        self.race.is_finished()
-    }
+        /// Current track's slug.
+        pub fn track(&self) -> String {
+            self.slug.clone()
+        }
 
-    /// Back to the grid: a fresh race on the same course the player chose at
-    /// boot. Inputs and camera state rebuild through the normal per-frame
-    /// path.
-    pub fn restart(&mut self) {
-        let (race, _geometry) = race_for_course(&self.course);
-        self.race = race;
+        fn new_session(&mut self, slug: &str) {
+            let def = by_slug(slug).unwrap_or(catalog()[0]);
+            self.seed = self
+                .seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let cam = self.session.cam_mode;
+            self.session = Session::new(def, self.seed >> 16);
+            self.session.cam_mode = cam;
+            if def.slug != self.slug {
+                self.slug = def.slug.to_owned();
+                self.renderer.load_world(&self.session.race.track);
+            }
+        }
+
+        /// Background demo: the player bike drives itself.
+        pub fn attract(&mut self) {
+            let slug = self.slug.clone();
+            self.show(&slug);
+        }
+
+        /// Loads `slug` (if different) as an attract-mode demo.
+        pub fn show(&mut self, slug: &str) {
+            self.new_session(slug);
+            self.session.autopilot = Some(Rival::new(0.15, 0.95, 0.4));
+            self.session.cam_mode = CamMode::Far;
+        }
+
+        /// Starts a race the player drives, on `slug`.
+        pub fn start_race(&mut self, slug: &str) {
+            self.new_session(slug);
+            self.session.autopilot = None;
+            if self.session.cam_mode == CamMode::Far {
+                self.session.cam_mode = CamMode::Chase;
+            }
+        }
+
+        pub fn set_paused(&mut self, paused: bool) {
+            self.session.paused = paused;
+        }
+
+        pub fn cycle_camera(&mut self) -> u32 {
+            self.session.cycle_camera();
+            self.session.cam_mode as u32
+        }
+
+        /// The canvas backing store changed size.
+        pub fn resize(&mut self, w: u32, h: u32) {
+            let (w, h) = (w.max(1), h.max(1));
+            if w == self.config.width && h == self.config.height {
+                return;
+            }
+            self.config.width = w;
+            self.config.height = h;
+            self.surface.configure(&self.device, &self.config);
+            self.renderer.resize(w, h);
+        }
+
+        /// Ink outlines and impact frames on or off (impact frames are off
+        /// for players who ask for reduced motion).
+        pub fn set_effects(&mut self, ink: bool, flashes: bool) {
+            self.renderer.settings.ink = ink;
+            self.renderer.settings.flashes = flashes;
+        }
+
+        /// Internal render resolution as a fraction of the canvas (0.35..1).
+        pub fn set_render_scale(&mut self, s: f32) {
+            self.renderer.set_render_scale(s);
+        }
+
+        /// Advances `dt` seconds of play and draws. Returns the cues raised,
+        /// as (code, a, b) triples.
+        #[allow(clippy::too_many_arguments)]
+        pub fn frame(
+            &mut self,
+            dt: f32,
+            throttle: f32,
+            brake: f32,
+            steer: f32,
+            analog_steer: bool,
+            boost: bool,
+            attack: bool,
+        ) -> Vec<f32> {
+            let input = Input {
+                throttle,
+                brake,
+                steer,
+                analog_steer,
+                boost,
+                attack,
+            };
+            self.session.update(dt, &input);
+            pack_cues(&self.session.cues, &mut self.cues);
+            self.draw();
+            self.cues.clone()
+        }
+
+        fn draw(&mut self) {
+            let frame = match self.surface.get_current_texture() {
+                Ok(f) => f,
+                Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                    self.surface.configure(&self.device, &self.config);
+                    return;
+                }
+                Err(_) => return,
+            };
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let bikes = self.session.bike_draws();
+            let particles = self.session.particles();
+            let input = self.session.frame_input(&bikes, &particles);
+            self.renderer.render(&view, &input);
+            frame.present();
+        }
+
+        /// HUD snapshot; layout in `pack_hud`.
+        pub fn hud(&self) -> Vec<f32> {
+            pack_hud(&self.session.hud(), self.session.paused).to_vec()
+        }
+
+        /// Centreline as x,z pairs for the minimap.
+        pub fn track_outline(&self) -> Vec<f32> {
+            let t = &self.session.race.track;
+            (0..t.len())
+                .step_by(3)
+                .flat_map(|i| {
+                    let p = t.sample(i).pos;
+                    [p.x, p.z]
+                })
+                .collect()
+        }
+
+        /// Every bike as x,z pairs, player first.
+        pub fn bike_points(&self) -> Vec<f32> {
+            self.session
+                .bike_positions()
+                .iter()
+                .flat_map(|p| [p.x, p.y])
+                .collect()
+        }
+
+        /// Standings as `name|time|finished` lines, leader first.
+        pub fn standings(&self) -> String {
+            self.session
+                .standings_names()
+                .into_iter()
+                .map(|(n, t, done)| format!("{n}|{t}|{}", u8::from(done)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// Draw calls, triangles and visible props in the last frame.
+        pub fn stats(&self) -> Vec<f32> {
+            let s = self.renderer.stats;
+            vec![s.draws as f32, s.triangles as f32, s.props as f32]
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use game::ai::Rival;
+    use game::tracks::catalog;
+    use runtime::{Input, Session};
 
-    /// Wave-8 gate evidence (headless boot): the boot path resolves each
-    /// track-select value and loads that course's own race. BrowserGame's
-    /// GPU bring-up needs a canvas, but the course resolution and the race
-    /// it builds are the same host-side calls, so each selection's course
-    /// can be checked headless.
     #[test]
-    fn booting_each_track_select_option_loads_that_course() {
-        for (slug, lap_length) in [("coast-run", 2_000.0), ("island-hop", 1_600.0)] {
-            let course = resolve_course(slug)
-                .unwrap_or_else(|error| panic!("booting '{slug}' failed: {error}"));
-            let (race, geometry) = race_for_course(course);
-            assert!(
-                (race.lap_length() - lap_length).abs() < 1e-3,
-                "'{slug}' booted a {:#} m lap, expected {lap_length} m",
-                race.lap_length()
-            );
-            assert!((geometry.road_width() - course.road_width).abs() < 1e-6);
+    fn track_list_has_every_track() {
+        let list = track_list();
+        assert_eq!(list.lines().count(), catalog().len());
+        for line in list.lines() {
+            assert_eq!(line.split('|').count(), 4, "{line}");
         }
     }
 
-    /// The selection semantic the shell consumes: two track-select values,
-    /// two different loaded courses.
     #[test]
-    fn booting_different_tracks_loads_different_courses() {
-        let coast = resolve_course("coast-run").expect("coast-run must resolve");
-        let island = resolve_course("island-hop").expect("island-hop must resolve");
-        assert_ne!(coast.id, island.id);
-        let (coast_race, _coast_geometry) = race_for_course(coast);
-        let (island_race, _island_geometry) = race_for_course(island);
+    fn style_css_follows_the_track() {
+        let a = style_css(catalog()[0].slug);
+        let b = style_css(catalog()[1].slug);
         assert!(
-            (coast_race.lap_length() - island_race.lap_length()).abs() > 1.0,
-            "distinct track-select values must load distinct courses"
+            a.contains("--accent:") && a.contains("--hot: #ff4d2e;"),
+            "{a}"
         );
+        assert_ne!(a, b, "tracks share the palette but not the accent");
+        assert_eq!(style_css("nope"), a);
     }
 
-    /// An unknown track-select value is a boot error on the loading screen,
-    /// same path as today's boot failures.
     #[test]
-    fn an_unknown_track_select_value_is_a_boot_error() {
-        let error = resolve_course("demo").expect_err("an unknown slug must fail to resolve");
-        assert!(error.contains("demo"));
+    fn hud_and_cues_pack_through_a_race_start() {
+        let mut s = Session::new(catalog()[0], 7);
+        s.autopilot = Some(Rival::new(0.0, 0.9, 0.0));
+        let mut out = Vec::new();
+        let mut codes = Vec::new();
+        for _ in 0..(60 * 8) {
+            s.update(1.0 / 60.0, &Input::default());
+            pack_cues(&s.cues, &mut out);
+            assert_eq!(out.len() % 3, 0);
+            codes.extend(out.chunks(3).map(|c| c[0] as u32));
+        }
+        assert!(codes.contains(&1), "countdown beeps");
+        assert!(codes.contains(&2), "green light");
+        let hud = pack_hud(&s.hud(), false);
+        assert_eq!(hud.len(), HUD_LEN);
+        assert!(hud[8] > 50.0, "moving: {} km/h", hud[8]);
+        assert_eq!(hud[1] as usize, s.race.bikes.len());
     }
 }

@@ -1,14 +1,24 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim", "crates/world", "crates/assets", "crates/game", "crates/render", "crates/runtime", "crates/web"]
+members = ["crates/sim", "crates/game", "crates/render", "crates/runtime", "crates/web"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
+
+[workspace.dependencies]
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The shell ships a size-optimized wasm build; native tools stay fast.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+strip = "debuginfo"
