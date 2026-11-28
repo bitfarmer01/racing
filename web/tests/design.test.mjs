@@ -83,3 +83,8 @@ test('traffic, weapons and hunters get their words', () => {
   assert.match(direct({ code: CUE.HUNTED, a: 3, b: 0, name: 'Vex' }, hud()).toast[0], /^Vex is coming/);
   assert.match(direct({ code: CUE.HUNTED, a: 3, b: 0 }, hud()).toast[0], /^A rival/);
 });
+
+test('the pack\'s mood swings are announced', () => {
+  assert.deepEqual(direct({ code: CUE.MOOD, a: 1, b: 0 }, hud()).toast, ['The pack turns rough', 'bad']);
+  assert.deepEqual(direct({ code: CUE.MOOD, a: 0, b: 0 }, hud()).toast, ['The pack settles', '']);
+});

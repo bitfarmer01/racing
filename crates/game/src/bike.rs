@@ -138,6 +138,10 @@ pub struct Bike {
     pub tuck: f32,
     /// Seconds of wheelspin left from a botched start.
     pub wheelspin: f32,
+    /// Thrown into the air off a ramp: ordinary gravity until it lands.
+    pub launched: bool,
+    /// Seconds of the current jump so far (0 on the ground).
+    pub air_time: f32,
 }
 
 impl Bike {
@@ -157,6 +161,8 @@ impl Bike {
             throttle: 0.0,
             brake: 0.0,
             on_ground: true,
+            launched: false,
+            air_time: 0.0,
             surface: Surface::Road,
             wheel_angle: 0.0,
             slip: 0.0,
@@ -252,11 +258,12 @@ impl Bike {
         let mut v_lat = self.vel.dot(right);
         let speed = self.vel.length();
 
-        self.surface = if self.track_pos.lateral.abs() <= track.half_width + 0.4 {
-            Surface::Road
-        } else {
-            Surface::Grass
-        };
+        self.surface =
+            if self.track_pos.lateral.abs() <= track.half_width_at(self.track_pos.s) + 0.4 {
+                Surface::Road
+            } else {
+                Surface::Grass
+            };
         let on_road = self.surface == Surface::Road;
 
         // Boost: needs meter and the ground under the wheels.
@@ -360,7 +367,7 @@ impl Bike {
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.y * dt;
         self.relocate(track);
-        let limit = track.half_width + RUNOFF;
+        let limit = track.half_width_at(self.track_pos.s) + RUNOFF;
         if self.track_pos.lateral.abs() > limit {
             let f = track.frame_at(self.track_pos.s);
             let side = self.track_pos.lateral.signum();
@@ -396,12 +403,22 @@ impl Bike {
         let ground = self.ground(track);
         // Ground speed from position differences, capped at a steep road's
         // grade so stepping up a kerb or shoulder can't launch the bike.
+        // A ramp's face is the one place the ground may throw the bike up.
         let horiz = self.vel.length();
-        let cap = horiz * 0.1 + 0.5;
-        let ground_vy = ((ground - prev_ground) / dt).clamp(-cap - 30.0, cap);
+        let ramp = track.ramp_at(self.track_pos.s, self.track_pos.lateral);
+        let ramp_slope = ramp.map_or(0.0, |r| r.1);
+        let cap = horiz * (0.1 + ramp_slope) + 0.5;
+        let ground_vy = ((ground - prev_ground) / dt).clamp(-cap - 30.0, cap.min(8.5));
+        if ramp_slope > 0.08 && horiz > 8.0 {
+            self.launched = true;
+        }
         let gap = self.pos.y - ground;
         let vy_before = self.vy;
-        let pull = if gap < 0.8 { GRAVITY * 2.5 } else { GRAVITY };
+        let pull = if gap < 0.8 && !self.launched {
+            GRAVITY * 2.5
+        } else {
+            GRAVITY
+        };
         self.vy -= pull * dt;
         self.pos.y += self.vy * dt;
         if self.pos.y <= ground {
@@ -412,8 +429,15 @@ impl Bike {
             self.vy = ground_vy.max(self.vy);
             self.vy = self.vy.min(ground_vy.max(0.0) + 0.5);
             self.on_ground = true;
+            if ramp.is_none() {
+                self.launched = false;
+            }
+            self.air_time = 0.0;
         } else {
             self.on_ground = self.pos.y - ground < 0.25;
+            if !self.on_ground {
+                self.air_time += dt;
+            }
         }
 
         // Pose.
@@ -516,7 +540,7 @@ impl Bike {
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.y * dt;
         self.relocate(track);
-        let limit = track.half_width + RUNOFF - 0.5;
+        let limit = track.half_width_at(self.track_pos.s) + RUNOFF - 0.5;
         if self.track_pos.lateral.abs() > limit {
             let f = track.frame_at(self.track_pos.s);
             let n = f.right * self.track_pos.lateral.signum();
@@ -559,15 +583,15 @@ impl Bike {
     /// Back on the bike: centred-ish on the road, facing the right way.
     pub fn respawn(&mut self, track: &Track) {
         let s = self.track_pos.s;
-        let lat = self
-            .track_pos
-            .lateral
-            .clamp(-track.half_width + 1.5, track.half_width - 1.5);
+        let hw = track.half_width_at(s);
+        let lat = self.track_pos.lateral.clamp(-hw + 1.5, hw - 1.5);
         let f = track.frame_at(s);
         self.pos = track.point_at(s, lat);
         self.heading = f.heading();
         self.vel = f.fwd * 6.0;
         self.vy = 0.0;
+        self.launched = false;
+        self.air_time = 0.0;
         self.yaw_rate = 0.0;
         self.lean = 0.0;
         self.pitch = 0.0;
@@ -678,6 +702,36 @@ mod tests {
     }
 
     #[test]
+    fn ramps_throw_the_bike_into_the_air_and_it_lands() {
+        let track = Track::build(catalog()[0]);
+        let r = track.ramps[0];
+        let s0 = r.s - 40.0;
+        let mut b = Bike::new(&track, s0, r.lateral, Tuning::default());
+        b.vel = b.fwd() * 38.0;
+        let c = Controls {
+            throttle: 1.0,
+            ..Controls::default()
+        };
+        let (mut air, mut peak) = (0.0f32, 0.0f32);
+        for _ in 0..(5.0 / DT) as usize {
+            // Hold the ramp's line (straight road, so a nudge is enough).
+            let err = r.lateral - b.track_pos.lateral;
+            b.heading = track.frame_at(b.track_pos.s).heading() + (err * 0.02).clamp(-0.05, 0.05);
+            b.step(&track, &c, DT);
+            air = air.max(b.air_time);
+            let g = track.ground_at(b.pos.x, b.pos.z, &b.track_pos);
+            peak = peak.max(b.pos.y - g);
+        }
+        assert!(air > 0.8, "air time {air}");
+        assert!(peak > 1.8, "peak height {peak}");
+        assert!(b.on_ground && b.is_riding(), "landed and still riding");
+        // Riding alongside the ramp leaves the road flat.
+        assert!(track
+            .ramp_at(r.s + 5.0, r.lateral - 3.0 * r.lateral.signum())
+            .is_none());
+    }
+
+    #[test]
     fn barrier_contains_the_bike() {
         let track = Track::build(catalog()[0]);
         let mut b = straight_test(&track);
@@ -688,7 +742,7 @@ mod tests {
         };
         for _ in 0..1200 {
             b.step(&track, &c, DT);
-            assert!(b.track_pos.lateral.abs() <= track.half_width + RUNOFF + 0.5);
+            assert!(b.track_pos.lateral.abs() <= track.max_half_width() + RUNOFF + 0.5);
         }
     }
 

@@ -34,8 +34,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
     let theme = track.def.theme;
     let mut rng = XorShift64::new(theme.seed as u64 ^ 0x5ce4e);
     let mut props = Vec::with_capacity(8_000);
-    let hw = track.half_width;
-    let barrier = hw + RUNOFF;
+    let barrier_at = |s: f32| track.half_width_at(s) + RUNOFF;
 
     // Start/finish gantry spans the road at s = 0.
     let f0 = track.frame_at(0.0);
@@ -43,7 +42,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
         kind: PropKind::Gantry,
         pos: f0.pos,
         yaw: f0.heading(),
-        scale: hw,
+        scale: f0.half_width,
         tint: 0.0,
     });
     // Grandstands along the start straight, outside the barrier.
@@ -54,7 +53,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
         } else {
             1.0
         };
-        let lat = side * (barrier + 7.0);
+        let lat = side * (barrier_at(s) + 7.0);
         let f = track.frame_at(s);
         let p = track.point_at(s, lat);
         let y = track.ground_height(p.x, p.z).max(f.pos.y - 1.0);
@@ -82,7 +81,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
             }
             let side = if k % 2 == 0 { 1.0 } else { -1.0 };
             let f = track.frame_at(s);
-            let p = track.point_at(s, side * (barrier + 1.2));
+            let p = track.point_at(s, side * (barrier_at(s) + 1.2));
             props.push(Prop {
                 kind: PropKind::Lamp,
                 pos: Vec3::new(p.x, track.ground_height(p.x, p.z), p.z),
@@ -105,7 +104,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
         if sm.curvature.abs() > 0.012 && sm.dist - last > 150.0 {
             last = sm.dist;
             let side = -sm.curvature.signum();
-            let p = track.point_at(sm.dist, side * (barrier + 3.0));
+            let p = track.point_at(sm.dist, side * (barrier_at(sm.dist) + 3.0));
             props.push(Prop {
                 kind: PropKind::Marshal,
                 pos: Vec3::new(p.x, track.ground_height(p.x, p.z), p.z),
@@ -132,7 +131,7 @@ pub fn generate(track: &Track) -> Vec<Prop> {
             let edge = match near {
                 Some(i) => {
                     let s = track.sample(i);
-                    (p - Vec2::new(s.pos.x, s.pos.z)).length() - hw
+                    (p - Vec2::new(s.pos.x, s.pos.z)).length() - s.half_width
                 }
                 None => 70.0,
             };
@@ -208,7 +207,7 @@ mod tests {
                 .filter(|p| matches!(p.kind, PropKind::Tree(_) | PropKind::Rock))
             {
                 let tp = t.locate(Vec2::new(p.pos.x, p.pos.z));
-                assert!(tp.lateral.abs() > t.half_width + RUNOFF + 2.0);
+                assert!(tp.lateral.abs() > t.half_width_at(tp.s) + RUNOFF + 2.0);
             }
         }
     }

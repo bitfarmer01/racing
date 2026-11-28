@@ -256,6 +256,29 @@ fn render_traffic(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) -> bo
     true
 }
 
+/// Looks along the wide straight at its first kicker, from behind and above.
+fn render_ramp(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) -> bool {
+    let track = &s.race.track;
+    let Some(ramp) = track.ramps.first() else {
+        return false;
+    };
+    let bikes = s.bike_draws();
+    let particles = s.particles();
+    let cars = s.car_draws();
+    let mut input = s.frame_input(&bikes, &cars, &particles);
+    let f = track.frame_at(ramp.s);
+    let fwd = glam::Vec3::new(f.fwd.x, 0.0, f.fwd.y);
+    let right = glam::Vec3::new(f.right.x, 0.0, f.right.y);
+    let foot = f.pos + right * ramp.lateral;
+    input.camera.pos =
+        foot - fwd * 16.0 - right * ramp.lateral.signum() * 6.0 + glam::Vec3::Y * 4.5;
+    input.camera.target = foot + fwd * 8.0 + glam::Vec3::Y * 0.6;
+    input.camera.up = glam::Vec3::Y;
+    input.camera.fov_y = 0.9;
+    r.render(view, &input);
+    true
+}
+
 /// Renders with an impact frame forced on (1) or left to the session (0).
 fn render_impact(r: &mut Renderer, s: &Session, view: &wgpu::TextureView, impact: f32) {
     let bikes = s.bike_draws();
@@ -368,6 +391,9 @@ fn main() {
         off.save(&gpu, &out.join(format!("{}-9-club.png", def.slug)));
         render_weapon(&mut r, &s, &off.view, 2.0);
         off.save(&gpu, &out.join(format!("{}-10-chain.png", def.slug)));
+        if render_ramp(&mut r, &s, &off.view) {
+            off.save(&gpu, &out.join(format!("{}-12-ramp.png", def.slug)));
+        }
         if render_traffic(&mut r, &s, &off.view) {
             off.save(&gpu, &out.join(format!("{}-11-traffic.png", def.slug)));
         }

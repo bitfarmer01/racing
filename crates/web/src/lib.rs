@@ -113,6 +113,7 @@ pub fn pack_cues(cues: &[runtime::Cue], out: &mut Vec<f32>) {
             Cue::Armed(kind) => (18.0, weapon_code(Some(kind)), 0.0),
             Cue::Disarmed => (19.0, 0.0, 0.0),
             Cue::Hunted(i) => (20.0, i as f32, 0.0),
+            Cue::Mood(brawl) => (21.0, if brawl { 1.0 } else { 0.0 }, 0.0),
         };
         out.extend_from_slice(&[code, a, b]);
     }

@@ -105,6 +105,11 @@ export const DIRECTION = {
   [CUE.DISARMED]: () => ({ toast: ['Weapon gone', 'bad'], sound: [150, 0.1, 'square', 0.25] }),
   // a = rival's bike index; the loader adds `name` (cues carry indices).
   [CUE.HUNTED]: (c) => ({ toast: [`${c.name || 'A rival'} is coming for you`, 'bad'], sound: [300, 0.18, 'sawtooth', 0.2] }),
+  // a = 1 when the pack turns rough, 0 when it settles into clean racing.
+  [CUE.MOOD]: (c) =>
+    c.a > 0
+      ? { toast: ['The pack turns rough', 'bad'], sound: [220, 0.22, 'sawtooth', 0.22] }
+      : { toast: ['The pack settles', ''] },
   [CUE.CRASH]: () => ({ sound: [55, 0.3, 'sawtooth', 0.5] }),
   [CUE.LAP]: (c, h) => {
     const best = h[HUD.BEST_LAP];

@@ -227,6 +227,10 @@ pub enum EventKind {
         n: u32,
     },
     Go,
+    /// The pack's mood changed: rough (true) or calm again.
+    Mood {
+        brawl: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -367,6 +371,10 @@ pub struct Race {
     pub player_armour: f32,
     /// Engine power each bike started with, before catch-up.
     base_power: Vec<f32>,
+    /// The pack is riding rough: brawlers hunt and everyone swings.
+    pub brawl: bool,
+    /// Seconds left of the current calm or brawl.
+    pub mood_t: f32,
     rng: XorShift64,
     last_player_place: usize,
     beeps: u32,
@@ -408,9 +416,9 @@ impl Race {
                 let quality = 1.0 - row / n as f32;
                 let pace = difficulty.rival_pace();
                 let tuning = Tuning {
-                    power: (0.93 + 0.07 * quality + rng.next_f32_in(-0.02, 0.02)) * pace,
+                    power: (0.93 + 0.07 * quality + rng.next_f32_in(-0.04, 0.04)) * pace,
                     grip: 0.95 + 0.05 * quality,
-                    top_speed: (0.95 + 0.05 * quality + rng.next_f32_in(-0.01, 0.01)) * pace,
+                    top_speed: (0.95 + 0.05 * quality + rng.next_f32_in(-0.035, 0.035)) * pace,
                 };
                 let lane = rng.next_f32_in(-0.9, 0.9);
                 let commitment = (0.80
@@ -468,6 +476,8 @@ impl Race {
             guard_chance: difficulty.rival_guard(),
             player_armour: loadout.armour,
             base_power,
+            brawl: false,
+            mood_t: difficulty.calm_secs() * 0.5,
             rng,
             last_player_place: n,
             beeps: 0,
@@ -522,6 +532,7 @@ impl Race {
             Phase::Finished { t } => self.phase = Phase::Finished { t: t + DT },
         }
         self.clock += DT;
+        self.mood();
         self.traffic.step(&self.track, DT, &mut self.rng);
         self.step_bikes(player_input);
         self.contacts();
@@ -530,6 +541,27 @@ impl Race {
         self.combat();
         self.progress();
         self.rank();
+    }
+
+    /// Fights come in waves: a spell of clean racing, then a spell where
+    /// the pack rides rough, and round again.
+    fn mood(&mut self) {
+        self.mood_t -= DT;
+        if self.mood_t <= 0.0 {
+            self.brawl = !self.brawl;
+            self.mood_t = if self.brawl {
+                self.difficulty.brawl_secs()
+            } else {
+                self.difficulty.calm_secs()
+            };
+            if self.racers[PLAYER].finish_time.is_none() {
+                self.push(PLAYER, EventKind::Mood { brawl: self.brawl });
+            }
+        }
+        let calm = !self.brawl;
+        for r in self.rivals.iter_mut().flatten() {
+            r.set_calm(calm);
+        }
     }
 
     /// The green light: a throttle held in the sweet spot fires the bike off
@@ -1409,6 +1441,30 @@ mod tests {
             .any(|e| e.kind == EventKind::Launch { perfect: false }));
         assert!(spun.player().wheelspin > 0.0);
         assert!(good.player().speed() > spun.player().speed() + 3.0);
+    }
+
+    #[test]
+    fn fights_come_in_waves() {
+        let mut race = Race::new(catalog()[0], 7);
+        let d = race.difficulty;
+        let mut moods = Vec::new();
+        for _ in 0..(150.0 / DT) as usize {
+            race.tick(&Controls::default());
+            for e in &race.events {
+                if let EventKind::Mood { brawl } = e.kind {
+                    moods.push((race.clock, brawl));
+                }
+            }
+            if matches!(race.phase, Phase::Racing) {
+                let calm = race.rivals.iter().flatten().all(|r| r.calm);
+                assert_eq!(calm, !race.brawl);
+            }
+        }
+        // A calm opening, then rough and calm spells in turn.
+        assert!(moods.len() >= 4, "{moods:?}");
+        assert!((moods[0].0 - d.calm_secs() * 0.5).abs() < 0.1 && moods[0].1);
+        assert!((moods[1].0 - moods[0].0 - d.brawl_secs()).abs() < 0.1 && !moods[1].1);
+        assert!((moods[2].0 - moods[1].0 - d.calm_secs()).abs() < 0.1 && moods[2].1);
     }
 
     #[test]

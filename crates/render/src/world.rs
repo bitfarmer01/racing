@@ -167,7 +167,7 @@ fn build_terrain(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
                 match track.nearest_index(p, 70.0) {
                     Some(i) => {
                         let tp = track.locate_near(p, i, 3);
-                        let edge = tp.lateral.abs() - track.half_width;
+                        let edge = tp.lateral.abs() - track.half_width_at(tp.s);
                         let k = track.frame_at(tp.s).curvature;
                         let outer = if tp.lateral * k < 0.0 { 1.0 } else { 0.35 };
                         let trap = smoothstep(0.007, 0.016, k.abs())
@@ -226,7 +226,6 @@ fn build_terrain(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
 }
 
 fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
-    let hw = track.half_width;
     let n = track.len();
     let mut chunks = Vec::new();
     let verge = Mat::new([1.0, 1.0, 1.0], 0.92, 0.0).kind(kind::TERRAIN);
@@ -234,7 +233,6 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
     let kerb = Mat::new([1.0, 1.0, 1.0], 0.5, 0.0).kind(kind::KERB);
     let steel = Mat::new([0.6, 0.62, 0.66], 0.32, 0.9).kind(kind::BARRIER);
     let post = Mat::new([0.25, 0.25, 0.27], 0.6, 0.6);
-    let barrier = hw + RUNOFF;
 
     let mut i0 = 0;
     while i0 < n {
@@ -247,6 +245,7 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
         };
         for i in i0..=i1 {
             let s = track.sample(i % n);
+            let hw = s.half_width;
             let dist = if i == n { track.length } else { s.dist };
             let right = Vec3::new(s.right.x, 0.0, s.right.y);
             let at = |lat: f32, dy: f32| {
@@ -296,10 +295,14 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
                 b.quad_idx(a + k, c + k, c + k + 1, a + k + 1);
             }
         }
-        // Raw channels for the verge (proximity = 1).
+        // Raw channels for the verge (proximity = 1); the asphalt carries
+        // its half width (/16) for the edge lines, since it varies.
         for v in &mut b.vertices {
             if v.mat[0] == kind::TERRAIN {
                 v.color = [255, 0, 0, 255];
+            } else if v.mat[0] == kind::ROAD {
+                let hw = v.uv[0].abs() - 0.15;
+                v.color = [(hw / 16.0 * 255.0).round() as u8, 0, 0, 255];
             }
         }
 
@@ -313,6 +316,7 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
                         let s = track.sample(i % n);
                         let dist = if i == n { track.length } else { s.dist };
                         let w = kerb_k(i);
+                        let hw = s.half_width;
                         let right = Vec3::new(s.right.x, 0.0, s.right.y);
                         let up = Vec3::new(
                             -right.x * s.bank.sin(),
@@ -361,7 +365,7 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
                 let s = track.sample(i % n);
                 let dist = if i == n { track.length } else { s.dist };
                 let right = Vec3::new(s.right.x, 0.0, s.right.y);
-                let lat = side * barrier;
+                let lat = side * (s.half_width + RUNOFF);
                 let p = s.pos + right * lat;
                 let tp = game::track::TrackPos {
                     index: i % n,
@@ -414,7 +418,7 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
             for i in (i0..i1).step_by(2) {
                 let s = track.sample(i % n);
                 let right = Vec3::new(s.right.x, 0.0, s.right.y);
-                let lat = side * (barrier + 0.14);
+                let lat = side * (s.half_width + RUNOFF + 0.14);
                 let p = s.pos + right * lat;
                 let g = track.ground_height(p.x, p.z);
                 b.cube(
@@ -425,6 +429,12 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
             }
         }
 
+        // Kickers whose foot falls in this stretch.
+        let (s_lo, s_hi) = (i0 as f32 * track.spacing, i1 as f32 * track.spacing);
+        for r in track.ramps.iter().filter(|r| (s_lo..s_hi).contains(&r.s)) {
+            build_ramp(&mut b, track, r, &kerb, &post);
+        }
+
         let base = mesh.vertices.len() as u32;
         mesh.vertices.extend_from_slice(&b.vertices);
         mesh.indices.extend(b.indices.iter().map(|i| i + base));
@@ -432,6 +442,77 @@ fn build_road(mesh: &mut MeshBuilder, track: &Track) -> Vec<Chunk> {
         i0 = i1;
     }
     chunks
+}
+
+/// A kicker: a striped curved face rising to a lip, with dark sides and a
+/// sheer back.
+fn build_ramp(b: &mut MeshBuilder, track: &Track, r: &game::track::Ramp, face: &Mat, side: &Mat) {
+    use game::track::{RAMP_HALF_WIDTH, RAMP_HEIGHT, RAMP_LENGTH};
+    const SEGS: usize = 12;
+    let mut stripe = *face;
+    stripe.extra = 1.0;
+    let corner = |x: f32, lat: f32, top: bool| -> (Vec3, Vec3) {
+        let f = track.frame_at(r.s + x);
+        let right = Vec3::new(f.right.x, 0.0, f.right.y);
+        let mut p = f.pos + right * lat;
+        let u = x / RAMP_LENGTH;
+        p.y = f.surface_y(lat)
+            + if top {
+                RAMP_HEIGHT * u * u + 0.03
+            } else {
+                -0.05
+            };
+        (p, right)
+    };
+    let (l, rr) = (r.lateral - RAMP_HALF_WIDTH, r.lateral + RAMP_HALF_WIDTH);
+    // Face.
+    let start = b.vertices.len() as u32;
+    for k in 0..=SEGS {
+        let x = RAMP_LENGTH * k as f32 / SEGS as f32;
+        let slope = 2.0 * RAMP_HEIGHT * x / (RAMP_LENGTH * RAMP_LENGTH);
+        let f = track.frame_at(r.s + x);
+        let fwd = Vec3::new(f.fwd.x, 0.0, f.fwd.y);
+        let n = (Vec3::Y - fwd * slope).normalize();
+        for lat in [l, rr] {
+            let (p, _) = corner(x, lat, true);
+            b.vertex(p, n, Vec2::new(lat, x * 0.9), &stripe);
+        }
+    }
+    for k in 0..SEGS as u32 {
+        let a = start + k * 2;
+        b.quad_idx(a, a + 1, a + 3, a + 2);
+    }
+    // Sides.
+    for (lat, sgn) in [(l, -1.0f32), (rr, 1.0)] {
+        let start = b.vertices.len() as u32;
+        for k in 0..=SEGS {
+            let x = RAMP_LENGTH * k as f32 / SEGS as f32;
+            let (top, right) = corner(x, lat, true);
+            let (bot, _) = corner(x, lat, false);
+            b.vertex(top, right * sgn, Vec2::new(0.0, x), side);
+            b.vertex(bot, right * sgn, Vec2::new(1.0, x), side);
+        }
+        for k in 0..SEGS as u32 {
+            let a = start + k * 2;
+            if sgn > 0.0 {
+                b.quad_idx(a, a + 2, a + 3, a + 1);
+            } else {
+                b.quad_idx(a, a + 1, a + 3, a + 2);
+            }
+        }
+    }
+    // Back wall under the lip.
+    let f = track.frame_at(r.s + RAMP_LENGTH);
+    let back = Vec3::new(f.fwd.x, 0.0, f.fwd.y);
+    let (lt, _) = corner(RAMP_LENGTH, l, true);
+    let (lb, _) = corner(RAMP_LENGTH, l, false);
+    let (rt, _) = corner(RAMP_LENGTH, rr, true);
+    let (rb, _) = corner(RAMP_LENGTH, rr, false);
+    let a = b.vertex(lt, back, Vec2::ZERO, side);
+    let bb = b.vertex(rt, back, Vec2::ZERO, side);
+    let c = b.vertex(rb, back, Vec2::ZERO, side);
+    let d = b.vertex(lb, back, Vec2::ZERO, side);
+    b.quad_idx(a, bb, c, d);
 }
 
 fn build_water(mesh: &mut MeshBuilder, track: &Track) -> Option<Chunk> {
@@ -519,7 +600,7 @@ fn build_props(mesh: &mut MeshBuilder, track: &Track) -> Vec<PropModel> {
         ),
         (models::lamp(), None, 1600.0, true),
         (models::grandstand(0.3), None, 2500.0, true),
-        (models::gantry(track.half_width), None, 2500.0, true),
+        (models::gantry(track.half_width_at(0.0)), None, 2500.0, true),
         (models::marshal(0.5), None, 1200.0, true),
     ];
     let mut out = Vec::new();

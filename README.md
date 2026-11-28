@@ -55,8 +55,18 @@ Open http://localhost:8000/web/. The built bundles in `web/pkg-webgpu` and
   nerve, how often they attack, block and parry, how hard their hits land on
   you, and how much the pack waits for you (Easy) or never does (Hard).
 - **Rivals** race the same physics with their own lines, skill and aggression.
-  The angriest of them hunt you: they drop back or close up to ride alongside
-  and swing at you. Hit one cleanly and they hold a grudge for a while.
+  No two hold the same pace: each drifts between pushing and cruising every
+  few seconds, and now and then one brakes too early into a corner, so the
+  pack strings out and bunches up again.
+- **Fights come in waves:** the race opens clean, then the pack turns rough
+  (a toast says so) and the angriest riders hunt you: they drop back or close
+  up to ride alongside and swing at you. After a spell it settles back into
+  clean racing, and round again (Hard brawls longer and rests less). Hit a
+  rider cleanly and they hold a grudge whatever the mood.
+- **Tracks:** each has a wide straight (the road opens out by a lane each
+  side) with striped kickers on its shoulders, and tight hairpins at set
+  points. Hit a kicker at speed and the bike flies for a second or more;
+  line it up straight to land riding.
 - **Traffic:** cars, vans and trucks use the road both ways, two lanes each
   direction. Touch one at speed and you are thrown over it; a rival shoving
   you into one counts as their knock-off. Skim past within a metre and a half

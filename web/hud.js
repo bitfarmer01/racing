@@ -18,7 +18,7 @@ export const WEAPONS = Object.freeze(['', 'Club', 'Chain']);
 export const CUE = Object.freeze({
   BEEP: 1, GO: 2, WALL: 3, CONTACT: 4, HIT_LANDED: 5, GOT_HIT: 6, CRASH: 7, LAP: 8, FINISHED: 9, OVERTAKE: 10,
   GUARDED: 11, PARRIED: 12, WAS_PARRIED: 13, KNOCKOFF: 14, LAUNCH: 15,
-  TRAFFIC_CRASH: 16, NEAR_MISS: 17, ARMED: 18, DISARMED: 19, HUNTED: 20,
+  TRAFFIC_CRASH: 16, NEAR_MISS: 17, ARMED: 18, DISARMED: 19, HUNTED: 20, MOOD: 21,
 });
 
 // Difficulty levels (crates/game/src/difficulty.rs) for the menu.

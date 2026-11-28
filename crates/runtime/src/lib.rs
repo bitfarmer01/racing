@@ -68,6 +68,8 @@ pub enum Cue {
     Disarmed,
     /// A rival (bike index) has come looking for the player.
     Hunted(usize),
+    /// The pack turned rough (true) or settled down again.
+    Mood(bool),
     Lap(u32, f32),
     Finished(usize),
     Overtake(bool),
@@ -334,6 +336,7 @@ impl Session {
             let mine = e.bike == PLAYER;
             match e.kind {
                 EventKind::CountdownBeep { n } => self.cues.push(Cue::Beep(n)),
+                EventKind::Mood { brawl } => self.cues.push(Cue::Mood(brawl)),
                 EventKind::Go => self.cues.push(Cue::Go),
                 EventKind::WallHit { speed } => {
                     let p = b.pos

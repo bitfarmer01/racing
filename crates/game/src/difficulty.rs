@@ -116,6 +116,24 @@ impl Difficulty {
         }
     }
 
+    /// Fights come in waves. Seconds of clean racing, then of rough
+    /// riding, in each cycle; the race opens with a calm spell.
+    pub fn calm_secs(self) -> f32 {
+        match self {
+            Difficulty::Easy => 45.0,
+            Difficulty::Normal => 32.0,
+            Difficulty::Hard => 22.0,
+        }
+    }
+
+    pub fn brawl_secs(self) -> f32 {
+        match self {
+            Difficulty::Easy => 14.0,
+            Difficulty::Normal => 20.0,
+            Difficulty::Hard => 26.0,
+        }
+    }
+
     /// Power multiplier for a rival `gap` metres behind the player
     /// (negative gap: the rival is ahead). Easy holds the leaders back and
     /// never pushes the stragglers; Hard has no catch-up at all.
@@ -161,6 +179,8 @@ mod tests {
         assert!(e.rival_pace() < n.rival_pace() && n.rival_pace() < h.rival_pace());
         assert!(e.rival_guard() < n.rival_guard() && n.rival_guard() < h.rival_guard());
         assert!(e.damage_to_player() < h.damage_to_player());
+        // Harder fields brawl more and rest less.
+        assert!(e.calm_secs() > h.calm_secs() && e.brawl_secs() < h.brawl_secs());
         // Easy waits for a player far behind; Hard never does.
         assert!(e.catch_up(-300.0) < 1.0);
         assert_eq!(h.catch_up(-300.0), 1.0);

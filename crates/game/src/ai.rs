@@ -8,10 +8,16 @@
 //! Brawlers, and any rival the player has hit, go further: they hunt the
 //! player down, ride up alongside and match speed to fight. Guarding is
 //! decided by the race, which sees strikes coming.
+//!
+//! Fights come in waves: the race calls the pack calm or rough. While it is
+//! calm, rivals race clean and only answer the player's own hits.
+//!
+//! No two rivals hold the same pace: each drifts between pushing and
+//! cruising every few seconds, and now and then brakes too early.
 
 use glam::Vec2;
 
-use crate::bike::{wrap_angle, Bike, Controls, BRAKE_DECEL, GRIP_ROAD};
+use crate::bike::{wrap_angle, Bike, Controls, BRAKE_DECEL, GRIP_ROAD, TOP_SPEED};
 use crate::track::Track;
 use crate::traffic::Car;
 
@@ -20,6 +26,14 @@ pub const GRUDGE_SECS: f32 = 12.0;
 /// A brawler hunts for this long, then rests before it hunts again.
 const HUNT_SECS: f32 = 14.0;
 const REST_SECS: f32 = 9.0;
+/// How often a calm rival, or one racing with no grudge, swings at a bike
+/// alongside, as a fraction of its aggression per tick.
+const CALM_STRIKE_RATE: f32 = 0.0004;
+const RACE_STRIKE_RATE: f32 = 0.05;
+const HUNT_STRIKE_RATE: f32 = 0.12;
+/// A rival's pace drifts between these shares of its top speed.
+const PACE_MIN: f32 = 0.86;
+const PACE_MAX: f32 = 1.02;
 
 #[derive(Debug, Clone)]
 pub struct Rival {
@@ -48,6 +62,14 @@ pub struct Rival {
     avoid: Option<(usize, f32)>,
     /// Lateral it is steering for this tick.
     pub target_lat: f32,
+    /// The pack is calm: race clean unless there's a grudge.
+    pub calm: bool,
+    /// Share of its top speed it is riding at now, drifting toward a goal.
+    pub pace: f32,
+    pace_goal: f32,
+    pace_t: f32,
+    /// Seconds left of a braking mistake.
+    fumble_t: f32,
 }
 
 impl Rival {
@@ -68,7 +90,22 @@ impl Rival {
             avoiding: false,
             avoid: None,
             target_lat: 0.0,
+            calm: false,
+            pace: 1.0,
+            pace_goal: 1.0,
+            pace_t: 0.0,
+            fumble_t: 0.0,
         }
+    }
+
+    /// Sets whether the pack is calm. When the calm breaks, brawlers come
+    /// looking at once.
+    pub fn set_calm(&mut self, calm: bool) {
+        if self.calm && !calm {
+            self.rest_t = 0.0;
+            self.hunt_t = 0.0;
+        }
+        self.calm = calm;
     }
 
     /// Decides this tick's controls. `others` are every other bike, `cars`
@@ -89,12 +126,22 @@ impl Rival {
         self.grudge = (self.grudge - dt).max(0.0);
         self.rest_t = (self.rest_t - dt).max(0.0);
         self.dodge_timer = (self.dodge_timer - dt).max(0.0);
+        self.fumble_t = (self.fumble_t - dt).max(0.0);
+        // Pace: every few seconds pick a new mood between cruising and
+        // pushing, and ease toward it.
+        self.pace_t -= dt;
+        if self.pace_t <= 0.0 {
+            let r = (roll * 9973.0).fract();
+            self.pace_goal = PACE_MIN + (PACE_MAX - PACE_MIN) * r;
+            self.pace_t = 4.0 + 5.0 * (roll * 7919.0).fract();
+        }
+        self.pace += (self.pace_goal - self.pace) * (0.6 * dt).min(1.0);
         if self.dodge_timer <= 0.0 {
             self.dodge *= 1.0 - (2.0 * dt).min(1.0);
         }
         let v = me.forward_speed().max(0.0);
         let s = me.track_pos.s;
-        let hw = track.half_width;
+        let hw = track.half_width_at(s);
 
         // Traffic: swing out around a slower bike ahead in our lane.
         let fwd = me.fwd();
@@ -129,7 +176,7 @@ impl Rival {
         if let Some(p) = prey.filter(|p| p.is_solid() && me.is_riding() && p.forward_speed() > 12.0)
         {
             let d = track.delta_s(s, p.track_pos.s);
-            let keen = self.grudge > 0.0 || (self.brawler && self.rest_t <= 0.0);
+            let keen = self.grudge > 0.0 || (self.brawler && !self.calm && self.rest_t <= 0.0);
             if keen && (-30.0..45.0).contains(&d) {
                 hunt = Some((d, p));
             }
@@ -280,7 +327,12 @@ impl Rival {
         let steer = (want_yaw / max_yaw).clamp(-1.0, 1.0);
 
         // Speed: the slowest of the corner limits ahead, reachable by braking.
-        let grip = GRIP_ROAD * me.tuning.grip * self.commitment;
+        let nerve = if self.hunting {
+            1.0
+        } else {
+            0.93 + 0.07 * self.pace.min(1.0)
+        };
+        let grip = GRIP_ROAD * me.tuning.grip * self.commitment * nerve;
         let horizon = (v * v / (2.0 * BRAKE_DECEL * 0.6) + 40.0).min(220.0);
         let mut target_v = f32::MAX;
         let mut d = 0.0;
@@ -290,6 +342,22 @@ impl Rival {
             let v_here = (v_corner * v_corner + 2.0 * BRAKE_DECEL * 0.6 * d).sqrt();
             target_v = target_v.min(v_here);
             d += 6.0;
+        }
+        // Cruising rivals hold off their top speed; hunters never do.
+        if !self.hunting {
+            target_v = target_v.min(TOP_SPEED * me.tuning.top_speed * self.pace);
+        }
+        // Now and then a rival brakes too early into a corner.
+        if self.fumble_t <= 0.0
+            && !self.hunting
+            && curv_ahead.abs() > 0.012
+            && v > 25.0
+            && (roll * 3571.0).fract() < 0.0004
+        {
+            self.fumble_t = 0.7;
+        }
+        if self.fumble_t > 0.0 {
+            target_v = target_v.min(v * 0.8);
         }
         if let Some(fv) = follow_car {
             target_v = target_v.min(fv.max(0.0));
@@ -331,9 +399,11 @@ impl Rival {
         let boost = (self.boost_timer > 0.0 || (chase && me.boost > 0.15)) && throttle > 0.9;
 
         let (rate, agg) = if self.hunting {
-            (0.12, self.aggression.max(0.5))
+            (HUNT_STRIKE_RATE, self.aggression.max(0.5))
+        } else if self.calm && self.grudge <= 0.0 {
+            (CALM_STRIKE_RATE, self.aggression)
         } else {
-            (0.05, self.aggression)
+            (RACE_STRIKE_RATE, self.aggression)
         };
         let strike = alongside.is_some()
             && self.attack_cooldown <= 0.0
@@ -359,5 +429,87 @@ impl Rival {
             kick,
             block: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bike::Tuning;
+    use crate::tracks::catalog;
+
+    /// Strikes a rival throws in `secs` at a bike riding alongside it.
+    fn strikes(calm: bool, secs: f32) -> usize {
+        let track = Track::build(catalog()[0]);
+        let me = Bike::new(&track, 60.0, 1.0, Tuning::default());
+        let other = Bike::new(&track, 60.0, -0.4, Tuning::default());
+        let mut r = Rival::new(0.0, 0.9, 0.8);
+        r.set_calm(calm);
+        let dt = 1.0 / 120.0;
+        let mut n = 0;
+        for k in 0..(secs / dt) as usize {
+            let roll = (k as f32 * 0.618_034).fract();
+            let c = r.drive(&me, &[&other], &[], None, &track, dt, roll);
+            n += (c.attack || c.kick) as usize;
+        }
+        n
+    }
+
+    #[test]
+    fn a_calm_pack_rarely_swings_and_a_rough_one_often_does() {
+        let calm = strikes(true, 100.0);
+        let rough = strikes(false, 100.0);
+        assert!(calm <= 6, "calm: {calm} strikes");
+        assert!(rough >= 20, "rough: {rough} strikes");
+    }
+
+    #[test]
+    fn a_grudge_ends_the_calm_for_that_rider() {
+        let track = Track::build(catalog()[0]);
+        let me = Bike::new(&track, 60.0, 1.0, Tuning::default());
+        let other = Bike::new(&track, 60.0, -0.4, Tuning::default());
+        let mut r = Rival::new(0.0, 0.9, 0.8);
+        r.set_calm(true);
+        r.grudge = GRUDGE_SECS;
+        let dt = 1.0 / 120.0;
+        let n = (0..1200)
+            .map(|k| {
+                r.drive(
+                    &me,
+                    &[&other],
+                    &[],
+                    None,
+                    &track,
+                    dt,
+                    (k as f32 * 0.618_034).fract(),
+                )
+            })
+            .filter(|c| c.attack || c.kick)
+            .count();
+        assert!(n >= 3, "{n} strikes in 10 s with a grudge");
+    }
+
+    #[test]
+    fn rivals_drift_between_cruising_and_pushing() {
+        let track = Track::build(catalog()[0]);
+        let me = Bike::new(&track, 60.0, 1.0, Tuning::default());
+        let mut r = Rival::new(0.0, 0.9, 0.5);
+        let dt = 1.0 / 120.0;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for k in 0..(90.0 / dt) as usize {
+            r.drive(
+                &me,
+                &[],
+                &[],
+                None,
+                &track,
+                dt,
+                (k as f32 * 0.618_034).fract(),
+            );
+            lo = lo.min(r.pace);
+            hi = hi.max(r.pace);
+        }
+        assert!(lo >= PACE_MIN - 1e-3 && hi <= PACE_MAX + 1e-3);
+        assert!(hi - lo > 0.06, "pace only ranged {lo:.3}..{hi:.3}");
     }
 }
