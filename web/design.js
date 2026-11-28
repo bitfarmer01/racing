@@ -12,7 +12,7 @@
 //    frames, sparks, shake) are already driven from the same cues inside the
 //    wasm. Nothing else in the page decides what a cue looks or sounds like.
 
-import { CUE, HUD, formatTime, ordinal } from './hud.js';
+import { CUE, HUD, WEAPONS, formatTime, ordinal } from './hud.js';
 
 // Parses `--name: value;` pairs as produced by `style_css`.
 export function parseStyle(css) {
@@ -89,6 +89,22 @@ export const DIRECTION = {
       ? { toast: ['Perfect start', 'best'], sound: [740, 0.1, 'sine', 0.25] }
       : { toast: ['Wheelspin', 'bad'] },
   [CUE.GOT_HIT]: () => ({ sound: [95, 0.1, 'square', 0.35] }),
+  // You went into a car: the loudest thing in the game.
+  [CUE.TRAFFIC_CRASH]: () => ({
+    toast: ['Wrecked', 'bad'],
+    flash: 0.9,
+    sound: [48, 0.45, 'sawtooth', 0.6],
+  }),
+  // a = 1 when the car was coming the other way (worth more boost).
+  [CUE.NEAR_MISS]: (c) =>
+    c.a > 0
+      ? { toast: ['Near miss · oncoming', 'best'], sound: [990, 0.06, 'sine', 0.22] }
+      : { toast: ['Near miss', 'best'], sound: [820, 0.05, 'sine', 0.16] },
+  // a = weapon code (1 club, 2 chain).
+  [CUE.ARMED]: (c) => ({ toast: [`${WEAPONS[c.a] || 'Weapon'} grabbed`, 'best'], sound: [420, 0.12, 'triangle', 0.35] }),
+  [CUE.DISARMED]: () => ({ toast: ['Weapon gone', 'bad'], sound: [150, 0.1, 'square', 0.25] }),
+  // a = rival's bike index; the loader adds `name` (cues carry indices).
+  [CUE.HUNTED]: (c) => ({ toast: [`${c.name || 'A rival'} is coming for you`, 'bad'], sound: [300, 0.18, 'sawtooth', 0.2] }),
   [CUE.CRASH]: () => ({ sound: [55, 0.3, 'sawtooth', 0.5] }),
   [CUE.LAP]: (c, h) => {
     const best = h[HUD.BEST_LAP];

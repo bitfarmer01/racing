@@ -156,7 +156,8 @@ fn render(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
 fn render_front(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) {
     let bikes = s.bike_draws();
     let particles = s.particles();
-    let mut input = s.frame_input(&bikes, &particles);
+    let cars = s.car_draws();
+    let mut input = s.frame_input(&bikes, &cars, &particles);
     let b = &s.race.bikes[0];
     let f = glam::Vec3::new(b.heading.cos(), 0.0, b.heading.sin());
     let side = glam::Vec3::new(-f.z, 0.0, f.x);
@@ -188,7 +189,8 @@ fn render_side_posed(
         bikes[0].tuck = 0.0;
     }
     let particles = s.particles();
-    let mut input = s.frame_input(&bikes, &particles);
+    let cars = s.car_draws();
+    let mut input = s.frame_input(&bikes, &cars, &particles);
     let b = &s.race.bikes[0];
     let f = glam::Vec3::new(b.heading.cos(), 0.0, b.heading.sin());
     let side = glam::Vec3::new(-f.z, 0.0, f.x);
@@ -200,11 +202,66 @@ fn render_side_posed(
     r.render(view, &input);
 }
 
+/// Side view with the player holding a weapon (1 club, 2 chain), mid-swing.
+fn render_weapon(r: &mut Renderer, s: &Session, view: &wgpu::TextureView, weapon: f32) {
+    let mut bikes = s.bike_draws();
+    bikes[0].weapon = weapon;
+    bikes[0].weapon_hand = 1.0;
+    bikes[0].punch = 0.55;
+    bikes[0].tuck = 0.0;
+    let particles = s.particles();
+    let cars = s.car_draws();
+    let mut input = s.frame_input(&bikes, &cars, &particles);
+    let b = &s.race.bikes[0];
+    let f = glam::Vec3::new(b.heading.cos(), 0.0, b.heading.sin());
+    let side = glam::Vec3::new(-f.z, 0.0, f.x);
+    let at = b.pos + glam::Vec3::Y * 0.9;
+    input.camera.pos = at + side * 2.6 + f * 2.2 + glam::Vec3::Y * 0.5;
+    input.camera.target = at;
+    input.camera.up = glam::Vec3::Y;
+    input.camera.fov_y = 0.75;
+    r.render(view, &input);
+}
+
+/// Behind and above the nearest car ahead of the player, looking at it.
+fn render_traffic(r: &mut Renderer, s: &Session, view: &wgpu::TextureView) -> bool {
+    let me = s.race.bikes[0].track_pos.s;
+    let Some(car) = s
+        .race
+        .traffic
+        .cars
+        .iter()
+        .filter(|c| (8.0..600.0).contains(&s.race.track.delta_s(me, c.s)))
+        .min_by(|a, b| {
+            s.race
+                .track
+                .delta_s(me, a.s)
+                .total_cmp(&s.race.track.delta_s(me, b.s))
+        })
+    else {
+        return false;
+    };
+    let bikes = s.bike_draws();
+    let particles = s.particles();
+    let cars = s.car_draws_near(car.pos);
+    let mut input = s.frame_input(&bikes, &cars, &particles);
+    let f = s.race.track.frame_at(car.s);
+    let fwd = glam::Vec3::new(f.fwd.x, 0.0, f.fwd.y);
+    let right = glam::Vec3::new(f.right.x, 0.0, f.right.y);
+    input.camera.pos = car.pos - fwd * 9.0 + right * 2.5 + glam::Vec3::Y * 2.6;
+    input.camera.target = car.pos + glam::Vec3::Y * 0.8 + fwd * 4.0;
+    input.camera.up = glam::Vec3::Y;
+    input.camera.fov_y = 0.9;
+    r.render(view, &input);
+    true
+}
+
 /// Renders with an impact frame forced on (1) or left to the session (0).
 fn render_impact(r: &mut Renderer, s: &Session, view: &wgpu::TextureView, impact: f32) {
     let bikes = s.bike_draws();
     let particles = s.particles();
-    let mut input = s.frame_input(&bikes, &particles);
+    let cars = s.car_draws();
+    let mut input = s.frame_input(&bikes, &cars, &particles);
     input.impact = input.impact.max(impact);
     r.render(view, &input);
 }
@@ -307,6 +364,13 @@ fn main() {
         off.save(&gpu, &out.join(format!("{}-8-guard.png", def.slug)));
         render_impact(&mut r, &s, &off.view, 1.0);
         off.save(&gpu, &out.join(format!("{}-4-impact.png", def.slug)));
+        render_weapon(&mut r, &s, &off.view, 1.0);
+        off.save(&gpu, &out.join(format!("{}-9-club.png", def.slug)));
+        render_weapon(&mut r, &s, &off.view, 2.0);
+        off.save(&gpu, &out.join(format!("{}-10-chain.png", def.slug)));
+        if render_traffic(&mut r, &s, &off.view) {
+            off.save(&gpu, &out.join(format!("{}-11-traffic.png", def.slug)));
+        }
         advance(&mut s, 9.0);
         s.cam_mode = CamMode::Far;
         advance(&mut s, 0.5);

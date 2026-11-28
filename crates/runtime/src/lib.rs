@@ -8,10 +8,10 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 use game::ai::Rival;
 use game::bike::{Bike, Controls, RiderState, Surface, BOOST_TOP_SPEED};
 use game::difficulty::Difficulty;
-use game::race::{EventKind, Phase, Race, Strike, DT, PLAYER, RIVAL_NAMES};
-use game::track::TrackDef;
+use game::race::{EventKind, Loadout, Phase, Race, Strike, WeaponKind, DT, PLAYER, RIVAL_NAMES};
+use game::track::{Track, TrackDef};
 use render::style::palette;
-use render::{BikeDraw, Camera, FrameInput, Particle, ParticleKind};
+use render::{BikeDraw, Camera, CarDraw, FrameInput, Particle, ParticleKind};
 use sim::rng::XorShift64;
 
 /// Raw player input for one frame.
@@ -58,6 +58,16 @@ pub enum Cue {
     /// The player's start: perfect, or wheelspin.
     Launch(bool),
     Crash,
+    /// The player went into a car.
+    TrafficCrash,
+    /// The player threaded past a car (true: an oncoming one).
+    NearMiss(bool),
+    /// The player picked up a weapon.
+    Armed(WeaponKind),
+    /// The player's weapon was taken or broke.
+    Disarmed,
+    /// A rival (bike index) has come looking for the player.
+    Hunted(usize),
     Lap(u32, f32),
     Finished(usize),
     Overtake(bool),
@@ -130,6 +140,18 @@ fn boost_flame() -> [f32; 4] {
     [r * 9.0 + 0.6, g * 9.0, b * 9.0, 1.0]
 }
 
+/// Road-car colours: duller, everyday paint so the race bikes stand out.
+pub const CAR_PAINTS: [([f32; 3], [f32; 3]); 8] = [
+    ([0.55, 0.56, 0.58], [0.0; 3]),
+    ([0.06, 0.06, 0.07], [0.0; 3]),
+    ([0.75, 0.74, 0.70], [0.0; 3]),
+    ([0.30, 0.04, 0.05], [0.0; 3]),
+    ([0.05, 0.12, 0.30], [0.0; 3]),
+    ([0.20, 0.26, 0.18], [0.0; 3]),
+    ([0.62, 0.50, 0.30], [0.0; 3]),
+    ([0.80, 0.62, 0.05], [0.0; 3]),
+];
+
 pub const PAINTS: [([f32; 3], [f32; 3]); 8] = [
     ([0.80, 0.04, 0.03], [0.85, 0.85, 0.86]),
     ([0.03, 0.18, 0.75], [0.05, 0.05, 0.08]),
@@ -164,7 +186,14 @@ pub struct Session {
     best_lap: Option<f32>,
     /// Seconds left on the current impact frame (see `IMPACT_SECS`).
     impact: f32,
+    /// Seconds the simulation holds still so a big hit lands (see `HIT_STOP_SECS`).
+    hit_stop: f32,
+    /// Which rivals were hunting the player last frame.
+    hunted: Vec<bool>,
 }
+
+/// A beat of frozen time when a blow lands, so it reads as heavy.
+pub const HIT_STOP_SECS: f32 = 0.07;
 
 /// Length of an impact-frame sequence: a held three-tone frame, a beat of
 /// normal picture, then a second held frame, like an anime hit.
@@ -176,7 +205,18 @@ impl Session {
     }
 
     pub fn with_difficulty(def: TrackDef, seed: u64, difficulty: Difficulty) -> Self {
-        let race = Race::with_difficulty(def, seed, difficulty);
+        Self::with_loadout(def, seed, difficulty, Loadout::default())
+    }
+
+    /// A race with the player's garage upgrades fitted.
+    pub fn with_loadout(
+        def: TrackDef,
+        seed: u64,
+        difficulty: Difficulty,
+        loadout: Loadout,
+    ) -> Self {
+        let race = Race::with_loadout(Track::build(def), seed, difficulty, loadout);
+        let n = race.bikes.len();
         let snaps: Vec<Snap> = race.bikes.iter().map(Snap::of).collect();
         Self {
             race,
@@ -199,6 +239,8 @@ impl Session {
             paused: false,
             best_lap: None,
             impact: 0.0,
+            hit_stop: 0.0,
+            hunted: vec![false; n],
         }
     }
 
@@ -241,14 +283,27 @@ impl Session {
             kick: input.kick,
             block: input.block,
         };
-        self.acc += dt;
+        // Hit-stop: the world holds for a beat; the camera and sparks don't.
+        if self.hit_stop > 0.0 {
+            self.hit_stop -= dt;
+        } else {
+            self.acc += dt;
+        }
         while self.acc >= DT {
             self.acc -= DT;
             if let Some(ai) = self.autopilot.as_mut() {
                 let me = &self.race.bikes[PLAYER];
                 let others: Vec<&Bike> = self.race.bikes.iter().skip(1).collect();
                 let roll = self.rng.next_f32();
-                controls = ai.drive(me, &others, &self.race.track, DT, roll);
+                controls = ai.drive(
+                    me,
+                    &others,
+                    &self.race.traffic.cars,
+                    None,
+                    &self.race.track,
+                    DT,
+                    roll,
+                );
                 if self.race.is_counting_down() {
                     controls.throttle = 0.7;
                 }
@@ -260,7 +315,13 @@ impl Session {
             }
             self.handle_events();
             self.tick_effects();
+            if self.hit_stop > 0.0 {
+                // Freeze from this tick: drop the rest of the frame's time.
+                self.acc = self.acc.min(DT * 0.5);
+                break;
+            }
         }
+        self.watch_hunters();
         self.step_particles(dt);
         self.update_camera(dt);
     }
@@ -307,6 +368,8 @@ impl Session {
                         self.cues.push(Cue::GotHit);
                     } else if attacker == PLAYER {
                         self.impact = IMPACT_SECS;
+                        self.hit_stop = HIT_STOP_SECS;
+                        self.trauma = (self.trauma + 0.2).min(1.0);
                         self.cues.push(Cue::HitLanded(kick));
                     }
                 }
@@ -332,7 +395,46 @@ impl Session {
                 EventKind::KnockOff { .. } => {
                     if mine {
                         self.impact = IMPACT_SECS;
+                        self.hit_stop = HIT_STOP_SECS * 1.6;
                         self.cues.push(Cue::KnockOff);
+                    }
+                }
+                EventKind::TrafficCrash { speed } => {
+                    self.burst_sparks(b.pos + Vec3::Y * 0.7, b, 60);
+                    self.burst_dust(b.pos + Vec3::Y * 0.6, 22, [0.5, 0.48, 0.46]);
+                    // Glass.
+                    self.burst_glass(b.pos + Vec3::Y * 1.0, b, 24);
+                    if mine {
+                        self.trauma = 1.0;
+                        self.impact = IMPACT_SECS;
+                        self.hit_stop = HIT_STOP_SECS * (1.0 + (speed / 30.0).min(1.5));
+                        self.cues.push(Cue::TrafficCrash);
+                    }
+                }
+                EventKind::CarScrape { speed } => {
+                    self.burst_sparks(b.pos + Vec3::Y * 0.6, b, 12 + speed as usize * 2);
+                    if mine {
+                        self.trauma = (self.trauma + 0.15 + speed * 0.03).min(1.0);
+                        self.cues.push(Cue::Contact(speed));
+                    }
+                }
+                EventKind::NearMiss { oncoming } => {
+                    if mine {
+                        self.trauma = (self.trauma + 0.12).min(1.0);
+                        self.cues.push(Cue::NearMiss(oncoming));
+                    }
+                }
+                EventKind::Armed { kind, from } => {
+                    if mine {
+                        self.cues.push(Cue::Armed(kind));
+                    } else if from == PLAYER {
+                        self.cues.push(Cue::Disarmed);
+                    }
+                }
+                EventKind::WeaponBroke => {
+                    self.burst_dust(b.pos + Vec3::Y * 1.3, 6, [0.45, 0.35, 0.25]);
+                    if mine {
+                        self.cues.push(Cue::Disarmed);
                     }
                 }
                 EventKind::Launch { perfect } => {
@@ -418,6 +520,51 @@ impl Session {
                 9.0,
                 1.2,
             );
+        }
+    }
+
+    /// Bright shards that tumble and fall: a windscreen going.
+    fn burst_glass(&mut self, at: Vec3, b: &Bike, n: usize) {
+        let v = Vec3::new(b.vel.x, 0.0, b.vel.y);
+        for _ in 0..n {
+            let r = Vec3::new(
+                self.rng.next_f32_in(-1.0, 1.0),
+                self.rng.next_f32_in(0.5, 2.0),
+                self.rng.next_f32_in(-1.0, 1.0),
+            );
+            let life = self.rng.next_f32_in(0.5, 1.0);
+            self.spawn(
+                Particle {
+                    kind: ParticleKind::Glow,
+                    pos: at,
+                    size: 0.03,
+                    color: [1.6, 2.0, 2.4, 1.0],
+                    vel: v * 0.4 + r * 4.0,
+                    stretch: 0.004,
+                },
+                life,
+                0.0,
+                12.0,
+                0.8,
+            );
+        }
+    }
+
+    /// Tells the player when a rival starts riding them down.
+    fn watch_hunters(&mut self) {
+        let me = self.race.bikes[PLAYER].track_pos.s;
+        for i in 1..self.race.bikes.len() {
+            let hunting = self.race.rivals[i].as_ref().is_some_and(|r| r.hunting);
+            let close = self
+                .race
+                .track
+                .delta_s(self.race.bikes[i].track_pos.s, me)
+                .abs()
+                < 25.0;
+            if hunting && close && !self.hunted[i] {
+                self.cues.push(Cue::Hunted(i));
+            }
+            self.hunted[i] = hunting && (close || self.hunted[i]);
         }
     }
 
@@ -706,8 +853,58 @@ impl Session {
                     susp_rear: s.susp[1],
                     kick,
                     block: r.guard,
+                    weapon: match r.weapon.map(|w| w.kind) {
+                        None => 0.0,
+                        Some(WeaponKind::Club) => 1.0,
+                        Some(WeaponKind::Chain) => 2.0,
+                    },
+                    // The weapon is in whichever hand is swinging.
+                    weapon_hand: if r.swinging() && r.swing_kind == Strike::Punch {
+                        r.swing_side
+                    } else {
+                        1.0
+                    },
                     ground_y,
                     contact,
+                }
+            })
+            .collect()
+    }
+
+    /// Road traffic, slightly extrapolated to this frame.
+    pub fn car_draws(&self) -> Vec<CarDraw> {
+        self.car_draws_near(self.cam_pos)
+    }
+
+    /// Cars within draw distance of `eye`.
+    pub fn car_draws_near(&self, eye: Vec3) -> Vec<CarDraw> {
+        let back = (1.0 - self.alpha()) * DT;
+        self.race
+            .traffic
+            .cars
+            .iter()
+            .filter(|c| c.pos.distance_squared(eye) < 320.0 * 320.0)
+            .map(|c| {
+                let v = c.vel() * back;
+                let pos = c.pos - Vec3::new(v.x, 0.0, v.y);
+                let f = Vec3::new(c.heading.cos(), 0.0, c.heading.sin());
+                let r = Vec3::new(-c.heading.sin(), 0.0, c.heading.cos());
+                let basis = Mat4::from_cols(
+                    r.extend(0.0),
+                    Vec3::Y.extend(0.0),
+                    (-f).extend(0.0),
+                    pos.extend(1.0),
+                );
+                let (paint, _) = CAR_PAINTS[c.paint as usize % CAR_PAINTS.len()];
+                CarDraw {
+                    model: basis * Mat4::from_rotation_x(c.pitch) * Mat4::from_rotation_z(-c.roll),
+                    kind: c.kind.index(),
+                    paint,
+                    brake: if c.stopped > 0.0 || c.speed < c.cruise - 4.0 {
+                        1.0
+                    } else {
+                        0.0
+                    },
                 }
             })
             .collect()
@@ -735,6 +932,7 @@ impl Session {
     pub fn frame_input<'a>(
         &self,
         bikes: &'a [BikeDraw],
+        cars: &'a [CarDraw],
         particles: &'a [Particle],
     ) -> FrameInput<'a> {
         let b = &self.race.bikes[PLAYER];
@@ -744,6 +942,7 @@ impl Session {
             camera: self.camera(),
             time: self.time,
             bikes,
+            cars,
             particles,
             start_lights: self.start_lights(),
             boost: if b.boosting { 1.0 } else { 0.0 },
@@ -798,6 +997,11 @@ impl Session {
             drafting: b.drafting,
             guard: r.guard,
             strike_ready: r.attack_cooldown <= 0.0 && r.swing <= 0.0 && b.is_riding(),
+            weapon: r.weapon.map(|w| w.kind),
+            weapon_uses: r.weapon.map_or(0, |w| w.uses as u32),
+            knockoffs: r.knockoffs,
+            near_misses: r.near_misses,
+            hits_landed: r.hits_landed,
         }
     }
 
@@ -854,6 +1058,11 @@ pub struct Hud {
     pub guard: f32,
     /// A punch or kick can be thrown now.
     pub strike_ready: bool,
+    pub weapon: Option<WeaponKind>,
+    pub weapon_uses: u32,
+    pub knockoffs: u32,
+    pub near_misses: u32,
+    pub hits_landed: u32,
 }
 
 fn bike_matrix(s: &Snap) -> Mat4 {

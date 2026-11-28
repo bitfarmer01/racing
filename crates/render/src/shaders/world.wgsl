@@ -245,6 +245,17 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let lw = smoothstep(-0.03, 0.03, e) * (1.0 - smoothstep(0.27, 0.33, e));
         c = mix(c, vec3<f32>(0.75, 0.75, 0.72) * (0.85 + 0.15 * grain), lw);
         rough = mix(rough, 0.45, lw);
+        // Lane paint: a dashed centreline and dashed lane dividers, since
+        // traffic runs both ways. Widths are antialiased by screen footprint.
+        let aa = max(fwidth(u), 0.01);
+        let dash = step(fract(s / 9.0), 0.45);
+        let cl = (1.0 - smoothstep(0.07 - aa, 0.07 + aa, abs(u))) * dash;
+        let ld = (1.0 - smoothstep(0.06 - aa, 0.06 + aa, abs(abs(u) - 3.15)))
+            * step(fract(s / 12.0 + 0.3), 0.3);
+        let paint = clamp(cl + ld, 0.0, 1.0) * (0.8 + 0.2 * grain);
+        c = mix(c, vec3<f32>(0.72, 0.66, 0.42), cl * (0.8 + 0.2 * grain));
+        c = mix(c, vec3<f32>(0.72, 0.72, 0.7), ld * (0.8 + 0.2 * grain));
+        rough = mix(rough, 0.5, paint);
         // Start / finish checker band.
         if (s < 3.0) {
             let ch = (i32(floor((u + 64.0) / 0.75)) + i32(floor(s / 0.75))) % 2;

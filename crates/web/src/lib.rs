@@ -39,7 +39,7 @@ pub fn style_css(slug: &str) -> String {
 }
 
 /// Number of floats in [`Game::hud`].
-pub const HUD_LEN: usize = 23;
+pub const HUD_LEN: usize = 28;
 
 /// Packs the HUD snapshot into a flat array (layout mirrored in loader.js).
 pub fn pack_hud(h: &runtime::Hud, paused: bool) -> [f32; HUD_LEN] {
@@ -69,7 +69,22 @@ pub fn pack_hud(h: &runtime::Hud, paused: bool) -> [f32; HUD_LEN] {
         b(paused),
         h.guard,
         b(h.strike_ready),
+        weapon_code(h.weapon),
+        h.weapon_uses as f32,
+        h.knockoffs as f32,
+        h.near_misses as f32,
+        h.hits_landed as f32,
     ]
+}
+
+/// 0 bare-handed, 1 club, 2 chain.
+fn weapon_code(w: Option<game::race::WeaponKind>) -> f32 {
+    use game::race::WeaponKind;
+    match w {
+        None => 0.0,
+        Some(WeaponKind::Club) => 1.0,
+        Some(WeaponKind::Chain) => 2.0,
+    }
 }
 
 /// Flattens cues into (code, a, b) triples (codes mirrored in loader.js).
@@ -93,6 +108,11 @@ pub fn pack_cues(cues: &[runtime::Cue], out: &mut Vec<f32>) {
             Cue::WasParried => (13.0, 0.0, 0.0),
             Cue::KnockOff => (14.0, 0.0, 0.0),
             Cue::Launch(perfect) => (15.0, if perfect { 1.0 } else { 0.0 }, 0.0),
+            Cue::TrafficCrash => (16.0, 0.0, 0.0),
+            Cue::NearMiss(oncoming) => (17.0, if oncoming { 1.0 } else { 0.0 }, 0.0),
+            Cue::Armed(kind) => (18.0, weapon_code(Some(kind)), 0.0),
+            Cue::Disarmed => (19.0, 0.0, 0.0),
+            Cue::Hunted(i) => (20.0, i as f32, 0.0),
         };
         out.extend_from_slice(&[code, a, b]);
     }
@@ -103,6 +123,7 @@ mod browser {
     use super::*;
     use game::ai::Rival;
     use game::difficulty::Difficulty;
+    use game::race::Loadout;
     use game::tracks::{by_slug, catalog};
     use render::{Renderer, Settings};
     use runtime::{CamMode, Input, Session};
@@ -122,6 +143,7 @@ mod browser {
         slug: String,
         seed: u64,
         difficulty: Difficulty,
+        loadout: Loadout,
         cues: Vec<f32>,
         adapter_name: String,
     }
@@ -208,6 +230,7 @@ mod browser {
                 slug: def.slug.to_owned(),
                 seed: 1,
                 difficulty: Difficulty::Normal,
+                loadout: Loadout::default(),
                 cues: Vec::new(),
                 adapter_name: adapter.get_info().name,
             };
@@ -240,7 +263,8 @@ mod browser {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let cam = self.session.cam_mode;
-            self.session = Session::with_difficulty(def, self.seed >> 16, self.difficulty);
+            self.session =
+                Session::with_loadout(def, self.seed >> 16, self.difficulty, self.loadout);
             self.session.cam_mode = cam;
             if def.slug != self.slug {
                 self.slug = def.slug.to_owned();
@@ -262,9 +286,18 @@ mod browser {
         }
 
         /// Starts a race the player drives, on `slug`, at `difficulty`
-        /// (`easy`, `normal` or `hard`; anything else is normal).
-        pub fn start_race(&mut self, slug: &str, difficulty: &str) {
+        /// (`easy`, `normal` or `hard`; anything else is normal), on a bike
+        /// with garage upgrades `engine`, `handling` and `armour` (0..=3).
+        pub fn start_race(
+            &mut self,
+            slug: &str,
+            difficulty: &str,
+            engine: u32,
+            handling: u32,
+            armour: u32,
+        ) {
             self.difficulty = Difficulty::from_slug(difficulty);
+            self.loadout = Loadout::from_levels(engine, handling, armour);
             self.new_session(slug);
             self.session.autopilot = None;
             if self.session.cam_mode == CamMode::Far {
@@ -350,7 +383,8 @@ mod browser {
                 .create_view(&wgpu::TextureViewDescriptor::default());
             let bikes = self.session.bike_draws();
             let particles = self.session.particles();
-            let input = self.session.frame_input(&bikes, &particles);
+            let cars = self.session.car_draws();
+            let input = self.session.frame_input(&bikes, &cars, &particles);
             self.renderer.render(&view, &input);
             frame.present();
         }
@@ -389,6 +423,11 @@ mod browser {
                 .map(|(n, t, done)| format!("{n}|{t}|{}", u8::from(done)))
                 .collect::<Vec<_>>()
                 .join("\n")
+        }
+
+        /// A racer's name by bike index (cues carry indices).
+        pub fn racer_name(&self, i: u32) -> String {
+            runtime::racer_name(i as usize).to_owned()
         }
 
         /// Draw calls, triangles and visible props in the last frame.

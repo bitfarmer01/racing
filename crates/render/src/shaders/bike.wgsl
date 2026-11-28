@@ -28,7 +28,8 @@ struct Inst {
     // hang-off (-1 left .. 1 right), tuck 0..1, front and rear suspension
     // compression (m)
     @location(13) pose: vec4<f32>,
-    // kick (-1 left .. 1 right), block 0..1
+    // kick (-1 left .. 1 right), block 0..1, weapon (0 none, 1 club,
+    // 2 chain), weapon hand (-1 left .. 1 right)
     @location(14) act: vec4<f32>,
 };
 
@@ -127,7 +128,20 @@ fn pose(v: VIn, inst: Inst) -> Posed {
         let punch = inst.anim.w;
         let kick = inst.act.x;
         let block = inst.act.y;
-        if (part == 13u || part == 14u) {
+        // Weapons ride with the arm of the hand holding them, and vanish
+        // (collapse to the grip) unless that is the one being carried.
+        var limb = part;
+        if (part >= 15u) {
+            let right = part == 15u || part == 17u;
+            let kind = select(2.0, 1.0, part <= 16u);
+            let hand = select(L_HAND, R_HAND, right);
+            let held = abs(inst.act.z - kind) < 0.5 && (inst.act.w > 0.0) == right;
+            if (!held) {
+                p = hand;
+            }
+            limb = select(12u, 11u, right);
+        }
+        if (limb == 13u || limb == 14u) {
             let side = select(-1.0, 1.0, part == 13u);
             let hip = select(L_HIP, R_HIP, part == 13u);
             // Inside knee out when hanging off; a kick swings the whole leg
@@ -137,10 +151,10 @@ fn pose(v: VIn, inst: Inst) -> Posed {
             let r = rot_z(side * (knee + k * 1.25)) * rot_x(-k * 0.35);
             p = r * (p - hip) + hip;
             n = r * n;
-        } else if (part == 11u || part == 12u) {
-            let side = select(-1.0, 1.0, part == 11u);
-            let sh = select(L_SHOULDER, R_SHOULDER, part == 11u);
-            let hand = select(L_HAND, R_HAND, part == 11u);
+        } else if (limb == 11u || limb == 12u) {
+            let side = select(-1.0, 1.0, limb == 11u);
+            let sh = select(L_SHOULDER, R_SHOULDER, limb == 11u);
+            let hand = select(L_HAND, R_HAND, limb == 11u);
             // Tucked: elbows drop, pivoting about the grip.
             let rt = rot_x(tuck * 0.15);
             p = rt * (p - hand) + hand;

@@ -77,10 +77,25 @@ pub struct BikeDraw {
     pub kick: f32,
     /// 0..1 guard up.
     pub block: f32,
+    /// Weapon carried: 0 none, 1 club, 2 chain.
+    pub weapon: f32,
+    /// Hand holding it, -1 left .. 1 right.
+    pub weapon_hand: f32,
     /// Height of the ground under the bike (for its contact shadow).
     pub ground_y: f32,
     /// 0..1 contact-shadow strength: 1 on the road, fading as it leaves it.
     pub contact: f32,
+}
+
+/// One road car to draw.
+#[derive(Debug, Clone, Copy)]
+pub struct CarDraw {
+    pub model: Mat4,
+    /// Car model (0 hatch, 1 saloon, 2 van, 3 truck).
+    pub kind: usize,
+    pub paint: [f32; 3],
+    /// 0..1 brake lights.
+    pub brake: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +122,7 @@ pub struct FrameInput<'a> {
     pub camera: Camera,
     pub time: f32,
     pub bikes: &'a [BikeDraw],
+    pub cars: &'a [CarDraw],
     pub particles: &'a [Particle],
     /// 0..5 red lights lit, 6 = green.
     pub start_lights: f32,
@@ -203,6 +219,7 @@ struct LoadedWorld {
     water: Option<Chunk>,
     props: Vec<PropModel>,
     bike: Chunk,
+    cars: [Chunk; 4],
     theme: Theme,
     length: f32,
     half_width: f32,
@@ -1019,6 +1036,7 @@ impl Renderer {
             water: geo.water,
             props: geo.props,
             bike: geo.bike,
+            cars: geo.cars,
             theme: track.def.theme,
             length: track.length,
             half_width: track.half_width,
@@ -1206,9 +1224,32 @@ impl Renderer {
                     b.rider_spin,
                 ],
                 pose: [b.hang, b.tuck, b.susp_front, b.susp_rear],
-                act: [b.kick, b.block, 0.0, 0.0],
+                act: [b.kick, b.block, b.weapon, b.weapon_hand],
             })
             .collect();
+        // Cars ride in the same buffer after the bikes, grouped by model.
+        let mut bikes = bikes;
+        let mut car_runs = [(0u32, 0u32); 4];
+        for (k, run) in car_runs.iter_mut().enumerate() {
+            run.0 = bikes.len() as u32;
+            bikes.extend(
+                input
+                    .cars
+                    .iter()
+                    .filter(|c| c.kind == k)
+                    .map(|c| BikeInstance {
+                        m: c.model.to_cols_array_2d(),
+                        paint: v4(c.paint, 0.0),
+                        paint2: v4([0.0; 3], c.brake),
+                        anim: [0.0; 4],
+                        rider: [0.0; 4],
+                        pose: [0.0; 4],
+                        act: [0.0; 4],
+                    }),
+            );
+            run.1 = bikes.len() as u32 - run.0;
+        }
+        let n_bikes = input.bikes.len() as u32;
         self.bike_buf
             .write(&self.device, &self.queue, bytemuck::cast_slice(&bikes));
 
@@ -1365,12 +1406,15 @@ impl Renderer {
             if !bikes.is_empty() {
                 pass.set_pipeline(&self.bike_shadow_pipe);
                 pass.set_vertex_buffer(1, self.bike_buf.buf.slice(..));
-                pass.draw_indexed(
-                    w.bike.first..w.bike.first + w.bike.count,
-                    0,
-                    0..bikes.len() as u32,
-                );
+                pass.draw_indexed(w.bike.first..w.bike.first + w.bike.count, 0, 0..n_bikes);
                 stats.draws += 1;
+                for (c, &(first, n)) in w.cars.iter().zip(&car_runs) {
+                    if n > 0 {
+                        pass.draw_indexed(c.first..c.first + c.count, 0, first..first + n);
+                        stats.draws += 1;
+                        stats.shadow_triangles += (c.count / 3) as u64 * n as u64;
+                    }
+                }
             }
         }
 
@@ -1404,13 +1448,16 @@ impl Renderer {
             if !bikes.is_empty() {
                 pass.set_pipeline(&self.bike_pipe);
                 pass.set_vertex_buffer(1, self.bike_buf.buf.slice(..));
-                pass.draw_indexed(
-                    w.bike.first..w.bike.first + w.bike.count,
-                    0,
-                    0..bikes.len() as u32,
-                );
+                pass.draw_indexed(w.bike.first..w.bike.first + w.bike.count, 0, 0..n_bikes);
                 stats.draws += 1;
-                stats.triangles += (w.bike.count / 3) as u64 * bikes.len() as u64;
+                stats.triangles += (w.bike.count / 3) as u64 * n_bikes as u64;
+                for (c, &(first, n)) in w.cars.iter().zip(&car_runs) {
+                    if n > 0 {
+                        pass.draw_indexed(c.first..c.first + c.count, 0, first..first + n);
+                        stats.draws += 1;
+                        stats.triangles += (c.count / 3) as u64 * n as u64;
+                    }
+                }
             }
             pass.set_pipeline(&self.world_pipe);
             let draw_chunk =

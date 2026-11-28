@@ -63,6 +63,27 @@ Where it goes:
 This is CPU software rendering, where every vertex and pixel costs the same
 CPU time; on a real GPU this much geometry is small.
 
+## Round 3: traffic, weapons, hunters, season (2026-11)
+
+Same method at 1280×720, alternating two runs of `main` (e4c17e3) and this
+branch:
+
+| | Golden Coast | Alpine Lake | Dusk Canyon |
+|---|---|---|---|
+| main | 96 ms | 102 ms | 117 ms |
+| this branch | 98 ms (+2 %) | 105 ms (+3 %) | 101 ms (−13 %) |
+
+- Traffic adds 6 to 30 cars per track, drawn through the bike's instanced
+  pipeline: one extra draw per vehicle kind in view (hatch, saloon, van,
+  truck), about 40 k more triangles at the bench frame, culled past 320 m.
+- Clubs and chains are extra parts of the rider mesh, collapsed to nothing
+  in the vertex shader unless carried, so they cost no draw calls.
+- Lane paint is a few instructions in the road shader.
+- The simulation (traffic, hunting AI, contacts) went from about 0.05 ms to
+  0.07 ms per frame.
+- The Dusk Canyon drop is a different scene at the bench mark, not a
+  speed-up: the race plays out differently by 8 s.
+
 ## Before (main @ 53aa156)
 
 The previous build was a 2D sprite scaler (two draw calls), measured by its

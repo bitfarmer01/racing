@@ -15,3 +15,4 @@ pub mod scenery;
 pub mod theme;
 pub mod track;
 pub mod tracks;
+pub mod traffic;

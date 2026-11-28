@@ -59,6 +59,8 @@ pub struct WorldGeometry {
     pub water: Option<Chunk>,
     pub props: Vec<PropModel>,
     pub bike: Chunk,
+    /// Road traffic, one model per car kind.
+    pub cars: [Chunk; 4],
 }
 
 const TERRAIN_STEP: f32 = 5.0;
@@ -126,6 +128,13 @@ impl WorldGeometry {
         mesh.vertices.extend_from_slice(&bike.vertices);
         mesh.indices.extend(bike.indices.iter().map(|i| i + base));
         let bike = finish_chunk(&mesh, first);
+        let cars = models::cars().map(|car| {
+            let first = mesh.indices.len();
+            let base = mesh.vertices.len() as u32;
+            mesh.vertices.extend_from_slice(&car.vertices);
+            mesh.indices.extend(car.indices.iter().map(|i| i + base));
+            finish_chunk(&mesh, first)
+        });
         Self {
             mesh,
             terrain,
@@ -133,6 +142,7 @@ impl WorldGeometry {
             water,
             props,
             bike,
+            cars,
         }
     }
 }

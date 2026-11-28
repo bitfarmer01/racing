@@ -3,10 +3,11 @@
 use glam::Vec2;
 use sim::rng::XorShift64;
 
-use crate::ai::Rival;
+use crate::ai::{Rival, GRUDGE_SECS};
 use crate::bike::{wrap_angle, Bike, Controls, Tuning};
 use crate::difficulty::Difficulty;
 use crate::track::{Track, TrackDef};
+use crate::traffic::{circle_vs_car, Traffic, STOP_SECS};
 
 pub const DT: f32 = 1.0 / 120.0;
 pub const COUNTDOWN_SECS: f32 = 3.0;
@@ -41,6 +42,109 @@ pub const LAUNCH_SWEET: (f32, f32) = (0.55, 0.82);
 pub const LAUNCH_SPIN: f32 = 0.92;
 /// Boost for gaining a place.
 const OVERTAKE_BOOST: f32 = 0.05;
+/// Running into a car faster than this puts the rider down.
+const TRAFFIC_CRASH_SPEED: f32 = 9.0;
+/// A rider shoved by a strike goes down against a car at this.
+const SHOVED_CRASH_SPEED: f32 = 3.0;
+/// Near miss: passing a car this close (edge to edge) at this relative speed.
+const NEAR_MISS_GAP: f32 = 1.5;
+const NEAR_MISS_SPEED: f32 = 16.0;
+const NEAR_MISS_BOOST: f32 = 0.08;
+/// Strikes a weapon survives.
+pub const WEAPON_USES: u8 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeaponKind {
+    /// Short and heavy.
+    Club,
+    /// Long reach, a little lighter.
+    Chain,
+}
+
+impl WeaponKind {
+    /// Lateral reach of a swing, metres from the bike's centreline.
+    fn reach(self) -> std::ops::Range<f32> {
+        match self {
+            WeaponKind::Club => 0.3..3.3,
+            WeaponKind::Chain => 0.3..3.9,
+        }
+    }
+
+    fn damage(self) -> f32 {
+        match self {
+            WeaponKind::Club => 56.0,
+            WeaponKind::Chain => 46.0,
+        }
+    }
+
+    fn shove(self) -> f32 {
+        match self {
+            WeaponKind::Club => 4.4,
+            WeaponKind::Chain => 3.6,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            WeaponKind::Club => "Club",
+            WeaponKind::Chain => "Chain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Weapon {
+    pub kind: WeaponKind,
+    /// Strikes left before it breaks.
+    pub uses: u8,
+}
+
+impl Weapon {
+    pub fn new(kind: WeaponKind) -> Self {
+        Self {
+            kind,
+            uses: WEAPON_USES,
+        }
+    }
+}
+
+/// What the player brings to a race from the garage.
+#[derive(Debug, Clone, Copy)]
+pub struct Loadout {
+    pub tuning: Tuning,
+    /// Scales balance damage the player takes (1 = stock leathers).
+    pub armour: f32,
+}
+
+/// Highest level of each garage upgrade.
+pub const MAX_UPGRADE: u32 = 3;
+
+impl Loadout {
+    /// Garage upgrades, each 0 (stock) to [`MAX_UPGRADE`]: engine adds pull
+    /// and top speed, handling adds grip, armour soaks hits.
+    pub fn from_levels(engine: u32, handling: u32, armour: u32) -> Self {
+        let e = engine.min(MAX_UPGRADE) as f32;
+        let h = handling.min(MAX_UPGRADE) as f32;
+        let a = armour.min(MAX_UPGRADE) as f32;
+        Self {
+            tuning: Tuning {
+                power: 1.0 + 0.045 * e,
+                grip: 1.0 + 0.04 * h,
+                top_speed: 1.0 + 0.025 * e,
+            },
+            armour: 1.0 - 0.13 * a,
+        }
+    }
+}
+
+impl Default for Loadout {
+    fn default() -> Self {
+        Self {
+            tuning: Tuning::default(),
+            armour: 1.0,
+        }
+    }
+}
 
 pub const RIVAL_NAMES: [&str; RIVAL_COUNT] =
     ["Vex", "Kato", "Marlow", "Juno", "Brask", "Silva", "Reyes"];
@@ -82,6 +186,25 @@ pub enum EventKind {
     KnockOff {
         victim: usize,
     },
+    /// This bike ran into a car and went down.
+    TrafficCrash {
+        speed: f32,
+    },
+    /// This bike scraped a car and stayed up.
+    CarScrape {
+        speed: f32,
+    },
+    /// This bike threaded past a car close and fast.
+    NearMiss {
+        oncoming: bool,
+    },
+    /// This bike's rider picked up a weapon, taking it off `from`.
+    Armed {
+        kind: WeaponKind,
+        from: usize,
+    },
+    /// This bike's weapon broke on its last strike.
+    WeaponBroke,
     /// This bike left the line: perfectly, or in a cloud of wheelspin.
     Launch {
         perfect: bool,
@@ -160,6 +283,10 @@ pub struct Racer {
     pub knockdowns: u32,
     pub knockoffs: u32,
     pub parries: u32,
+    pub near_misses: u32,
+    pub weapon: Option<Weapon>,
+    /// Who struck this rider last, and is still to blame for a fall.
+    pub last_hit_by: Option<usize>,
 }
 
 impl Racer {
@@ -186,6 +313,9 @@ impl Racer {
             knockdowns: 0,
             knockoffs: 0,
             parries: 0,
+            near_misses: 0,
+            weapon: None,
+            last_hit_by: None,
         }
     }
 
@@ -206,6 +336,15 @@ impl Racer {
     pub fn guarding(&self) -> bool {
         self.guard > 0.5
     }
+
+    /// Reach, damage and shove of the next swing.
+    fn strike_stats(&self, kind: Strike) -> (std::ops::Range<f32>, f32, f32) {
+        match (kind, self.weapon) {
+            (Strike::Kick, _) => (0.3..3.1, KICK_DAMAGE, 5.0),
+            (Strike::Punch, Some(w)) => (w.kind.reach(), w.kind.damage(), w.kind.shove()),
+            (Strike::Punch, None) => (0.3..2.7, HIT_DAMAGE, 3.2),
+        }
+    }
 }
 
 pub struct Race {
@@ -213,6 +352,7 @@ pub struct Race {
     pub bikes: Vec<Bike>,
     pub racers: Vec<Racer>,
     pub rivals: Vec<Option<Rival>>,
+    pub traffic: Traffic,
     pub phase: Phase,
     /// Race clock, seconds since the green light.
     pub clock: f32,
@@ -223,6 +363,8 @@ pub struct Race {
     pub difficulty: Difficulty,
     /// Chance a rival raises its guard against a strike it sees coming.
     pub guard_chance: f32,
+    /// Scales balance damage the player takes, from the garage.
+    pub player_armour: f32,
     /// Engine power each bike started with, before catch-up.
     base_power: Vec<f32>,
     rng: XorShift64,
@@ -244,6 +386,10 @@ impl Race {
     }
 
     pub fn with_track_and_difficulty(track: Track, seed: u64, difficulty: Difficulty) -> Self {
+        Self::with_loadout(track, seed, difficulty, Loadout::default())
+    }
+
+    pub fn with_loadout(track: Track, seed: u64, difficulty: Difficulty, loadout: Loadout) -> Self {
         let mut rng = XorShift64::new(seed);
         let n = RIVAL_COUNT + 1;
         let mut bikes = Vec::with_capacity(n);
@@ -256,7 +402,7 @@ impl Race {
             let lateral = if slot % 2 == 0 { -2.6 } else { 2.6 };
             let s = track.length - back;
             let (tuning, rival) = if slot == PLAYER {
-                (Tuning::default(), None)
+                (loadout.tuning, None)
             } else {
                 // Front of the grid is quicker; every rival differs a little.
                 let quality = 1.0 - row / n as f32;
@@ -285,6 +431,26 @@ impl Race {
             racers.push(Racer::new(name, -back));
             rivals.push(rival);
         }
+        // The angriest riders come looking for you; some bring weapons.
+        let mut by_anger: Vec<usize> = (1..n).collect();
+        by_anger.sort_by(|&a, &b| {
+            let ag = |i: usize| rivals[i].as_ref().map_or(0.0, |r: &Rival| r.aggression);
+            ag(b).total_cmp(&ag(a))
+        });
+        for &i in by_anger.iter().take(difficulty.brawlers()) {
+            if let Some(r) = rivals[i].as_mut() {
+                r.brawler = true;
+            }
+        }
+        for (k, &i) in by_anger.iter().take(difficulty.armed_rivals()).enumerate() {
+            let kind = if k % 2 == 0 {
+                WeaponKind::Club
+            } else {
+                WeaponKind::Chain
+            };
+            racers[i].weapon = Some(Weapon::new(kind));
+        }
+        let traffic = Traffic::spawn(&track, difficulty.traffic_density(), &mut rng);
         let laps = track.def.laps;
         let base_power = bikes.iter().map(|b| b.tuning.power).collect();
         let mut race = Self {
@@ -292,6 +458,7 @@ impl Race {
             bikes,
             racers,
             rivals,
+            traffic,
             phase: Phase::Countdown { t: 0.0 },
             clock: 0.0,
             laps,
@@ -299,6 +466,7 @@ impl Race {
             events: Vec::with_capacity(32),
             difficulty,
             guard_chance: difficulty.rival_guard(),
+            player_armour: loadout.armour,
             base_power,
             rng,
             last_player_place: n,
@@ -354,8 +522,11 @@ impl Race {
             Phase::Finished { t } => self.phase = Phase::Finished { t: t + DT },
         }
         self.clock += DT;
+        self.traffic.step(&self.track, DT, &mut self.rng);
         self.step_bikes(player_input);
         self.contacts();
+        self.traffic_contacts();
+        self.near_misses();
         self.combat();
         self.progress();
         self.rank();
@@ -419,8 +590,17 @@ impl Race {
                 let roll = self.rng.next_f32();
                 let others: Vec<&Bike> =
                     (0..n).filter(|&j| j != i).map(|j| &self.bikes[j]).collect();
+                let prey = (i != PLAYER && !player_finished).then(|| &self.bikes[PLAYER]);
                 let rival = self.rivals[i].get_or_insert_with(|| Rival::new(0.0, 0.88, 0.0));
-                let mut c = rival.drive(&self.bikes[i], &others, &self.track, DT, roll);
+                let mut c = rival.drive(
+                    &self.bikes[i],
+                    &others,
+                    &self.traffic.cars,
+                    prey,
+                    &self.track,
+                    DT,
+                    roll,
+                );
                 // Catch-up, set by the difficulty: never decisive.
                 let gap = self.racers[PLAYER].progress - self.racers[i].progress;
                 if i != PLAYER {
@@ -497,6 +677,7 @@ impl Race {
             }
             if fx.crashed {
                 self.racers[i].knockdowns += 1;
+                self.racers[i].weapon = None;
                 self.push(i, EventKind::Crash);
             }
             if fx.landed > 0.0 {
@@ -577,10 +758,7 @@ impl Race {
                 continue;
             }
             let side = r.swing_side;
-            let reach = match kind {
-                Strike::Punch => 0.3..2.7,
-                Strike::Kick => 0.3..3.1,
-            };
+            let reach = r.strike_stats(kind).0;
             let me = self.bikes[i].clone();
             for j in 0..n {
                 if j == i || !self.bikes[j].is_solid() {
@@ -611,13 +789,33 @@ impl Race {
             self.push(j, EventKind::Parried { attacker: i });
             let back = -self.bikes[i].right() * side * 1.6;
             self.bikes[i].vel += back;
+            // Turning a weapon back takes it off them.
+            if kind == Strike::Punch && self.racers[j].weapon.is_none() {
+                if let Some(w) = self.racers[i].weapon.take() {
+                    self.racers[j].weapon = Some(w);
+                    self.push(
+                        j,
+                        EventKind::Armed {
+                            kind: w.kind,
+                            from: i,
+                        },
+                    );
+                }
+            }
             self.damage(i, PARRY_PUNISH, j);
             return;
         }
-        let (damage, shove) = match kind {
-            Strike::Punch => (HIT_DAMAGE, 3.2),
-            Strike::Kick => (KICK_DAMAGE, 5.0),
-        };
+        let (_, damage, shove) = self.racers[i].strike_stats(kind);
+        // Each clean or blocked weapon blow wears it down.
+        if kind == Strike::Punch {
+            if let Some(w) = self.racers[i].weapon.as_mut() {
+                w.uses = w.uses.saturating_sub(1);
+                if w.uses == 0 {
+                    self.racers[i].weapon = None;
+                    self.push(i, EventKind::WeaponBroke);
+                }
+            }
+        }
         let soak = if guard { GUARD_SOAK } else { 1.0 };
         let right = self.bikes[i].right();
         let target = &mut self.bikes[j];
@@ -627,6 +825,12 @@ impl Race {
             self.push(j, EventKind::Blocked { attacker: i });
         } else {
             self.racers[i].hits_landed += 1;
+            // Hit a rival and it remembers.
+            if i == PLAYER {
+                if let Some(r) = self.rivals[j].as_mut() {
+                    r.grudge = GRUDGE_SECS;
+                }
+            }
             self.bikes[i].boost = (self.bikes[i].boost + 0.12).min(1.0);
             self.push(
                 j,
@@ -643,22 +847,139 @@ impl Race {
     /// knock-off: a full boost meter.
     fn damage(&mut self, j: usize, amount: f32, by: usize) {
         let scale = if j == PLAYER {
-            self.difficulty.damage_to_player()
+            self.difficulty.damage_to_player() * self.player_armour
         } else {
             1.0
         };
         let tr = &mut self.racers[j];
         tr.balance -= amount * scale;
         tr.since_hit = 0.0;
+        tr.last_hit_by = Some(by);
         if tr.balance <= 0.0 {
             tr.balance = 100.0;
-            tr.knockdowns += 1;
             tr.guard = 0.0;
             self.bikes[j].crash();
-            self.push(j, EventKind::Crash);
-            self.racers[by].knockoffs += 1;
-            self.bikes[by].boost = 1.0;
-            self.push(by, EventKind::KnockOff { victim: j });
+            self.knocked_off(j, by);
+        }
+    }
+
+    /// `j` is on the ground and `by` put it there: the knock-off scores,
+    /// fills `by`'s boost, and a weapon changes hands.
+    fn knocked_off(&mut self, j: usize, by: usize) {
+        self.racers[j].knockdowns += 1;
+        self.push(j, EventKind::Crash);
+        self.racers[by].knockoffs += 1;
+        self.bikes[by].boost = 1.0;
+        self.push(by, EventKind::KnockOff { victim: j });
+        if let Some(w) = self.racers[j].weapon.take() {
+            if self.racers[by].weapon.is_none() {
+                self.racers[by].weapon = Some(Weapon::new(w.kind));
+                self.push(
+                    by,
+                    EventKind::Armed {
+                        kind: w.kind,
+                        from: j,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Bikes against road traffic: a scrape bounces off, a real hit puts the
+    /// rider over the bonnet and stops the car. A rider shoved into a car by
+    /// a strike goes down far more easily, and the striker gets the credit.
+    fn traffic_contacts(&mut self) {
+        for i in 0..self.bikes.len() {
+            if !self.bikes[i].is_solid() {
+                continue;
+            }
+            for ci in 0..self.traffic.cars.len() {
+                let car = &self.traffic.cars[ci];
+                let b = &self.bikes[i];
+                if b.pos2().distance_squared(car.pos2()) > 36.0 || (b.pos.y - car.pos.y).abs() > 2.0
+                {
+                    continue;
+                }
+                let mut deepest: Option<(Vec2, f32)> = None;
+                for sa in [-1.0, 1.0] {
+                    let p = b.pos2() + b.fwd() * CONTACT_OFFSET * sa;
+                    if let Some((nrm, pen)) = circle_vs_car(car, p, CONTACT_RADIUS) {
+                        if deepest.is_none_or(|(_, d)| pen > d) {
+                            deepest = Some((nrm, pen));
+                        }
+                    }
+                }
+                let Some((nrm, pen)) = deepest else { continue };
+                let car_vel = car.vel();
+                let closing = -(b.vel - car_vel).dot(nrm);
+                let r = &self.racers[i];
+                let shoved_by = r.last_hit_by.filter(|_| r.since_hit < 0.8);
+                let b = &mut self.bikes[i];
+                b.pos.x += nrm.x * pen;
+                b.pos.z += nrm.y * pen;
+                let goes_down = closing > TRAFFIC_CRASH_SPEED
+                    || (shoved_by.is_some() && closing > SHOVED_CRASH_SPEED);
+                if goes_down {
+                    let v = b.vel;
+                    b.crash();
+                    // Over the bonnet: the rider keeps going, the bike stops.
+                    let up = 4.0 + closing * 0.09;
+                    b.rider_vel = glam::Vec3::new(v.x * 0.7, up, v.y * 0.7);
+                    b.vel = car_vel * 0.6 + nrm * 2.0;
+                    let car = &mut self.traffic.cars[ci];
+                    car.stopped = STOP_SECS;
+                    car.speed *= 0.3;
+                    self.racers[i].weapon = None;
+                    self.push(i, EventKind::TrafficCrash { speed: closing });
+                    match shoved_by {
+                        Some(by) if by != i => self.knocked_off(i, by),
+                        _ => {
+                            self.racers[i].knockdowns += 1;
+                            self.push(i, EventKind::Crash);
+                        }
+                    }
+                    break;
+                } else if closing > 0.0 {
+                    b.vel += nrm * closing * 1.3;
+                    b.yaw_rate += nrm.dot(b.right()) * -0.4;
+                    if closing > 1.5 {
+                        self.push(i, EventKind::CarScrape { speed: closing });
+                    }
+                }
+            }
+        }
+    }
+
+    /// The player threading past a car close and fast tops up the boost.
+    fn near_misses(&mut self) {
+        let p = &self.bikes[PLAYER];
+        let riding = p.is_riding();
+        let (ps, plat, pvel) = (p.track_pos.s, p.track_pos.lateral, p.vel);
+        let mut scored = Vec::new();
+        for (ci, car) in self.traffic.cars.iter_mut().enumerate() {
+            let d = self.track.delta_s(car.s, ps);
+            if d.abs() > 30.0 {
+                car.player_side = 0.0;
+                continue;
+            }
+            let side = if d >= 0.0 { 1.0 } else { -1.0 };
+            let passed = car.player_side != 0.0 && side != car.player_side;
+            car.player_side = side;
+            if !passed || !riding || car.near_miss_cd > 0.0 {
+                continue;
+            }
+            let gap = (plat - car.lateral).abs() - car.half_extents().x;
+            let rel = (pvel - car.vel()).length();
+            if (0.0..NEAR_MISS_GAP).contains(&gap) && rel > NEAR_MISS_SPEED {
+                car.near_miss_cd = 3.0;
+                scored.push((ci, car.dir < 0.0));
+            }
+        }
+        for (_, oncoming) in scored {
+            self.racers[PLAYER].near_misses += 1;
+            let b = &mut self.bikes[PLAYER];
+            b.boost = (b.boost + NEAR_MISS_BOOST).min(1.0);
+            self.push(PLAYER, EventKind::NearMiss { oncoming });
         }
     }
 
@@ -856,6 +1177,19 @@ mod tests {
     }
 
     #[test]
+    fn garage_upgrades_make_the_bike_quicker_and_tougher() {
+        let stock = Loadout::from_levels(0, 0, 0);
+        let maxed = Loadout::from_levels(MAX_UPGRADE, MAX_UPGRADE, 9);
+        assert_eq!(stock.tuning.power, 1.0);
+        assert_eq!(stock.armour, 1.0);
+        assert!(maxed.tuning.power > 1.1 && maxed.tuning.top_speed > 1.05);
+        assert!(maxed.tuning.grip > 1.1);
+        assert!(maxed.armour > 0.5 && maxed.armour < 0.7, "{}", maxed.armour);
+        let race = Race::with_loadout(Track::build(catalog()[0]), 1, Difficulty::Normal, maxed);
+        assert_eq!(race.player_armour, maxed.armour);
+    }
+
+    #[test]
     fn countdown_holds_the_grid_then_goes() {
         let mut race = Race::new(catalog()[0], 1);
         let start = race.player().pos;
@@ -903,7 +1237,8 @@ mod tests {
                 "{}: lap {lap:.1}s = {avg_kmh:.0} km/h",
                 def.name
             );
-            assert!(crashes <= 6, "{}: {crashes} rival crashes", def.name);
+            // Traffic and rival-on-rival fights put a few down; not a pile-up.
+            assert!(crashes <= 9, "{}: {crashes} rival crashes", def.name);
             for (i, b) in race.bikes.iter().enumerate().skip(1) {
                 assert!(
                     b.track_pos.lateral.abs() < race.track.half_width + 6.0,

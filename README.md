@@ -55,8 +55,27 @@ Open http://localhost:8000/web/. The built bundles in `web/pkg-webgpu` and
   nerve, how often they attack, block and parry, how hard their hits land on
   you, and how much the pack waits for you (Easy) or never does (Hard).
 - **Rivals** race the same physics with their own lines, skill and aggression.
+  The angriest of them hunt you: they drop back or close up to ride alongside
+  and swing at you. Hit one cleanly and they hold a grudge for a while.
+- **Traffic:** cars, vans and trucks use the road both ways, two lanes each
+  direction. Touch one at speed and you are thrown over it; a rival shoving
+  you into one counts as their knock-off. Skim past within a metre and a half
+  for a near miss and a sliver of boost (more for oncoming cars). Rivals
+  dodge traffic too, but not always.
+- **Weapons:** some rivals carry a club or a chain: longer reach, harder
+  hits, a few uses before it breaks. Knock an armed rider off, or parry their
+  swing while bare-handed, and the weapon is yours. Crash and you drop it.
+- **Hits land:** a landed blow freezes the action for a few hundredths of a
+  second, harder for knock-offs and wrecks, so contact reads.
+- **Season:** each finish pays prize money for your place, your knock-offs
+  and your near misses (Hard pays most). Spend it in the garage on the menu:
+  engine (pull and top speed), handling (grip) and armour (hits cost less
+  balance), three levels each. Progress is kept in the browser.
 
 ![Kick and guard](docs/screenshots/combat-poses.jpg)
+
+![Traffic both ways](docs/screenshots/traffic.jpg)
+![A rider with a club](docs/screenshots/club.jpg)
 
 ## Look
 

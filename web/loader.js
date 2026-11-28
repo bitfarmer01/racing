@@ -4,9 +4,12 @@
 
 import { RaceAudio } from './audio.js';
 import {
-  HUD, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
-  ResolutionGovernor, DIFFICULTIES, pickDifficulty,
+  HUD, CUE, REDLINE_RPM, MAX_RPM, formatTime, ordinal, decodeCues, parseTracks, parseStandings, fitMap,
+  ResolutionGovernor, DIFFICULTIES, pickDifficulty, WEAPONS,
 } from './hud.js';
+import {
+  UPGRADES, MAX_LEVEL, loadSeason, saveSeason, bankRace, payout, nextCost, buy, money,
+} from './season.js';
 import { applyStyle, canvasPalette, direct, prefersReducedMotion } from './design.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,7 +24,7 @@ function replaceCanvas() {
 const ui = {
   boot: $('boot'), bootStatus: $('boot-status'), menu: $('menu'), tracks: $('tracks'), start: $('start'),
   hud: $('hud'), pos: $('h-pos'), suf: $('h-suf'), of: $('h-of'), lap: $('h-lap'), time: $('h-time'), best: $('h-best'),
-  bal: $('h-bal'), guard: $('h-guard'), strike: $('h-strike'), levels: $('levels'), speed: $('h-speed'), gear: $('h-gear'), boost: $('h-boost'), boostLbl: $('h-boostlbl'), draft: $('draft'),
+  bal: $('h-bal'), guard: $('h-guard'), strike: $('h-strike'), weapon: $('h-weapon'), cash: $('cash'), ups: $('ups'), rPay: $('r-pay'), levels: $('levels'), speed: $('h-speed'), gear: $('h-gear'), boost: $('h-boost'), boostLbl: $('h-boostlbl'), draft: $('draft'),
   count: $('count'), banner: $('banner'), toast: $('toast'), hint: $('hint'), flash: $('flash'),
   tach: $('tach'), minimap: $('minimap'),
   pause: $('pause'), pauseSub: $('pause-sub'), resume: $('resume'), restart: $('restart'), quit: $('quit'),
@@ -161,6 +164,7 @@ let wasm = null;
 let tracks = [];
 let selected = 0;
 let difficulty = pickDifficulty(localStorage.getItem('difficulty'));
+let season = loadSeason(localStorage.getItem('season'));
 let mode = 'menu'; // menu | race | paused | results
 let outline = null;
 let mapper = null;
@@ -215,6 +219,44 @@ function renderLevels() {
   }
 }
 
+function storeSeason() {
+  try {
+    localStorage.setItem('season', saveSeason(season));
+  } catch {
+    // Private mode or full storage: the season lasts until the tab closes.
+  }
+}
+
+function renderGarage() {
+  setText(ui.cash, money(season.cash));
+  ui.ups.innerHTML = '';
+  for (const u of UPGRADES) {
+    const lvl = season[u.key];
+    const cost = nextCost(season, u.key);
+    const b = document.createElement('button');
+    b.className = 'up' + (cost != null && season.cash >= cost ? ' can' : '');
+    b.disabled = cost == null || season.cash < cost;
+    b.title = u.blurb;
+    b.innerHTML = '<b></b><div class="pips"></div><small></small>';
+    b.querySelector('b').textContent = u.name;
+    const pips = b.querySelector('.pips');
+    for (let i = 0; i < MAX_LEVEL; i++) {
+      const pip = document.createElement('i');
+      if (i < lvl) pip.className = 'on';
+      pips.appendChild(pip);
+    }
+    b.querySelector('small').textContent = cost == null ? 'Maxed' : `Upgrade ${money(cost)}`;
+    b.addEventListener('click', () => {
+      const next = buy(season, u.key);
+      if (!next) return;
+      season = next;
+      storeSeason();
+      renderGarage();
+    });
+    ui.ups.appendChild(b);
+  }
+}
+
 function selectTrack(i) {
   selected = (i + tracks.length) % tracks.length;
   localStorage.setItem('track', tracks[selected].slug);
@@ -240,6 +282,7 @@ function enterMenu() {
   game.set_paused(false);
   game.show(tracks[selected].slug);
   loadMap();
+  renderGarage();
 }
 
 function startRace() {
@@ -253,7 +296,8 @@ function startRace() {
   ui.hint.style.opacity = '1';
   setTimeout(() => (ui.hint.style.opacity = '0'), 9000);
   ui.toast.innerHTML = '';
-  game.start_race(tracks[selected].slug, difficulty);
+  banked = false;
+  game.start_race(tracks[selected].slug, difficulty, season.engine, season.handling, season.armour);
   loadMap();
   canvasEl.focus();
 }
@@ -382,6 +426,10 @@ function updateHud(h) {
   ui.bal.classList.toggle('low', bal < 0.35);
   ui.guard.classList.toggle('on', h[HUD.GUARD] > 0.5);
   ui.strike.classList.toggle('on', h[HUD.STRIKE_READY] > 0);
+  const w = WEAPONS[h[HUD.WEAPON]] || '';
+  show(ui.weapon, w !== '');
+  ui.weapon.classList.toggle('arm', w !== '');
+  setText(ui.weapon, w ? `${w.toUpperCase()} ×${h[HUD.WEAPON_USES]}` : '');
   drawTach(h[HUD.RPM], h[HUD.BOOSTING] > 0);
 
   const cd = h[HUD.COUNTDOWN];
@@ -415,6 +463,7 @@ function showResults() {
   ui.rTitle.textContent = me === 0 ? 'Victory!' : `${me + 1}${ordinal(me + 1)} place`;
   const h = lastHud;
   ui.rSub.textContent = `${tracks[selected].name} · best lap ${formatTime(h[HUD.BEST_LAP])}`;
+  showPay(me + 1, h);
   ui.rTable.innerHTML = '';
   rows.forEach((r, i) => {
     const tr = document.createElement('tr');
@@ -427,6 +476,29 @@ function showResults() {
     }
     ui.rTable.appendChild(tr);
   });
+}
+
+// Pays out the race once and lists what it paid for.
+let banked = false;
+function showPay(place, h) {
+  const result = { place, knockoffs: h[HUD.KNOCKOFFS], nearMisses: h[HUD.NEAR_MISSES], difficulty };
+  if (!banked) {
+    banked = true;
+    season = bankRace(season, result);
+    storeSeason();
+  }
+  const p = payout(result);
+  ui.rPay.innerHTML = '';
+  const line = (label, v, cls = '') => {
+    const d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.innerHTML = '<span></span><b></b>';
+    d.querySelector('span').textContent = label;
+    d.querySelector('b').textContent = v;
+    ui.rPay.appendChild(d);
+  };
+  for (const [label, v] of p.lines) line(label, money(v));
+  line(`Prize money · cash ${money(season.cash)}`, `+${money(p.total)}`, 'tot');
 }
 
 // ---------------------------------------------------------------- audio ----
@@ -451,6 +523,7 @@ function audioFrame(h, extra = {}) {
 // What each cue does on the page lives in design.js (DIRECTION).
 function handleCues(cues, h) {
   for (const c of cues) {
+    if (c.code === CUE.HUNTED) c.name = game.racer_name(c.a);
     const d = direct(c, h);
     if (d.flash && !reducedMotion) flash(d.flash);
     if (d.sound && audio.ctx) audio.blip(...d.sound);
@@ -605,6 +678,7 @@ window.addEventListener('pointerdown', () => audio.unlock(), { once: false });
     });
     renderTrackList();
     renderLevels();
+    renderGarage();
     if (localStorage.getItem('muted')) {
       audio.setMuted(true);
       ui.mute.textContent = '🔇';
