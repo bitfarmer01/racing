@@ -26,6 +26,11 @@ pub mod part {
     pub const LEFT_ARM: u8 = 12;
     pub const RIGHT_LEG: u8 = 13;
     pub const LEFT_LEG: u8 = 14;
+    /// Weapons, held in one hand; hidden unless the rider carries that one.
+    pub const RIGHT_CLUB: u8 = 15;
+    pub const LEFT_CLUB: u8 = 16;
+    pub const RIGHT_CHAIN: u8 = 17;
+    pub const LEFT_CHAIN: u8 = 18;
 }
 
 /// Bike vertex flags (vertex `mat.a`).
@@ -551,6 +556,276 @@ fn rider(b: &mut MeshBuilder) {
             &glove,
         );
     }
+    weapons(b);
+}
+
+/// A club and a chain in each hand, gripped at the hand and held up and
+/// back over the shoulder; the shader shows the one the rider carries.
+fn weapons(b: &mut MeshBuilder) {
+    for x in [1.0f32, -1.0] {
+        let hand = Vec3::new(0.31 * x, 0.97, -0.43);
+        let up = Vec3::new(0.12 * x, 0.62, 0.34).normalize();
+        let (club_part, chain_part) = if x > 0.0 {
+            (part::RIGHT_CLUB, part::RIGHT_CHAIN)
+        } else {
+            (part::LEFT_CLUB, part::LEFT_CHAIN)
+        };
+        // Club: a tapered wooden baton with a taped grip.
+        let wood = bike_mat([0.36, 0.2, 0.09], 0.7, 0.0, club_part, 0.0);
+        let tape = bike_mat([0.05, 0.05, 0.05], 0.8, 0.0, club_part, 0.0);
+        b.limb(hand - up * 0.08, hand + up * 0.1, 0.022, 0.022, &tape);
+        b.limb(hand + up * 0.1, hand + up * 0.62, 0.026, 0.042, &wood);
+        b.sphere(hand + up * 0.62, Vec3::splat(0.042), 3, 6, &wood);
+        // Chain: steel links hanging off a grip, swinging out behind.
+        let steel = bike_mat([0.62, 0.63, 0.66], 0.25, 1.0, chain_part, 0.0);
+        let grip = bike_mat([0.04, 0.04, 0.04], 0.8, 0.0, chain_part, 0.0);
+        b.limb(hand - up * 0.06, hand + up * 0.08, 0.02, 0.02, &grip);
+        let hang = Vec3::new(0.18 * x, 0.35, 0.5).normalize();
+        let mut p = hand + up * 0.08;
+        for k in 0..9 {
+            let dir = (up * (1.0 - k as f32 / 9.0) + hang * (k as f32 / 9.0)).normalize();
+            let q = p + dir * 0.075;
+            b.limb(p, q, 0.014, 0.014, &steel);
+            b.sphere(q, Vec3::splat(0.019), 2, 5, &steel);
+            p = q;
+        }
+    }
+}
+
+/// Road car models, one per traffic kind (see `game::traffic::CarKind`),
+/// in bike space (+x right, -z forward), sized to the game's boxes.
+pub fn cars() -> [MeshBuilder; 4] {
+    [
+        car_body(0.85, 1.95, 0.0),
+        car_body(0.9, 2.35, 1.0),
+        van(),
+        truck(),
+    ]
+}
+
+fn car_mats() -> (Mat, Mat, Mat, Mat, Mat, Mat, Mat) {
+    let paint = bike_mat([0.8, 0.8, 0.8], 0.22, 0.35, part::BODY, flag::PAINT);
+    let glass = bike_mat([0.05, 0.06, 0.08], 0.05, 0.0, part::BODY, 0.0);
+    let trim = bike_mat([0.04, 0.04, 0.045], 0.6, 0.1, part::BODY, 0.0);
+    let tyre = bike_mat([0.025, 0.025, 0.025], 0.85, 0.0, part::BODY, 0.0);
+    let hub = bike_mat([0.6, 0.6, 0.63], 0.3, 1.0, part::BODY, 0.0);
+    let head = bike_mat([1.0, 0.95, 0.85], 0.2, 0.0, part::BODY, flag::HEADLIGHT);
+    let tail = bike_mat([1.0, 0.05, 0.03], 0.2, 0.0, part::BODY, flag::TAILLIGHT);
+    (paint, glass, trim, tyre, hub, head, tail)
+}
+
+fn car_wheels(b: &mut MeshBuilder, hw: f32, zs: &[f32], r: f32, tyre: &Mat, hub: &Mat) {
+    for &z in zs {
+        for x in [-1.0f32, 1.0] {
+            let c = Vec3::new(x * (hw - 0.1), r, z);
+            disc_x(b, c, 0.11, r, 12, tyre);
+            disc_x(b, c + Vec3::X * x * 0.01, 0.105, r * 0.6, 8, hub);
+        }
+    }
+}
+
+/// A flat panel whose normal faces `out`, whatever order the corners came in.
+fn quad_out(b: &mut MeshBuilder, out: Vec3, mut p: [Vec3; 4], m: &Mat) {
+    if (p[1] - p[0]).cross(p[2] - p[0]).dot(out) < 0.0 {
+        p.reverse();
+    }
+    b.quad(p, m);
+}
+
+fn car_lights(b: &mut MeshBuilder, hw: f32, hl: f32, y: f32, head: &Mat, tail: &Mat) {
+    for x in [-1.0f32, 1.0] {
+        let cx = x * (hw - 0.22);
+        quad_out(
+            b,
+            -Vec3::Z,
+            [
+                Vec3::new(cx - 0.16, y - 0.06, -hl - 0.01),
+                Vec3::new(cx + 0.16, y - 0.06, -hl - 0.01),
+                Vec3::new(cx + 0.16, y + 0.06, -hl - 0.01),
+                Vec3::new(cx - 0.16, y + 0.06, -hl - 0.01),
+            ],
+            head,
+        );
+        quad_out(
+            b,
+            Vec3::Z,
+            [
+                Vec3::new(cx + 0.15, y - 0.05, hl + 0.01),
+                Vec3::new(cx - 0.15, y - 0.05, hl + 0.01),
+                Vec3::new(cx - 0.15, y + 0.06, hl + 0.01),
+                Vec3::new(cx + 0.15, y + 0.06, hl + 0.01),
+            ],
+            tail,
+        );
+    }
+}
+
+/// Hatchback (`boot` 0) or saloon (`boot` 1): rounded lower body, a glass
+/// cabin under a painted roof.
+fn car_body(hw: f32, hl: f32, boot: f32) -> MeshBuilder {
+    let mut b = MeshBuilder::new();
+    let (paint, glass, trim, tyre, hub, head, tail) = car_mats();
+    let sq = 4.0;
+    b.loft(
+        &[
+            sec(hl, 0.55, hw * 0.92, 0.22, sq),
+            sec(hl - 0.2, 0.62, hw, 0.32, sq),
+            sec(-hl + 0.45, 0.62, hw, 0.31, sq),
+            sec(-hl + 0.05, 0.52, hw * 0.94, 0.2, sq),
+        ],
+        Vec3::X,
+        16,
+        &paint,
+    );
+    // Bumpers.
+    b.cube(
+        Vec3::new(0.0, 0.38, hl - 0.02),
+        Vec3::new(hw * 0.95, 0.08, 0.06),
+        &trim,
+    );
+    b.cube(
+        Vec3::new(0.0, 0.38, -hl + 0.02),
+        Vec3::new(hw * 0.95, 0.08, 0.06),
+        &trim,
+    );
+    // Cabin: glass greenhouse, painted roof.
+    let rear = hl - 0.35 - boot * 0.55;
+    let front = -hl * 0.22;
+    b.loft(
+        &[
+            sec(rear + 0.05, 0.95, hw * 0.8, 0.04, 3.0),
+            sec(rear - 0.15, 1.18, hw * 0.82, 0.26, 3.0),
+            sec(front + 0.2, 1.2, hw * 0.84, 0.27, 3.0),
+            sec(front - 0.55, 0.96, hw * 0.88, 0.04, 3.0),
+        ],
+        Vec3::X,
+        12,
+        &glass,
+    );
+    b.cuboid(
+        Vec3::new(0.0, 1.44, (rear - 0.15 + front + 0.2) * 0.5),
+        Vec3::new(hw * 0.8, 0.03, (rear - front - 0.35) * 0.5),
+        Vec2::new(0.97, 0.95),
+        &paint,
+    );
+    car_wheels(&mut b, hw, &[hl - 0.7, -hl + 0.7], 0.31, &tyre, &hub);
+    car_lights(&mut b, hw, hl, 0.66, &head, &tail);
+    b
+}
+
+fn van() -> MeshBuilder {
+    let mut b = MeshBuilder::new();
+    let (paint, glass, trim, tyre, hub, head, tail) = car_mats();
+    let (hw, hl) = (1.0, 2.6);
+    b.loft(
+        &[
+            sec(hl, 1.15, hw * 0.98, 0.78, 6.0),
+            sec(-hl + 0.9, 1.15, hw, 0.8, 6.0),
+            sec(-hl + 0.25, 0.85, hw * 0.98, 0.5, 5.0),
+            sec(-hl, 0.7, hw * 0.94, 0.32, 4.0),
+        ],
+        Vec3::X,
+        16,
+        &paint,
+    );
+    // Windscreen and side windows of the cab.
+    quad_out(
+        &mut b,
+        Vec3::new(0.0, 0.5, -1.0),
+        [
+            Vec3::new(-hw * 0.88, 1.35, -hl + 0.62),
+            Vec3::new(hw * 0.88, 1.35, -hl + 0.62),
+            Vec3::new(hw * 0.86, 1.82, -hl + 0.93),
+            Vec3::new(-hw * 0.86, 1.82, -hl + 0.93),
+        ]
+        .map(|p| p + Vec3::new(0.0, 0.0, -0.03)),
+        &glass,
+    );
+    for x in [-1.0f32, 1.0] {
+        let xx = x * (hw + 0.005);
+        let q = [
+            Vec3::new(xx, 1.35, -hl + 0.75),
+            Vec3::new(xx, 1.35, -hl + 1.75),
+            Vec3::new(xx, 1.8, -hl + 1.75),
+            Vec3::new(xx, 1.8, -hl + 1.0),
+        ];
+        quad_out(&mut b, Vec3::X * x, q, &glass);
+    }
+    b.cube(
+        Vec3::new(0.0, 0.4, hl - 0.02),
+        Vec3::new(hw * 0.95, 0.09, 0.06),
+        &trim,
+    );
+    b.cube(
+        Vec3::new(0.0, 0.4, -hl - 0.02),
+        Vec3::new(hw * 0.95, 0.09, 0.06),
+        &trim,
+    );
+    car_wheels(&mut b, hw, &[hl - 0.75, -hl + 0.8], 0.34, &tyre, &hub);
+    car_lights(&mut b, hw, hl, 0.72, &head, &tail);
+    b
+}
+
+fn truck() -> MeshBuilder {
+    let mut b = MeshBuilder::new();
+    let (paint, glass, trim, tyre, hub, head, tail) = car_mats();
+    let (hw, hl) = (1.2, 4.2);
+    let cargo = bike_mat([0.82, 0.82, 0.8], 0.6, 0.0, part::BODY, 0.0);
+    // Cab.
+    b.cuboid(
+        Vec3::new(0.0, 1.45, -hl + 0.8),
+        Vec3::new(hw, 0.95, 0.8),
+        Vec2::new(0.96, 0.9),
+        &paint,
+    );
+    quad_out(
+        &mut b,
+        Vec3::new(0.0, 0.3, -1.0),
+        [
+            Vec3::new(-hw * 0.85, 1.55, -hl - 0.005),
+            Vec3::new(hw * 0.85, 1.55, -hl - 0.005),
+            Vec3::new(hw * 0.82, 2.25, -hl + 0.15),
+            Vec3::new(-hw * 0.82, 2.25, -hl + 0.15),
+        ],
+        &glass,
+    );
+    // Box body and chassis.
+    b.cube(
+        Vec3::new(0.0, 2.0, 1.0),
+        Vec3::new(hw, 1.45, hl - 1.0),
+        &cargo,
+    );
+    b.cube(
+        Vec3::new(0.0, 0.5, 0.0),
+        Vec3::new(hw * 0.7, 0.15, hl - 0.1),
+        &trim,
+    );
+    b.cube(
+        Vec3::new(0.0, 0.55, -hl + 0.02),
+        Vec3::new(hw * 0.98, 0.14, 0.06),
+        &trim,
+    );
+    // A painted stripe down the box.
+    for x in [-1.0f32, 1.0] {
+        let xx = x * (hw + 0.006);
+        let q = [
+            Vec3::new(xx, 1.4, hl - 0.1),
+            Vec3::new(xx, 1.4, -hl + 1.7),
+            Vec3::new(xx, 1.7, -hl + 1.7),
+            Vec3::new(xx, 1.7, hl - 0.1),
+        ];
+        quad_out(&mut b, Vec3::X * x, q, &paint);
+    }
+    car_wheels(
+        &mut b,
+        hw,
+        &[hl - 0.9, hl - 2.1, -hl + 1.0],
+        0.48,
+        &tyre,
+        &hub,
+    );
+    car_lights(&mut b, hw, hl, 0.75, &head, &tail);
+    b
 }
 
 fn foliage(color: [f32; 3]) -> Mat {

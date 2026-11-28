@@ -129,6 +129,23 @@ export class Game {
         return v1;
     }
     /**
+     * A racer's name by bike index (cues carry indices).
+     * @param {number} i
+     * @returns {string}
+     */
+    racer_name(i) {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.game_racer_name(this.__wbg_ptr, i);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * The canvas backing store changed size.
      * @param {number} w
      * @param {number} h
@@ -185,11 +202,18 @@ export class Game {
     }
     /**
      * Starts a race the player drives, on `slug`, at `difficulty`
-     * (`easy`, `normal` or `hard`; anything else is normal).
+     * (`easy`, `normal` or `hard`; anything else is normal), on a bike
+     * with garage upgrades `engine`, `handling` and `armour` (0..=3).
      * @param {string} slug
      * @param {string} difficulty
+     * @param {number} engine
+     * @param {number} handling
+     * @param {number} armour
      */
-    start_race(slug, difficulty) {
+    start_race(slug, difficulty, engine, handling, armour) {
+        const val3 = +engine;
+        const val4 = +handling;
+        const val5 = +armour;
         let ptr0, len0, ptr1, len1;
         try {
             ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -201,7 +225,7 @@ export class Game {
             if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
             throw e;
         }
-        wasm.game_start_race(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        wasm.game_start_race(this.__wbg_ptr, ptr0, len0, ptr1, len1, val3, val4, val5);
     }
     /**
      * Draw calls, triangles and visible props in the last frame.

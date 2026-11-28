@@ -26,6 +26,23 @@ pub const CREST_RADIUS: f32 = 300.0;
 const MAX_GRADE: f32 = 0.085;
 /// Spatial-hash cell for nearest-sample queries.
 const CELL: f32 = 24.0;
+/// The longest straight on each circuit opens out by this much each side.
+pub const WIDE_EXTRA: f32 = 5.0;
+/// Length of the ramp in and out of the wide section, metres.
+const WIDE_TAPER: f32 = 45.0;
+/// Kicker ramps on the wide straight's shoulders.
+pub const RAMP_LENGTH: f32 = 11.0;
+pub const RAMP_HEIGHT: f32 = 1.3;
+pub const RAMP_HALF_WIDTH: f32 = 1.8;
+
+/// A kicker on the road: rides up a curved face and drops off a lip.
+#[derive(Debug, Clone, Copy)]
+pub struct Ramp {
+    /// Lap distance of the foot of the ramp; the lip is `RAMP_LENGTH` on.
+    pub s: f32,
+    /// Lateral of its centre.
+    pub lateral: f32,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrackDef {
@@ -52,6 +69,8 @@ pub struct TrackSample {
     pub curvature: f32,
     /// Bank angle in radians; positive raises the left edge.
     pub bank: f32,
+    /// Half the road's width here (wider on the circuit's main straight).
+    pub half_width: f32,
 }
 
 impl TrackSample {
@@ -82,7 +101,12 @@ pub struct Track {
     pub samples: Vec<TrackSample>,
     pub length: f32,
     pub spacing: f32,
+    /// Narrowest half width (most of the lap); see [`Track::half_width_at`].
     pub half_width: f32,
+    /// Lap distance where the wide straight starts and its full-width
+    /// length, if the circuit has one.
+    pub wide: Option<(f32, f32)>,
+    pub ramps: Vec<Ramp>,
     grid_origin: Vec2,
     grid_dims: (i32, i32),
     grid: Vec<Vec<u32>>,
@@ -131,6 +155,7 @@ impl Track {
                     dist: i as f32 * spacing,
                     curvature: 0.0,
                     bank: 0.0,
+                    half_width: def.half_width,
                 }
             })
             .collect();
@@ -155,6 +180,28 @@ impl Track {
             s.curvature = curv[i];
             s.bank = bank[i];
         }
+        let wide = widen_longest_straight(&mut samples, spacing, length);
+        // Two kickers on the wide straight's shoulders, opposite sides,
+        // kept off the start line and its grid.
+        let mut ramps: Vec<Ramp> = Vec::new();
+        if let Some((start, len)) = wide {
+            let lat = def.half_width + WIDE_EXTRA * 0.5;
+            for f in [0.3, 0.62, 0.15, 0.45, 0.8] {
+                let at = (start + len * f).rem_euclid(length);
+                let from_line = at.min(length - at);
+                let spaced = ramps.iter().all(|r| {
+                    let d = (r.s - at).abs();
+                    d.min(length - d) > 90.0
+                });
+                if ramps.len() < 2 && from_line > 140.0 && spaced {
+                    let side = if ramps.is_empty() { 1.0 } else { -1.0 };
+                    ramps.push(Ramp {
+                        s: at,
+                        lateral: side * lat,
+                    });
+                }
+            }
+        }
 
         let mut track = Self {
             def,
@@ -162,6 +209,8 @@ impl Track {
             length,
             spacing,
             half_width: def.half_width,
+            wide,
+            ramps,
             grid_origin: Vec2::ZERO,
             grid_dims: (0, 0),
             grid: Vec::new(),
@@ -226,7 +275,42 @@ impl Track {
             dist: s,
             curvature: a.curvature + (b.curvature - a.curvature) * t,
             bank: a.bank + (b.bank - a.bank) * t,
+            half_width: a.half_width + (b.half_width - a.half_width) * t,
         }
+    }
+
+    /// Half the road's width at lap distance `s`.
+    pub fn half_width_at(&self, s: f32) -> f32 {
+        self.frame_at(s).half_width
+    }
+
+    /// Widest half width anywhere on the lap.
+    pub fn max_half_width(&self) -> f32 {
+        self.samples
+            .iter()
+            .map(|s| s.half_width)
+            .fold(self.half_width, f32::max)
+    }
+
+    /// Height a ramp adds at (`s`, `lateral`) and the slope of its face
+    /// (rise over run along the road), or `None` off every ramp.
+    pub fn ramp_at(&self, s: f32, lateral: f32) -> Option<(f32, f32)> {
+        self.ramps.iter().find_map(|r| {
+            let x = self.delta_s(r.s, s);
+            if !(0.0..RAMP_LENGTH).contains(&x) {
+                return None;
+            }
+            // Square sides with a short chamfer so a glancing pass rides up.
+            let side = (lateral - r.lateral).abs() - RAMP_HALF_WIDTH;
+            if side > 0.35 {
+                return None;
+            }
+            let edge = 1.0 - (side / 0.35).clamp(0.0, 1.0);
+            let u = x / RAMP_LENGTH;
+            let h = RAMP_HEIGHT * u * u * edge;
+            let slope = 2.0 * RAMP_HEIGHT * u / RAMP_LENGTH * edge;
+            Some((h, slope))
+        })
     }
 
     /// World position of a point `lateral` metres right of the line at `s`.
@@ -346,11 +430,12 @@ impl Track {
 
     fn blend_ground(&self, natural: f32, tp: &TrackPos) -> f32 {
         let f = self.frame_at(tp.s);
-        let hw = self.half_width;
+        let hw = f.half_width;
         let edge = tp.lateral.abs() - hw;
         let road_y = f.surface_y(tp.lateral.clamp(-hw, hw));
         if edge <= 0.0 {
-            return f.surface_y(tp.lateral);
+            let lift = self.ramp_at(tp.s, tp.lateral).map_or(0.0, |r| r.0);
+            return f.surface_y(tp.lateral) + lift;
         }
         // A shallow shoulder falls away a little, then the land takes over.
         let shoulder = road_y - 0.08 - (edge.min(RUNOFF + 2.0) * 0.025);
@@ -367,7 +452,7 @@ impl Track {
             Some(i) => {
                 let tp = self.refine(p, i);
                 let h = self.blend_ground(natural, &tp);
-                let edge = tp.lateral.abs() - self.half_width;
+                let edge = tp.lateral.abs() - self.half_width_at(tp.s);
                 if edge < 1.5 {
                     h - 0.45
                 } else {
@@ -399,6 +484,51 @@ impl Track {
         }
         (lo, hi)
     }
+}
+
+/// Opens the longest near-straight run out by [`WIDE_EXTRA`] a side,
+/// easing in and out, and returns where the full width starts and how long
+/// it lasts.
+fn widen_longest_straight(
+    samples: &mut [TrackSample],
+    spacing: f32,
+    length: f32,
+) -> Option<(f32, f32)> {
+    let n = samples.len();
+    let straight = |i: usize| samples[i % n].curvature.abs() < 0.0028;
+    let (mut best, mut best_start, mut run, mut run_start) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..2 * n {
+        if straight(i) {
+            if run == 0 {
+                run_start = i;
+            }
+            run = (run + 1).min(n);
+            if run > best {
+                best = run;
+                best_start = run_start % n;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    // Keep clear of the corners at each end.
+    let inset = (25.0 / spacing) as usize;
+    let taper = (WIDE_TAPER / spacing) as usize;
+    if best < 2 * (inset + taper) + (40.0 / spacing) as usize {
+        return None;
+    }
+    let first = best_start + inset;
+    let last = best_start + best - inset;
+    for k in first..last {
+        let into = (k - first).min(last - 1 - k) as f32 / taper as f32;
+        let t = smoothstep(0.0, 1.0, into.min(1.0));
+        samples[k % n].half_width += WIDE_EXTRA * t;
+    }
+    let start = ((first + taper) % n) as f32 * spacing;
+    Some((
+        start.rem_euclid(length),
+        (last - first - 2 * taper) as f32 * spacing,
+    ))
 }
 
 /// Dense closed polyline through `points` (centripetal Catmull-Rom).

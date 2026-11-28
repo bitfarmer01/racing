@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseStyle, applyStyle, canvasPalette, direct, DIRECTION } from '../design.js';
-import { CUE, HUD } from '../hud.js';
+import { CUE, HUD, HUD_LEN } from '../hud.js';
 
 const CSS = '--ink: #14121a; --paper: #f4f1ea; --hot: #ff4d2e; --accent: #ffb347; --accent-rgb: 255, 179, 71;';
 
@@ -27,7 +27,7 @@ test('canvasPalette falls back to the shared palette', () => {
 });
 
 const hud = () => {
-  const h = new Array(23).fill(0);
+  const h = new Array(HUD_LEN).fill(0);
   h[HUD.POSITION] = 3;
   h[HUD.LAPS] = 3;
   h[HUD.BEST_LAP] = 61.25;
@@ -72,4 +72,19 @@ test('combat cues get their words', () => {
   assert.match(direct({ code: CUE.KNOCKOFF, a: 0, b: 0 }, hud()).toast[0], /full boost/);
   assert.deepEqual(direct({ code: CUE.LAUNCH, a: 1, b: 0 }, hud()).toast, ['Perfect start', 'best']);
   assert.deepEqual(direct({ code: CUE.LAUNCH, a: 0, b: 0 }, hud()).toast, ['Wheelspin', 'bad']);
+});
+
+test('traffic, weapons and hunters get their words', () => {
+  assert.deepEqual(direct({ code: CUE.TRAFFIC_CRASH, a: 0, b: 0 }, hud()).toast, ['Wrecked', 'bad']);
+  assert.match(direct({ code: CUE.NEAR_MISS, a: 1, b: 0 }, hud()).toast[0], /oncoming/);
+  assert.deepEqual(direct({ code: CUE.NEAR_MISS, a: 0, b: 0 }, hud()).toast, ['Near miss', 'best']);
+  assert.deepEqual(direct({ code: CUE.ARMED, a: 2, b: 0 }, hud()).toast, ['Chain grabbed', 'best']);
+  assert.deepEqual(direct({ code: CUE.DISARMED, a: 0, b: 0 }, hud()).toast, ['Weapon gone', 'bad']);
+  assert.match(direct({ code: CUE.HUNTED, a: 3, b: 0, name: 'Vex' }, hud()).toast[0], /^Vex is coming/);
+  assert.match(direct({ code: CUE.HUNTED, a: 3, b: 0 }, hud()).toast[0], /^A rival/);
+});
+
+test('the pack\'s mood swings are announced', () => {
+  assert.deepEqual(direct({ code: CUE.MOOD, a: 1, b: 0 }, hud()).toast, ['The pack turns rough', 'bad']);
+  assert.deepEqual(direct({ code: CUE.MOOD, a: 0, b: 0 }, hud()).toast, ['The pack settles', '']);
 });

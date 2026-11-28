@@ -32,6 +32,10 @@ export class Game {
      */
     hud(): Float32Array;
     /**
+     * A racer's name by bike index (cues carry indices).
+     */
+    racer_name(i: number): string;
+    /**
      * The canvas backing store changed size.
      */
     resize(w: number, h: number): void;
@@ -55,9 +59,10 @@ export class Game {
     standings(): string;
     /**
      * Starts a race the player drives, on `slug`, at `difficulty`
-     * (`easy`, `normal` or `hard`; anything else is normal).
+     * (`easy`, `normal` or `hard`; anything else is normal), on a bike
+     * with garage upgrades `engine`, `handling` and `armour` (0..=3).
      */
-    start_race(slug: string, difficulty: string): void;
+    start_race(slug: string, difficulty: string, engine: number, handling: number, armour: number): void;
     /**
      * Draw calls, triangles and visible props in the last frame.
      */
@@ -106,13 +111,14 @@ export interface InitOutput {
     readonly game_frame: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number];
     readonly game_hdr_format: (a: number) => [number, number];
     readonly game_hud: (a: number) => [number, number];
+    readonly game_racer_name: (a: number, b: number) => [number, number];
     readonly game_resize: (a: number, b: number, c: number) => void;
     readonly game_set_effects: (a: number, b: number, c: number) => void;
     readonly game_set_paused: (a: number, b: number) => void;
     readonly game_set_render_scale: (a: number, b: number) => void;
     readonly game_show: (a: number, b: number, c: number) => void;
     readonly game_standings: (a: number) => [number, number];
-    readonly game_start_race: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly game_start_race: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly game_stats: (a: number) => [number, number];
     readonly game_track: (a: number) => [number, number];
     readonly game_track_outline: (a: number) => [number, number];

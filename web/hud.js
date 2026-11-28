@@ -5,13 +5,20 @@ export const HUD = Object.freeze({
   POSITION: 0, RACERS: 1, LAP: 2, LAPS: 3, LAP_TIME: 4, LAST_LAP: 5, BEST_LAP: 6,
   RACE_TIME: 7, SPEED: 8, GEAR: 9, RPM: 10, BOOST: 11, BOOSTING: 12, COUNTDOWN: 13,
   WRONG_WAY: 14, CRASHED: 15, FINISHED: 16, BALANCE: 17, PROGRESS: 18, DRAFTING: 19, PAUSED: 20,
-  GUARD: 21, STRIKE_READY: 22,
+  GUARD: 21, STRIKE_READY: 22, WEAPON: 23, WEAPON_USES: 24, KNOCKOFFS: 25, NEAR_MISSES: 26, HITS: 27,
 });
+
+// Number of floats in Game.hud() (HUD_LEN in crates/web/src/lib.rs).
+export const HUD_LEN = 28;
+
+// HUD.WEAPON codes -> names.
+export const WEAPONS = Object.freeze(['', 'Club', 'Chain']);
 
 // Cue codes from Game.frame() (crates/web/src/lib.rs, pack_cues).
 export const CUE = Object.freeze({
   BEEP: 1, GO: 2, WALL: 3, CONTACT: 4, HIT_LANDED: 5, GOT_HIT: 6, CRASH: 7, LAP: 8, FINISHED: 9, OVERTAKE: 10,
   GUARDED: 11, PARRIED: 12, WAS_PARRIED: 13, KNOCKOFF: 14, LAUNCH: 15,
+  TRAFFIC_CRASH: 16, NEAR_MISS: 17, ARMED: 18, DISARMED: 19, HUNTED: 20, MOOD: 21,
 });
 
 // Difficulty levels (crates/game/src/difficulty.rs) for the menu.

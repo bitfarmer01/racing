@@ -123,7 +123,9 @@ fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
 }
 
 // Warm pools of light under the street lamps (road and verges only).
-fn lamp_light(s: f32, u: f32) -> vec3<f32> {
+// `wide` is how much wider than its base the road is here (the lamps
+// stand back on the wide straight).
+fn lamp_light(s: f32, u: f32, wide: f32) -> vec3<f32> {
     let strength = g.params.y;
     if (strength <= 0.0) {
         return vec3<f32>(0.0);
@@ -136,7 +138,7 @@ fn lamp_light(s: f32, u: f32) -> vec3<f32> {
         let ls = k * sp;
         let on = select(0.0, 1.0, ls >= 60.0 && ls <= g.params2.w);
         let side = select(-1.0, 1.0, (i32(k) % 2) == 0);
-        let d = vec2<f32>(s - ls, u - side * g.params.w);
+        let d = vec2<f32>(s - ls, u - side * (g.params.w + wide));
         let r2 = dot(d, d) + 8.2 * 8.2;
         acc = acc + on * 8.2 / (r2 * sqrt(r2)) * 320.0;
     }
@@ -225,12 +227,13 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         rough = t.a;
         metal = 0.0;
         if (in.color.r > 0.99) {
-            lamps = lamp_light(in.uv.y, in.uv.x);
+            lamps = lamp_light(in.uv.y, in.uv.x, 0.0);
         }
     } else if (kind == K_ROAD) {
         let u = in.uv.x;
         let s = in.uv.y;
-        let hw = g.params2.x;
+        // Half width varies (the wide straight), so it rides in the vertex.
+        let hw = in.color.r * 16.0;
         let grain = vnoise(wp.xz * 3.1) * 0.5 + vnoise(wp.xz * 13.0) * 0.5;
         let patches = fbm3(vec2<f32>(s * 0.045, u * 0.25));
         var c = vec3<f32>(0.05, 0.05, 0.055) * (0.72 + 0.45 * grain) * (0.82 + 0.36 * patches);
@@ -245,6 +248,17 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let lw = smoothstep(-0.03, 0.03, e) * (1.0 - smoothstep(0.27, 0.33, e));
         c = mix(c, vec3<f32>(0.75, 0.75, 0.72) * (0.85 + 0.15 * grain), lw);
         rough = mix(rough, 0.45, lw);
+        // Lane paint: a dashed centreline and dashed lane dividers, since
+        // traffic runs both ways. Widths are antialiased by screen footprint.
+        let aa = max(fwidth(u), 0.01);
+        let dash = step(fract(s / 9.0), 0.45);
+        let cl = (1.0 - smoothstep(0.07 - aa, 0.07 + aa, abs(u))) * dash;
+        let ld = (1.0 - smoothstep(0.06 - aa, 0.06 + aa, abs(abs(u) - 3.15)))
+            * step(fract(s / 12.0 + 0.3), 0.3);
+        let paint = clamp(cl + ld, 0.0, 1.0) * (0.8 + 0.2 * grain);
+        c = mix(c, vec3<f32>(0.72, 0.66, 0.42), cl * (0.8 + 0.2 * grain));
+        c = mix(c, vec3<f32>(0.72, 0.72, 0.7), ld * (0.8 + 0.2 * grain));
+        rough = mix(rough, 0.5, paint);
         // Start / finish checker band.
         if (s < 3.0) {
             let ch = (i32(floor((u + 64.0) / 0.75)) + i32(floor(s / 0.75))) % 2;
@@ -261,12 +275,12 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
             c = mix(c, vec3<f32>(0.75), clamp(slot, 0.0, 1.0));
         }
         albedo = c;
-        lamps = lamp_light(s, u);
+        lamps = lamp_light(s, u, hw - g.params2.x);
     } else if (kind == K_KERB) {
         let st = step(0.5, fract(in.uv.y / 2.4));
         albedo = mix(vec3<f32>(0.72, 0.03, 0.02), vec3<f32>(0.78, 0.78, 0.76), st);
         rough = 0.45;
-        lamps = lamp_light(in.uv.y, in.uv.x);
+        lamps = lamp_light(in.uv.y, in.uv.x, 0.0);
     } else if (kind == K_FOLIAGE) {
         albedo = albedo * mix(0.78, 1.22, in.tint);
         ao = mix(0.55, 1.0, in.uv.y);

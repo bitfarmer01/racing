@@ -15,4 +15,4 @@ pub mod style;
 pub mod world;
 
 pub use camera::Camera;
-pub use renderer::{BikeDraw, FrameInput, Particle, ParticleKind, Renderer, Settings};
+pub use renderer::{BikeDraw, CarDraw, FrameInput, Particle, ParticleKind, Renderer, Settings};

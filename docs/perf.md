@@ -63,6 +63,46 @@ Where it goes:
 This is CPU software rendering, where every vertex and pixel costs the same
 CPU time; on a real GPU this much geometry is small.
 
+## Round 3: traffic, weapons, hunters, season (2026-11)
+
+Same method at 1280×720, alternating two runs of `main` (e4c17e3) and this
+branch:
+
+| | Golden Coast | Alpine Lake | Dusk Canyon |
+|---|---|---|---|
+| main | 96 ms | 102 ms | 117 ms |
+| this branch | 98 ms (+2 %) | 105 ms (+3 %) | 101 ms (−13 %) |
+
+- Traffic adds 6 to 30 cars per track, drawn through the bike's instanced
+  pipeline: one extra draw per vehicle kind in view (hatch, saloon, van,
+  truck), about 40 k more triangles at the bench frame, culled past 320 m.
+- Clubs and chains are extra parts of the rider mesh, collapsed to nothing
+  in the vertex shader unless carried, so they cost no draw calls.
+- Lane paint is a few instructions in the road shader.
+- The simulation (traffic, hunting AI, contacts) went from about 0.05 ms to
+  0.07 ms per frame.
+- The Dusk Canyon drop is a different scene at the bench mark, not a
+  speed-up: the race plays out differently by 8 s.
+
+## Round 4: ramps, wide straights, hairpins, fight waves (2026-11)
+
+Same method at 1280×720, alternating two runs of the round 3 build
+(c2203dc) and this one. The machine ran slower than in round 3, so compare
+the rows with each other, not with the tables above:
+
+| | Golden Coast | Alpine Lake | Dusk Canyon |
+|---|---|---|---|
+| round 3 | 126 ms | 138 ms | 133 ms |
+| this build | 128 ms (+1 %) | 136 ms (−1 %) | 141 ms (+6 %) |
+
+- Kickers are a few dozen triangles each in the road chunk they sit in, so
+  they add no draw calls.
+- The road's width now varies along the track; it is carried in each road
+  vertex rather than a uniform, which costs nothing per pixel.
+- Dusk Canyon's top straight and hairpin are new, so the bench frame there
+  is a different scene; the change is within run-to-run noise elsewhere.
+- The simulation is unchanged at about 0.08 ms per frame.
+
 ## Before (main @ 53aa156)
 
 The previous build was a 2D sprite scaler (two draw calls), measured by its

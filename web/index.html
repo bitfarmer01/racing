@@ -88,6 +88,24 @@
     .level b { display: block; font-weight: 800; font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; }
     .level small { display: block; color: var(--dim); font-size: 11px; margin-top: 3px; line-height: 1.35; }
     .level.sel { border-color: var(--hot); background: rgba(255, 77, 46, 0.14); box-shadow: inset 0 -3px 0 var(--hot); }
+    .garage { width: min(440px, 90vw); margin-top: 14px; }
+    .garage .cash { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--dim); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+    .garage .cash b { color: var(--gold); font-size: 20px; letter-spacing: 0; }
+    .ups { display: flex; gap: 8px; margin-top: 6px; }
+    .up { flex: 1; font: inherit; text-align: left; background: var(--glass); border: 1px solid var(--line); color: var(--paper); border-radius: 12px; padding: 9px 12px; cursor: pointer; }
+    .up b { display: block; font-weight: 800; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .up .pips { display: flex; gap: 3px; margin: 5px 0 4px; }
+    .up .pips i { flex: 1; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.12); }
+    .up .pips i.on { background: var(--gold); }
+    .up small { display: block; color: var(--dim); font-size: 11px; }
+    .up:disabled { cursor: default; opacity: 0.55; }
+    .up.can { border-color: var(--gold); }
+    .fight span.arm { color: var(--ink); border-color: var(--gold); background: var(--gold); }
+    .pay { margin: 0 0 16px; font-size: 14px; }
+    .pay div { display: flex; justify-content: space-between; padding: 3px 8px; color: var(--dim); }
+    .pay div b { color: var(--paper); }
+    .pay div.tot { color: var(--gold); font-weight: 800; border-top: 1px solid var(--line); margin-top: 4px; padding-top: 6px; }
+    .pay div.tot b { color: var(--gold); }
     #lapline { font-weight: 800; font-size: 15px; color: var(--accent); letter-spacing: 0.06em; margin-top: 6px; }
     #map { right: 22px; top: 18px; width: 200px; height: 200px; padding: 0; overflow: hidden; }
     #map canvas { width: 100%; height: 100%; display: block; }
@@ -155,9 +173,13 @@
   <div id="menu" class="layer hidden">
     <div>
       <h1 class="brand">RACING<span>.</span></h1>
-      <p class="tag">Eight riders · three laps · no rules</p>
+      <p class="tag">Eight riders · two-way traffic · no rules</p>
       <div class="tracks" id="tracks"></div>
       <div class="levels" id="levels" role="radiogroup" aria-label="Difficulty"></div>
+      <div class="garage">
+        <div class="cash">Garage <span>Cash <b id="cash">$0</b></span></div>
+        <div class="ups" id="ups"></div>
+      </div>
       <div class="actions">
         <button class="btn primary" id="start">Race</button>
         <span class="keys"><kbd>Enter</kbd> to start</span>
@@ -166,7 +188,8 @@
     <div class="keys">
       <kbd>W</kbd><kbd>↑</kbd> throttle &nbsp; <kbd>S</kbd><kbd>↓</kbd> brake &nbsp; <kbd>A</kbd><kbd>D</kbd> steer &nbsp;
       <kbd>Shift</kbd> boost &nbsp; <kbd>X</kbd> punch &nbsp; <kbd>Z</kbd> kick &nbsp; <kbd>Q</kbd> guard (hold) &nbsp; <kbd>C</kbd> camera &nbsp; <kbd>Esc</kbd> pause &nbsp; · &nbsp; gamepad supported<br>
-      Hold the throttle part-way on the grid for a perfect start. Raise your guard just as a hit lands to parry it.
+      Hold the throttle part-way on the grid for a perfect start. Raise your guard just as a hit lands to parry it.<br>
+      Knock a rider off to take their club or chain. Skim past cars for boost, but don't touch them. Prize money buys upgrades.
     </div>
   </div>
 
@@ -183,7 +206,7 @@
       <div class="row num">TIME <b id="h-time">0:00.000</b></div>
       <div class="row num">BEST <b id="h-best">–</b></div>
       <div class="bal"><i id="h-bal"></i></div>
-      <div class="fight"><span id="h-strike">STRIKE</span><span id="h-guard">GUARD</span></div>
+      <div class="fight"><span id="h-strike">STRIKE</span><span id="h-guard">GUARD</span><span id="h-weapon" class="hidden"></span></div>
     </div>
     <div id="map" class="panel"><canvas id="minimap" width="400" height="400"></canvas></div>
     <div id="dash" class="panel">
@@ -220,6 +243,7 @@
       <h2 id="r-title">Finished</h2>
       <div class="sub" id="r-sub"></div>
       <table id="r-table"></table>
+      <div class="pay" id="r-pay"></div>
       <div class="actions">
         <button class="btn primary" id="again">Race again</button>
         <button class="btn" id="tomenu">Menu</button>
